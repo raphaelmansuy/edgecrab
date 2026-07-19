@@ -45,6 +45,9 @@ pub struct FuzzySelector<T: Clone + FuzzyItem> {
     pub selected: usize,
     /// Whether the overlay is visible.
     pub active: bool,
+    /// Last rendered list viewport height (for PageUp/PageDown / mouse wheel).
+    /// Renderers that virtualize large catalogs should update this each frame.
+    pub list_viewport_rows: usize,
 }
 
 impl<T: Clone + FuzzyItem> FuzzySelector<T> {
@@ -56,6 +59,7 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
             query: String::new(),
             selected: 0,
             active: false,
+            list_viewport_rows: 8,
         }
     }
 
@@ -171,15 +175,28 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
         }
     }
 
-    /// Move selection up by one page (8 rows).
+    /// Move selection up by one viewport page.
     pub fn page_up(&mut self) {
-        self.selected = self.selected.saturating_sub(8);
+        let step = self.list_viewport_rows.max(1) as isize;
+        self.page_by(-step);
     }
 
-    /// Move selection down by one page (8 rows).
+    /// Move selection down by one viewport page.
     pub fn page_down(&mut self) {
-        let last = self.filtered.len().saturating_sub(1);
-        self.selected = (self.selected + 8).min(last);
+        let step = self.list_viewport_rows.max(1) as isize;
+        self.page_by(step);
+    }
+
+    /// Move selection by `delta` rows (negative = up). Used for viewport-sized
+    /// PageUp/PageDown and mouse-wheel virtual scrolling.
+    pub fn page_by(&mut self, delta: isize) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let last = self.filtered.len().saturating_sub(1) as isize;
+        let next = (self.selected as isize).saturating_add(delta).clamp(0, last);
+        self.selected = next as usize;
     }
 
     /// Return the currently highlighted item, if any.
@@ -284,6 +301,38 @@ mod tests {
             selector.current().map(|item| item.primary()),
             Some("bedrock/anthropic.claude-4-sonnet-20250514-v1:0")
         );
+    }
+
+    #[test]
+    fn page_by_virtual_scrolls_large_marketplace_lists() {
+        // Simulate skills.sh-scale catalogs: selection jumps by viewport, stays in range.
+        let items: Vec<TestItem> = (0..500)
+            .map(|i| {
+                // Leak short-lived labels into 'static for the test fixture.
+                let primary = Box::leak(format!("skills.sh:owner/repo/skill-{i:03}").into_boxed_str());
+                TestItem {
+                    primary,
+                    secondary: "↑ installs",
+                    tag: "skills.sh",
+                }
+            })
+            .collect();
+        let mut selector = FuzzySelector::new();
+        selector.set_items(items);
+        assert_eq!(selector.filtered.len(), 500);
+
+        let viewport = 24isize;
+        selector.list_viewport_rows = viewport as usize;
+        selector.page_down();
+        assert_eq!(selector.selected, 24);
+        selector.page_by(viewport * 10);
+        assert_eq!(selector.selected, 264);
+        selector.page_by(10_000);
+        assert_eq!(selector.selected, 499);
+        selector.page_up();
+        assert_eq!(selector.selected, 475);
+        selector.page_by(-10_000);
+        assert_eq!(selector.selected, 0);
     }
 
     #[test]

@@ -1405,15 +1405,76 @@ impl App {
             return;
         }
 
+        // Import-from / SourcePick / Done / Error / Installing (marketplace-owned overlays).
+        {
+            use super::skills_marketplace::{
+                IMPORT_FROM_PEERS, MarketplaceKeyContext, MarketplaceMode, MarketplaceModeKind,
+                map_marketplace_key, marketplace_provider_filters,
+            };
+            let import_selected = match &self.skills_marketplace_mode {
+                MarketplaceMode::ImportFrom { selected } => *selected,
+                _ => 0,
+            };
+            let source_selected = match &self.skills_marketplace_mode {
+                MarketplaceMode::SourcePick { selected } => *selected,
+                _ => 0,
+            };
+            let kind = self.skills_marketplace_mode.kind();
+            if matches!(
+                kind,
+                MarketplaceModeKind::ImportFrom
+                    | MarketplaceModeKind::SourcePick
+                    | MarketplaceModeKind::Done
+                    | MarketplaceModeKind::Error
+                    | MarketplaceModeKind::Installing
+                    | MarketplaceModeKind::ConfirmSafe
+            ) {
+                let market_ctx = MarketplaceKeyContext {
+                    mode: kind,
+                    has_selection: self.remote_skill_browser.selector.current().is_some(),
+                    help_visible: self.skills_marketplace_help,
+                    import_count: IMPORT_FROM_PEERS.len(),
+                    import_selected,
+                    query_empty: self.remote_skill_browser.current_query().is_empty(),
+                    source_count: marketplace_provider_filters().len(),
+                    source_selected,
+                };
+                let action = map_marketplace_key(key.code, key.modifiers, market_ctx);
+                if self.apply_marketplace_action(action) {
+                    return;
+                }
+                // Soft Esc during Installing already mapped; swallow other keys on overlays.
+                return;
+            }
+        }
+
         if self.remote_skill_browser.selector.active {
+            use super::skills_marketplace::{
+                IMPORT_FROM_PEERS, MarketplaceKeyContext, map_marketplace_key,
+                marketplace_provider_filters,
+            };
+
+            let market_ctx = MarketplaceKeyContext {
+                mode: self.skills_marketplace_mode.kind(),
+                has_selection: self.remote_skill_browser.selector.current().is_some(),
+                help_visible: self.skills_marketplace_help,
+                import_count: IMPORT_FROM_PEERS.len(),
+                import_selected: 0,
+                query_empty: self.remote_skill_browser.current_query().is_empty(),
+                source_count: marketplace_provider_filters().len(),
+                source_selected: 0,
+            };
+            let action = map_marketplace_key(key.code, key.modifiers, market_ctx);
+            if self.apply_marketplace_action(action) {
+                return;
+            }
+
             match key.code {
                 KeyCode::Esc
                     if !self.close_detail_fullscreen(DetailSurface::RemoteSkillBrowser) =>
                 {
-                    self.remote_skill_browser.selector.active = false;
-                    self.remote_skill_browser.action_in_flight = None;
                     self.clear_remote_skill_guard_cache();
-                    self.needs_redraw = true;
+                    self.enter_skills_marketplace_installed();
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(
@@ -1426,16 +1487,6 @@ impl App {
                 {
                     self.toggle_simple_split_focus(DetailSurface::RemoteSkillBrowser);
                 }
-                KeyCode::Enter => {
-                    if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
-                        self.run_remote_skill_action(entry);
-                    }
-                }
-                _ if selector_action_key(&key, 'i') => {
-                    if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
-                        self.run_remote_skill_action(entry);
-                    }
-                }
                 _ if selector_action_key(&key, 'u') => {
                     if let Some(mut entry) = self.remote_skill_browser.selector.current().cloned() {
                         if entry.installed_name.is_some() {
@@ -1443,7 +1494,7 @@ impl App {
                             self.run_remote_skill_action(entry);
                         } else {
                             self.push_output(
-                                "This remote skill is not hub-installed yet. Use Enter or I to install it.",
+                                "This remote skill is not hub-installed yet. Press Enter to inspect, then i to install.",
                                 OutputRole::System,
                             );
                         }
@@ -1481,6 +1532,7 @@ impl App {
                         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                         self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
                         self.schedule_remote_skill_guard_preview();
+                        self.maybe_extend_browse_cache();
                     }
                 }
                 KeyCode::PageUp
@@ -1530,19 +1582,31 @@ impl App {
                         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                         self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
                         self.schedule_remote_skill_guard_preview();
+                        self.maybe_extend_browse_cache();
                     }
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace
+                    if matches!(
+                        self.skills_marketplace_mode.kind(),
+                        super::skills_marketplace::MarketplaceModeKind::SearchRemote
+                    ) =>
+                {
                     self.remote_skill_browser.selector.pop_char();
                     self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
-                    self.schedule_remote_skill_search(false);
+                    self.maybe_schedule_remote_skill_search_after_query_edit();
                 }
-                KeyCode::Char(c) if selector_search_char(&key) == Some(c) => {
+                // Only SearchRemote owns the filter; Inspect/modals must not mutate the query.
+                KeyCode::Char(c)
+                    if matches!(
+                        self.skills_marketplace_mode.kind(),
+                        super::skills_marketplace::MarketplaceModeKind::SearchRemote
+                    ) && selector_search_char(&key) == Some(c) =>
+                {
                     self.remote_skill_browser.selector.push_char(c);
                     self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
                     self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
-                    self.schedule_remote_skill_search(false);
+                    self.maybe_schedule_remote_skill_search_after_query_edit();
                 }
                 _ => {}
             }
@@ -1828,9 +1892,32 @@ impl App {
 
         // Skill selector overlay active — same key scheme as model selector
         if self.skill_selector.active {
+            use super::skills_marketplace::{
+                IMPORT_FROM_PEERS, MarketplaceKeyContext, MarketplaceModeKind, map_marketplace_key,
+            };
+            if matches!(
+                self.skills_marketplace_mode.kind(),
+                MarketplaceModeKind::BrowseInstalled
+            ) {
+                let market_ctx = MarketplaceKeyContext {
+                    mode: MarketplaceModeKind::BrowseInstalled,
+                    has_selection: self.skill_selector.current().is_some(),
+                    help_visible: self.skills_marketplace_help,
+                    import_count: IMPORT_FROM_PEERS.len(),
+                    import_selected: 0,
+                    query_empty: true,
+                    source_count: 0,
+                    source_selected: 0,
+                };
+                let action = map_marketplace_key(key.code, key.modifiers, market_ctx);
+                if self.apply_marketplace_action(action) {
+                    return;
+                }
+            }
             match key.code {
                 KeyCode::Esc if !self.close_detail_fullscreen(DetailSurface::SkillSelector) => {
                     self.skill_selector.active = false;
+                    self.skills_marketplace_help = false;
                 }
                 _ if selector_action_key(&key, 'z') => {
                     self.toggle_detail_fullscreen(

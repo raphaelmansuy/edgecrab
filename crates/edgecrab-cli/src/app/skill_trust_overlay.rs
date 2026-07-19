@@ -548,6 +548,9 @@ impl App {
                             None
                         },
                         action: RemoteSkillAction::Install,
+                        url: None,
+                        repo: None,
+                        path: None,
                     };
                     let _ = tx.send(AgentResponse::RemoteSkillGuardPrompt {
                         entry,
@@ -681,8 +684,38 @@ impl App {
                 return;
             }
             SkillTrustOverlayAction::Cancel => {
+                let review_only = self
+                    .skill_trust_prompt
+                    .as_ref()
+                    .is_some_and(|s| s.review_only);
+                let (preserved, identifier) = match &self.skills_marketplace_mode {
+                    super::skills_marketplace::MarketplaceMode::GuardReview {
+                        preserved_query,
+                        identifier,
+                    } => (Some(preserved_query.clone()), Some(identifier.clone())),
+                    _ => (None, None),
+                };
                 self.skill_trust_prompt = None;
                 self.remote_skill_browser.action_in_flight = None;
+                if let Some(query) = preserved {
+                    // Keep search query visible after Esc from Guard (019 W2).
+                    if self.remote_skill_browser.selector.query != query {
+                        self.remote_skill_browser.selector.query = query;
+                    }
+                }
+                // Evidence-only (`e`) returns to Inspect dossier; install-gate Cancel → search.
+                self.skills_marketplace_mode = if review_only {
+                    if let Some(identifier) = identifier {
+                        super::skills_marketplace::MarketplaceMode::Inspect {
+                            identifier,
+                            preview_scroll: 0,
+                        }
+                    } else {
+                        super::skills_marketplace::MarketplaceMode::SearchRemote
+                    }
+                } else {
+                    super::skills_marketplace::MarketplaceMode::SearchRemote
+                };
             }
             SkillTrustOverlayAction::Choose(index) => {
                 if index < action_count {
@@ -745,13 +778,29 @@ impl App {
                 }
             }
             self.remote_skill_browser.action_in_flight = None;
+            self.skills_marketplace_mode = super::skills_marketplace::MarketplaceMode::Inspect {
+                identifier: state.entry.identifier,
+                preview_scroll: 0,
+            };
             self.needs_redraw = true;
             return;
         }
 
         let cancel_index = if needs_trust { 2 } else { 1 };
         if choice == cancel_index {
+            let preserved = match &self.skills_marketplace_mode {
+                super::skills_marketplace::MarketplaceMode::GuardReview {
+                    preserved_query, ..
+                } => Some(preserved_query.clone()),
+                _ => None,
+            };
             self.remote_skill_browser.action_in_flight = None;
+            if let Some(query) = preserved
+                && self.remote_skill_browser.selector.query != query
+            {
+                self.remote_skill_browser.selector.query = query;
+            }
+            self.skills_marketplace_mode = super::skills_marketplace::MarketplaceMode::SearchRemote;
             self.needs_redraw = true;
             return;
         }
@@ -784,11 +833,15 @@ impl App {
             edgecrab_tools::tools::skills_hub::InstallGate {
                 force: false,
                 trust: true,
+                yes: false,
+                ..Default::default()
             }
         } else {
             edgecrab_tools::tools::skills_hub::InstallGate {
                 force: true,
                 trust: false,
+                yes: false,
+                ..Default::default()
             }
         };
 

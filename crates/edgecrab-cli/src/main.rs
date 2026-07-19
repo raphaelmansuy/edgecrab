@@ -2157,7 +2157,7 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
             println!("{}", content);
         }
 
-        SkillsCommand::Search { query } => {
+        SkillsCommand::Search { query, source } => {
             let query_lower = query.to_lowercase();
             let installed_matches: Vec<InstalledSkill> = collect_installed_skills(&skills_dir)?
                 .into_iter()
@@ -2173,8 +2173,8 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 edgecrab_tools::tools::skills_hub::search_optional_skills(&optional_root, &query);
             let remote_report = edgecrab_tools::tools::skills_hub::search_hub(
                 &query,
-                None,
-                8,
+                source.as_deref(),
+                25, // Hermes CLI do_search default
                 edgecrab_core::AppConfig::load()
                     .ok()
                     .and_then(|c| c.skills.hub_url)
@@ -2217,32 +2217,165 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
             }
         }
 
-        SkillsCommand::Install { source, name } => {
+        SkillsCommand::Browse {
+            source,
+            page,
+            page_size,
+            json,
+        } => {
+            let configured_hub = edgecrab_core::AppConfig::load()
+                .ok()
+                .and_then(|c| c.skills.hub_url);
+            if json {
+                let fetch_limit = (page.max(1) * page_size.clamp(1, 100)).clamp(1, 10_000);
+                let report = edgecrab_tools::tools::skills_hub::search_hub(
+                    "",
+                    source.as_deref(),
+                    fetch_limit,
+                    configured_hub.as_deref(),
+                )
+                .await;
+                println!(
+                    "{}",
+                    edgecrab_tools::tools::skills_hub::render_browse_page_json(
+                        &report,
+                        page,
+                        page_size,
+                        source.as_deref().unwrap_or("all"),
+                    )
+                );
+            } else {
+                println!(
+                    "{}",
+                    edgecrab_tools::tools::skills_hub::browse_hub_page(
+                        source.as_deref(),
+                        page,
+                        page_size,
+                        configured_hub.as_deref(),
+                    )
+                    .await
+                );
+            }
+        }
+
+        SkillsCommand::Install {
+            source,
+            name,
+            force,
+            trust,
+            yes,
+            now,
+            deferred,
+            json,
+        } => {
+            use edgecrab_tools::tools::skills_hub::{
+                InstallGate, InstallStage, InstallStageReport, format_stages_human,
+            };
+            let mut gate = InstallGate {
+                force,
+                trust,
+                yes,
+                ..Default::default()
+            };
+            if deferred {
+                gate.now = false;
+            } else if now {
+                gate.now = true;
+            }
+            if !json {
+                println!("{}", format_stages_human(Some(InstallStage::Fetch)));
+            }
             let source_path = std::path::Path::new(&source);
             if source_path.exists() {
-                let bundle = build_local_skill_bundle(source_path, name.as_deref())?;
-                let skill_name = bundle.name.clone();
-                let message = edgecrab_tools::tools::skills_hub::install_skill(
-                    &bundle,
-                    &skills_dir,
-                    edgecrab_tools::tools::skills_hub::InstallGate::default(),
+                let bundle = edgecrab_tools::tools::skills_hub::build_local_skill_bundle(
+                    source_path,
+                    name.as_deref(),
                 )
                 .map_err(|e| anyhow::anyhow!(e))?;
-                println!("{message}");
-                println!("Activate with: edgecrab skills view {skill_name}");
+                let skill_name = bundle.name.clone();
+                match edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, gate)
+                {
+                    Ok(message) => {
+                        if json {
+                            println!(
+                                "{}",
+                                InstallStageReport::done(&skill_name, &message).to_json()
+                            );
+                        } else {
+                            println!("{}", format_stages_human(Some(InstallStage::Commit)));
+                            println!("{message}");
+                            println!("Activate with: edgecrab skills view {skill_name}");
+                        }
+                    }
+                    Err(e) => {
+                        if json {
+                            println!("{}", InstallStageReport::failed(&skill_name, &e).to_json());
+                        }
+                        return Err(anyhow::anyhow!(e));
+                    }
+                }
                 return Ok(());
             }
 
-            let outcome = edgecrab_tools::tools::skills_hub::install_identifier(
+            match edgecrab_tools::tools::skills_hub::install_identifier(
                 &source,
                 &skills_dir,
                 edgecrab_tools::tools::skills_sync::optional_skills_dir().as_deref(),
-                edgecrab_tools::tools::skills_hub::InstallGate::default(),
+                gate,
             )
             .await
+            {
+                Ok(outcome) => {
+                    if json {
+                        println!(
+                            "{}",
+                            InstallStageReport::done(&outcome.skill_name, &outcome.message)
+                                .to_json()
+                        );
+                    } else {
+                        println!("{}", format_stages_human(Some(InstallStage::Commit)));
+                        println!("{}", outcome.message);
+                        println!("Activate with: edgecrab skills view {}", outcome.skill_name);
+                    }
+                }
+                Err(e) => {
+                    if json {
+                        println!("{}", InstallStageReport::failed(&source, &e).to_json());
+                    }
+                    return Err(anyhow::anyhow!(e));
+                }
+            }
+        }
+
+        SkillsCommand::ImportFrom {
+            spec,
+            force,
+            trust,
+            yes,
+            json,
+        } => {
+            let gate = edgecrab_tools::tools::skills_hub::InstallGate {
+                force,
+                trust,
+                yes,
+                ..Default::default()
+            };
+            let report = edgecrab_tools::tools::skills_hub::import_skills_from(
+                &spec, &skills_dir, gate,
+            )
             .map_err(|e| anyhow::anyhow!(e))?;
-            println!("{}", outcome.message);
-            println!("Activate with: edgecrab skills view {}", outcome.skill_name);
+            if json {
+                println!("{}", serde_json::to_string(&report).unwrap_or_else(|_| report.format()));
+            } else {
+                println!("{}", report.format());
+            }
+        }
+
+        SkillsCommand::Sources => {
+            println!(
+                "{}",
+                edgecrab_tools::tools::skills_hub::render_sources_catalog()
+            );
         }
 
         SkillsCommand::Update { name } => {
@@ -2278,8 +2411,237 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
             std::fs::remove_dir_all(&skill.skill_dir)?;
             println!("Removed skill '{}'.", skill.identifier);
         }
+
+        // W1: clap ≡ slash — delegate remaining hub actions to the shared façade.
+        other => {
+            let slash = skills_command_to_hub_slash(&other);
+            let configured_hub = edgecrab_core::AppConfig::load()
+                .ok()
+                .and_then(|c| c.skills.hub_url);
+            match edgecrab_tools::tools::skills_hub::handle_skills_hub_slash(
+                &slash,
+                &skills_dir,
+                configured_hub.as_deref(),
+            )
+            .await
+            {
+                Some(msg) => println!("{msg}"),
+                None => {
+                    anyhow::bail!("Unsupported skills command mapping for: {slash}");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Map clap `SkillsCommand` variants onto `/skills …` args for `handle_skills_hub_slash`.
+fn skills_command_to_hub_slash(command: &SkillsCommand) -> String {
+    use crate::cli_args::{SkillsIndexCommand, SkillsSnapshotCommand, SkillsTapCommand};
+    match command {
+        SkillsCommand::Tap { command } => match command {
+            SkillsTapCommand::List => "tap list".into(),
+            SkillsTapCommand::Add { repo, root } => match root {
+                Some(root) => format!("tap add {repo} {root}"),
+                None => format!("tap add {repo}"),
+            },
+            SkillsTapCommand::Remove { name } => format!("tap remove {name}"),
+        },
+        SkillsCommand::Trust { identifier } => format!("trust {identifier}"),
+        SkillsCommand::Untrust { identifier } => format!("untrust {identifier}"),
+        SkillsCommand::Trusted => "trusted".into(),
+        SkillsCommand::Audit { name, deep, log } => {
+            if *log {
+                "audit log".into()
+            } else {
+                let mut parts = vec!["audit".to_string()];
+                if let Some(name) = name {
+                    parts.push(name.clone());
+                }
+                if *deep {
+                    parts.push("--deep".into());
+                }
+                parts.join(" ")
+            }
+        }
+        SkillsCommand::Snapshot { command } => match command {
+            SkillsSnapshotCommand::Export { file } => format!("snapshot export {file}"),
+            SkillsSnapshotCommand::Import { file, force } => {
+                if *force {
+                    format!("snapshot import {file} --force")
+                } else {
+                    format!("snapshot import {file}")
+                }
+            }
+        },
+        SkillsCommand::Check { name } => match name {
+            Some(name) => format!("check {name}"),
+            None => "check".into(),
+        },
+        SkillsCommand::Inspect { identifier, scan } => {
+            if *scan {
+                format!("inspect {identifier} --scan")
+            } else {
+                format!("inspect {identifier}")
+            }
+        }
+        SkillsCommand::OptOut { remove, dry_run } => {
+            let mut parts = vec!["opt-out".to_string()];
+            if *remove {
+                parts.push("--remove".into());
+            }
+            if *dry_run {
+                parts.push("--dry-run".into());
+            }
+            parts.join(" ")
+        }
+        SkillsCommand::OptIn { sync } => {
+            if *sync {
+                "opt-in --sync".into()
+            } else {
+                "opt-in".into()
+            }
+        }
+        SkillsCommand::Reset { name, restore } => {
+            if *restore {
+                format!("reset {name} --restore")
+            } else {
+                format!("reset {name}")
+            }
+        }
+        SkillsCommand::Lock => "lock".into(),
+        SkillsCommand::Index { command } => match command {
+            SkillsIndexCommand::Refresh => "index refresh".into(),
+            SkillsIndexCommand::Status => "index status".into(),
+        },
+        SkillsCommand::ListModified { json } => {
+            if *json {
+                "list-modified --json".into()
+            } else {
+                "list-modified".into()
+            }
+        }
+        SkillsCommand::Diff { name } => format!("diff-bundled {name}"),
+        SkillsCommand::RepairOfficial { name, restore } => {
+            if *restore {
+                format!("repair-official {name} --restore")
+            } else {
+                format!("repair-official {name}")
+            }
+        }
+        SkillsCommand::Publish { path, to, repo } => {
+            let mut parts = vec![
+                "publish".to_string(),
+                path.clone(),
+                "--to".into(),
+                to.clone(),
+            ];
+            if let Some(repo) = repo {
+                parts.push("--repo".into());
+                parts.push(repo.clone());
+            }
+            parts.join(" ")
+        }
+        SkillsCommand::Bundles { command } => match command {
+            crate::cli_args::SkillsBundlesCommand::Help => "bundles".into(),
+            crate::cli_args::SkillsBundlesCommand::Show { file } => {
+                format!("bundles show {file}")
+            }
+            crate::cli_args::SkillsBundlesCommand::Install {
+                file,
+                force,
+                trust,
+                yes,
+            } => {
+                let mut parts = vec!["bundles".into(), "install".into(), file.clone()];
+                if *force {
+                    parts.push("--force".into());
+                }
+                if *trust {
+                    parts.push("--trust".into());
+                }
+                if *yes {
+                    parts.push("--yes".into());
+                }
+                parts.join(" ")
+            }
+        },
+        SkillsCommand::WebHub => "web-hub".into(),
+        // Covered by dedicated arms above — not reached.
+        SkillsCommand::List
+        | SkillsCommand::View { .. }
+        | SkillsCommand::Search { .. }
+        | SkillsCommand::Browse { .. }
+        | SkillsCommand::Install { .. }
+        | SkillsCommand::ImportFrom { .. }
+        | SkillsCommand::Sources
+        | SkillsCommand::Update { .. }
+        | SkillsCommand::Remove { .. } => unreachable!("handled by dedicated SkillsCommand arms"),
+    }
+}
+
+#[cfg(test)]
+mod skills_cli_parity_tests {
+    use super::skills_command_to_hub_slash;
+    use crate::cli_args::{
+        SkillsCommand, SkillsIndexCommand, SkillsSnapshotCommand, SkillsTapCommand,
+    };
+
+    #[test]
+    fn maps_tap_trust_audit_snapshot_to_slash() {
+        assert_eq!(
+            skills_command_to_hub_slash(&SkillsCommand::Tap {
+                command: SkillsTapCommand::List
+            }),
+            "tap list"
+        );
+        assert_eq!(
+            skills_command_to_hub_slash(&SkillsCommand::Tap {
+                command: SkillsTapCommand::Add {
+                    repo: "owner/repo".into(),
+                    root: Some("skills".into()),
+                }
+            }),
+            "tap add owner/repo skills"
+        );
+        assert_eq!(
+            skills_command_to_hub_slash(&SkillsCommand::Trust {
+                identifier: "openai/demo".into()
+            }),
+            "trust openai/demo"
+        );
+        assert_eq!(
+            skills_command_to_hub_slash(&SkillsCommand::Audit {
+                name: None,
+                deep: false,
+                log: true,
+            }),
+            "audit log"
+        );
+        assert_eq!(
+            skills_command_to_hub_slash(&SkillsCommand::Snapshot {
+                command: SkillsSnapshotCommand::Import {
+                    file: "snap.json".into(),
+                    force: true,
+                }
+            }),
+            "snapshot import snap.json --force"
+        );
+        assert_eq!(
+            skills_command_to_hub_slash(&SkillsCommand::Inspect {
+                identifier: "x".into(),
+                scan: true,
+            }),
+            "inspect x --scan"
+        );
+        assert_eq!(
+            skills_command_to_hub_slash(&SkillsCommand::Index {
+                command: SkillsIndexCommand::Status
+            }),
+            "index status"
+        );
+        assert_eq!(skills_command_to_hub_slash(&SkillsCommand::Lock), "lock");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2405,83 +2767,6 @@ fn extract_skill_description(content: &str) -> String {
     }
 
     String::new()
-}
-
-fn build_local_skill_bundle(
-    source_path: &std::path::Path,
-    name_override: Option<&str>,
-) -> anyhow::Result<edgecrab_tools::tools::skills_hub::SkillBundle> {
-    let skill_name = name_override
-        .map(str::to_string)
-        .unwrap_or_else(|| derive_skill_name(source_path));
-
-    if skill_name.is_empty()
-        || skill_name.contains('/')
-        || skill_name.contains('\\')
-        || skill_name.contains("..")
-    {
-        anyhow::bail!(
-            "Derived skill name '{}' is unsafe; provide --name",
-            skill_name
-        );
-    }
-
-    let mut files = std::collections::HashMap::new();
-    if source_path.is_file() {
-        let content = std::fs::read_to_string(source_path)?;
-        files.insert("SKILL.md".into(), content);
-    } else {
-        let skill_md = source_path.join("SKILL.md");
-        if !skill_md.is_file() {
-            anyhow::bail!("No SKILL.md found in {}", source_path.display());
-        }
-        collect_local_skill_files(source_path, source_path, &mut files)?;
-    }
-
-    Ok(edgecrab_tools::tools::skills_hub::SkillBundle {
-        name: skill_name.clone(),
-        files,
-        source: "local".into(),
-        identifier: source_path.display().to_string(),
-        trust_level: "trusted".into(),
-    })
-}
-
-fn derive_skill_name(source_path: &std::path::Path) -> String {
-    if source_path.is_file() {
-        return source_path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("skill")
-            .to_string();
-    }
-    source_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("skill")
-        .to_string()
-}
-
-fn collect_local_skill_files(
-    root: &std::path::Path,
-    dir: &std::path::Path,
-    files: &mut std::collections::HashMap<String, String>,
-) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_local_skill_files(root, &path, files)?;
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            files.insert(rel, std::fs::read_to_string(&path)?);
-        }
-    }
-    Ok(())
 }
 
 async fn run_cron(command: CronCommand, args: &CliArgs) -> anyhow::Result<()> {

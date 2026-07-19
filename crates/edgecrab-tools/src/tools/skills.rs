@@ -2926,6 +2926,8 @@ impl ToolHandler for SkillsHubTool {
                 let gate = super::skills_hub::InstallGate {
                     force: args.force,
                     trust: args.trust,
+                    yes: false,
+                    ..Default::default()
                 };
                 super::skills_hub::install_identifier(
                     &identifier,
@@ -2953,6 +2955,8 @@ impl ToolHandler for SkillsHubTool {
                 let gate = super::skills_hub::InstallGate {
                     force: args.force,
                     trust: args.trust,
+                    yes: false,
+                    ..Default::default()
                 };
                 let result = if let Some(name) = args.query {
                     super::skills_hub::update_installed_skill(

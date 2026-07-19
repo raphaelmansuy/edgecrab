@@ -416,10 +416,22 @@ pub fn handle_skills_pending_subcommand(
         "pending" => Some(format_skills_pending_list(home)),
         "approve" | "apply" => Some(approve_pending(home, tokens.get(1).copied())),
         "reject" | "deny" | "drop" => Some(reject_pending(home, tokens.get(1).copied())),
-        "diff" => tokens
-            .get(1)
-            .and_then(|id| skill_pending_diff(home, id))
-            .or_else(|| Some("Usage: /skills diff <id>".into())),
+        "diff" => {
+            let Some(arg) = tokens.get(1).copied() else {
+                return Some(
+                    "Usage: /skills diff <pending-id|bundled-skill-name>\n\
+                     Pending writes: /skills pending\n\
+                     Bundled drift: /skills list-modified"
+                        .into(),
+                );
+            };
+            if let Some(pending) = skill_pending_diff(home, arg) {
+                Some(pending)
+            } else {
+                let bundled = crate::tools::skills_sync::diff_bundled_skill(arg);
+                Some(crate::tools::skills_hub::format_bundled_diff_result(&bundled))
+            }
+        }
         "approval" | "mode" => Some(set_approval_mode(
             tokens.get(1).copied(),
             ctx.write_approval,

@@ -106,7 +106,7 @@ use crate::status_bar::{
     StatusBarDocumentChip, StatusBarEditorMode, StatusBarRenderParams, StatusBarUiProfile,
     render_status_bar as render_status_bar_widget,
 };
-use crate::status_chrome::{TerminalGlyphProfile, compact_spinner_frame};
+use crate::status_chrome::{TerminalGlyphProfile, compact_spinner_frame, format_elapsed_hint};
 use crate::status_summaries::{ActiveSubagentStatus, BackgroundTaskStatus};
 use crate::stream_bridge;
 use crate::theme::{SkinConfig, Theme, palette as P};
@@ -140,6 +140,7 @@ use edgequake_llm::ProviderFactory;
 use tokio_util::sync::CancellationToken;
 
 mod approval_overlay;
+mod browse_page_cache;
 mod browser_chrome;
 mod browser_selectors;
 mod diagnose_overlay;
@@ -156,7 +157,9 @@ mod replay_command;
 mod response_dispatch;
 mod secret_capture_overlay;
 mod setup_overlays;
+mod skill_inspect_view;
 mod skill_trust_overlay;
+mod skills_marketplace;
 mod steering_overlay;
 mod stream_forward;
 mod value_capture_overlay;
@@ -1294,24 +1297,6 @@ async fn play_audio_file(path: &std::path::Path) -> anyhow::Result<&'static str>
     Ok(player.program)
 }
 
-/// Recursively copy a directory tree from `src` to `dst`.
-/// Returns the count of files copied, or an IO error.
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<usize> {
-    std::fs::create_dir_all(dst)?;
-    let mut count = 0;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            count += copy_dir_recursive(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 fn load_config_root_for_edit() -> anyhow::Result<(std::path::PathBuf, serde_yml::Value)> {
     let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
     if let Some(parent) = config_path.parent() {
@@ -2429,6 +2414,26 @@ struct RemoteSkillEntry {
     search_text: String,
     installed_name: Option<String>,
     action: RemoteSkillAction,
+    url: Option<String>,
+    repo: Option<String>,
+    path: Option<String>,
+}
+
+impl RemoteSkillEntry {
+    fn to_inspect_catalog(&self) -> skill_inspect_view::SkillInspectCatalog {
+        skill_inspect_view::SkillInspectCatalog {
+            name: self.name.clone(),
+            identifier: self.identifier.clone(),
+            description: self.description.clone(),
+            source_label: self.source_label.clone(),
+            origin: self.origin.clone(),
+            trust_level: self.trust_level.clone(),
+            tags: self.tags.clone(),
+            url: self.url.clone(),
+            repo: self.repo.clone(),
+            path: self.path.clone(),
+        }
+    }
 }
 
 impl FuzzyItem for RemoteSkillEntry {
@@ -2503,8 +2508,25 @@ where
     inflight_request_id: Option<u64>,
     next_request_id: u64,
     loading_query: Option<String>,
+    /// When the current in-flight fetch started (for elapsed + spinner chrome).
+    loading_started: Option<Instant>,
+    /// Braille/ASCII spinner frame while `inflight_request_id` is set.
+    loading_spinner_frame: usize,
+    /// Abort handle for the in-flight marketplace search/browse task.
+    search_abort: Option<tokio::task::AbortHandle>,
+    /// Abort handle for background per-source catalog `ensure()`.
+    catalog_ensure_abort: Option<tokio::task::AbortHandle>,
+    /// Partials applied for the current `inflight_request_id` (0 → first paint replaces).
+    browse_partials_seen: u32,
     action_in_flight: Option<String>,
     source_filter: Option<String>,
+    /// Last rendered list viewport height (for PageUp/PageDown / mouse wheel).
+    list_viewport_rows: usize,
+    /// Last successful empty-query browse snapshot for [`browse_snapshot_filter`].
+    browse_snapshot: Vec<T>,
+    browse_snapshot_filter: Option<String>,
+    /// Sliding page window for on-demand browse extend (skills only).
+    browse_page_cache: browse_page_cache::BrowsePageCache,
 }
 
 impl<T> RemoteBrowserState<T>
@@ -2520,13 +2542,43 @@ where
             inflight_request_id: None,
             next_request_id: 0,
             loading_query: None,
+            loading_started: None,
+            loading_spinner_frame: 0,
+            search_abort: None,
+            catalog_ensure_abort: None,
+            browse_partials_seen: 0,
             action_in_flight: None,
             source_filter: None,
+            list_viewport_rows: 16,
+            browse_snapshot: Vec::new(),
+            browse_snapshot_filter: None,
+            browse_page_cache: browse_page_cache::BrowsePageCache::default(),
         }
     }
 
     fn current_query(&self) -> String {
         self.selector.query.trim().to_string()
+    }
+
+    fn abort_inflight_search(&mut self) {
+        if let Some(handle) = self.search_abort.take() {
+            handle.abort();
+        }
+    }
+
+    fn abort_catalog_ensure(&mut self) {
+        if let Some(handle) = self.catalog_ensure_abort.take() {
+            handle.abort();
+        }
+        self.browse_page_cache.clear_catalog_ensure();
+    }
+
+    fn clear_loading(&mut self) {
+        self.abort_inflight_search();
+        self.inflight_request_id = None;
+        self.loading_query = None;
+        self.loading_started = None;
+        self.browse_partials_seen = 0;
     }
 
     fn activate(&mut self, initial_query: Option<&str>, source_filter: Option<&str>) {
@@ -2537,9 +2589,11 @@ where
         self.notices.clear();
         self.last_completed_query = None;
         self.search_due_at = None;
-        self.inflight_request_id = None;
-        self.loading_query = None;
+        self.clear_loading();
+        self.abort_catalog_ensure();
+        self.loading_spinner_frame = 0;
         self.action_in_flight = None;
+        self.browse_page_cache.reset_for_browse();
         self.source_filter = source_filter
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -2548,11 +2602,44 @@ where
 
     fn reset_results(&mut self) {
         self.search_due_at = None;
-        self.inflight_request_id = None;
-        self.loading_query = None;
+        self.clear_loading();
+        self.abort_catalog_ensure();
         self.last_completed_query = None;
         self.notices.clear();
         self.selector.set_items(Vec::new());
+        self.browse_snapshot.clear();
+        self.browse_snapshot_filter = None;
+        self.browse_page_cache.reset_for_browse();
+    }
+
+    fn loading_status_line(
+        &self,
+        browse: bool,
+        filter_label: &str,
+        glyphs: TerminalGlyphProfile,
+    ) -> String {
+        let spin = compact_spinner_frame(self.loading_spinner_frame, glyphs);
+        let elapsed = self
+            .loading_started
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        let elapsed_hint = format_elapsed_hint(elapsed, 1);
+        if browse {
+            format!("{spin} Browsing {filter_label}…{elapsed_hint}")
+        } else {
+            format!("{spin} Searching remote sources…{elapsed_hint}")
+        }
+    }
+
+    fn restore_browse_snapshot_if_matching(&mut self) -> bool {
+        let filter_matches = self.browse_snapshot_filter == self.source_filter;
+        if filter_matches && !self.browse_snapshot.is_empty() {
+            self.selector
+                .replace_items_preserving_state(self.browse_snapshot.clone());
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -3948,11 +4035,21 @@ pub struct App {
     plugin_toggle_status_note: Option<String>,
     /// Remote plugin browser overlay (activated by `/plugins search` or `/plugins browse`)
     remote_plugin_browser: RemotePluginBrowser,
-    /// Remote skill browser overlay (activated by `/skills search` or `/skills hub`)
+    /// Remote skill browser overlay (`/skills browse|hub` catalog, `/skills search <q>`)
     remote_skill_browser: RemoteSkillBrowser,
     remote_skill_guard: remote_skill_guard::RemoteSkillGuardCache,
     /// Guard scan trust prompt (dangerous / caution skills from remote browser).
     skill_trust_prompt: Option<SkillTrustPromptState>,
+    /// Skills Marketplace FSM (019 W2) — theatre + mode around remote browser / guard.
+    skills_marketplace_mode: skills_marketplace::MarketplaceMode,
+    /// Expanded `?` help strip for the remote skills marketplace.
+    skills_marketplace_help: bool,
+    /// Identifiers opened in Inspect this session (016 install gating).
+    skills_marketplace_inspected: std::collections::HashSet<String>,
+    /// Latest install-theatre status line (from progress events).
+    skills_marketplace_status: Option<String>,
+    /// When the current install theatre stage started (elapsed in UI).
+    skills_install_stage_started: Option<Instant>,
     /// Session browser overlay (activated by F5 or `/session` with no args)
     session_browser: FuzzySelector<SessionBrowserEntry>,
     /// Last non-error status note shown in the session browser footer.
@@ -4383,11 +4480,22 @@ enum AgentResponse {
     },
     /// A background operation (model discovery, compress, swap) completed.
     BgOp(BackgroundOpResult),
+    /// Progressive remote skill browse/search — one source group finished.
+    RemoteSkillSearchPartial {
+        request_id: u64,
+        query: String,
+        group: edgecrab_tools::tools::skills_hub::SearchGroup,
+    },
     /// A remote skill search completed for the given request id and query.
     RemoteSkillSearchReady {
         request_id: u64,
         query: String,
         report: edgecrab_tools::tools::skills_hub::SearchReport,
+    },
+    /// Background per-source catalog ensure finished (skills marketplace browse).
+    RemoteSkillCatalogEnsureDone {
+        filter: String,
+        error: Option<String>,
     },
     /// A remote plugin search completed for the given request id and query.
     RemotePluginSearchReady {
@@ -4427,6 +4535,12 @@ enum AgentResponse {
     RemoteSkillGuardPreviewFailed {
         identifier: String,
         error: String,
+    },
+    /// Install theatre stage update for Skills Marketplace (019 W2).
+    RemoteSkillInstallProgress {
+        identifier: String,
+        stage: skills_marketplace::InstallStage,
+        status: Option<String>,
     },
     /// A remote skill install/update action completed.
     RemoteSkillActionComplete {
@@ -5012,6 +5126,11 @@ impl App {
             remote_skill_browser: RemoteSkillBrowser::new(),
             remote_skill_guard: remote_skill_guard::RemoteSkillGuardCache::default(),
             skill_trust_prompt: None,
+            skills_marketplace_mode: skills_marketplace::MarketplaceMode::default(),
+            skills_marketplace_help: false,
+            skills_marketplace_inspected: std::collections::HashSet::new(),
+            skills_marketplace_status: None,
+            skills_install_stage_started: None,
             session_browser: FuzzySelector::new(),
             session_browser_status_note: None,
             session_browser_pane: DetailPaneState::default(),
@@ -6468,6 +6587,10 @@ impl App {
     }
 
     fn open_skill_selector(&mut self) {
+        // Marketplace home: installed list + `/`/`S` → SearchRemote.
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::BrowseInstalled;
+        self.skills_marketplace_help = false;
+        self.remote_skill_browser.selector.active = false;
         self.refresh_skills_list();
         self.reset_split_detail_scroll(DetailSurface::SkillSelector);
         self.skill_selector.activate();
@@ -6772,6 +6895,31 @@ impl App {
         identifier.trim().replace('\\', "/")
     }
 
+    /// Top-level skill names under `skills_dir` (O(n) once — no recursive walk per row).
+    fn installed_skill_dir_names(skills_dir: &std::path::Path) -> HashSet<String> {
+        let mut names = HashSet::new();
+        let Ok(entries) = std::fs::read_dir(skills_dir) else {
+            return names;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() && path.join("SKILL.md").is_file() {
+                names.insert(name);
+            } else if path.is_file()
+                && let Some(stem) = name.strip_suffix(".md")
+            {
+                names.insert(stem.to_string());
+            }
+        }
+        names
+    }
+
     fn build_remote_skill_entries(
         report: &edgecrab_tools::tools::skills_hub::SearchReport,
     ) -> (Vec<RemoteSkillEntry>, Vec<String>) {
@@ -6784,6 +6932,8 @@ impl App {
                 installed_name,
             );
         }
+        // O(1) collision lookup — avoid recursive `find_skill_md` on every partial row.
+        let installed_dirs = Self::installed_skill_dir_names(&skills_dir);
 
         let mut entries = Vec::new();
         let mut notices = Vec::new();
@@ -6795,8 +6945,7 @@ impl App {
             for skill in &group.results {
                 let normalized_identifier = Self::normalize_skill_identifier(&skill.identifier);
                 let installed_name = installed_by_identifier.get(&normalized_identifier).cloned();
-                let has_local_collision = Self::find_skill_md(&skill.name).is_some()
-                    || skills_dir.join(&skill.name).exists();
+                let has_local_collision = installed_dirs.contains(&skill.name);
                 let action = if installed_name.is_some() {
                     RemoteSkillAction::Update
                 } else if has_local_collision {
@@ -6830,6 +6979,9 @@ impl App {
                     search_text,
                     installed_name,
                     action,
+                    url: skill.url.clone(),
+                    repo: skill.repo.clone(),
+                    path: skill.path.clone(),
                 });
             }
         }
@@ -6997,6 +7149,8 @@ impl App {
         let request_id = self.remote_mcp_browser.next_request_id;
         self.remote_mcp_browser.inflight_request_id = Some(request_id);
         self.remote_mcp_browser.loading_query = Some(query.clone());
+        self.remote_mcp_browser.loading_started = Some(Instant::now());
+        self.remote_mcp_browser.loading_spinner_frame = 0;
         let tx = self.response_tx.clone();
         self.rt_handle.spawn(async move {
             let report = crate::mcp_catalog::search_mcp_sources(Some(&query), 12).await;
@@ -7023,8 +7177,7 @@ impl App {
         }
 
         let (entries, notices) = Self::build_remote_mcp_entries(&report);
-        self.remote_mcp_browser.inflight_request_id = None;
-        self.remote_mcp_browser.loading_query = None;
+        self.remote_mcp_browser.clear_loading();
         self.remote_mcp_browser.last_completed_query = Some(query);
         self.remote_mcp_browser.notices = notices;
         self.remote_mcp_browser.selector.set_items(entries);
@@ -7110,27 +7263,625 @@ impl App {
     }
 
     fn open_remote_skill_selector(&mut self, initial_query: Option<&str>) {
+        self.skills_marketplace_help = false;
+        self.skills_marketplace_status = None;
+        // Empty hub/search/`R` must open marketplace SearchRemote (not re-enter local).
+        let query = initial_query.filter(|q| !q.trim().is_empty());
+        self.enter_skills_marketplace_search(query);
+        self.needs_redraw = true;
+    }
+
+    fn enter_skills_marketplace_installed(&mut self) {
+        self.remote_skill_browser.selector.active = false;
+        self.remote_skill_browser.action_in_flight = None;
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::BrowseInstalled;
+        self.refresh_skills_list();
+        self.reset_split_detail_scroll(DetailSurface::SkillSelector);
+        self.skill_selector.activate();
+        self.needs_redraw = true;
+    }
+
+    /// True when any Skills Marketplace surface (list, remote, modal, guard) is up.
+    fn skills_marketplace_visible(&self) -> bool {
+        self.skill_selector.active
+            || self.remote_skill_browser.selector.active
+            || self.skill_trust_prompt.is_some()
+            || !matches!(
+                self.skills_marketplace_mode,
+                skills_marketplace::MarketplaceMode::BrowseInstalled
+            )
+    }
+
+    /// Fully leave the Skills Marketplace (cancel in-flight browse/search).
+    /// Used by mouse dismiss; Esc keeps layered Back via [`apply_marketplace_action`].
+    fn dismiss_skills_marketplace(&mut self) {
+        self.remote_skill_browser.next_request_id = self
+            .remote_skill_browser
+            .next_request_id
+            .saturating_add(1);
+        self.remote_skill_browser.clear_loading();
+        self.remote_skill_browser.abort_catalog_ensure();
+        self.remote_skill_browser.search_due_at = None;
+        self.remote_skill_browser.selector.active = false;
+        self.remote_skill_browser.action_in_flight = None;
+        self.skill_selector.active = false;
+        self.skill_trust_prompt = None;
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::BrowseInstalled;
+        self.skills_marketplace_help = false;
+        self.skills_marketplace_status = None;
+        self.needs_redraw = true;
+    }
+
+    /// Terminal area used for marketplace mouse hit-testing.
+    fn skills_marketplace_terminal_area(&self) -> Rect {
+        let (cols, rows) =
+            crossterm::terminal::size().unwrap_or((self.last_terminal_width.max(1), 24));
+        Rect::new(0, 0, cols, rows)
+    }
+
+    /// Geometry for remote SearchRemote / Inspect mouse hit-testing.
+    fn skills_marketplace_remote_hit_rects(
+        &self,
+        area: Rect,
+    ) -> (Rect, Rect, Rect, Rect) {
+        let inspecting = matches!(
+            self.skills_marketplace_mode,
+            skills_marketplace::MarketplaceMode::Inspect { .. }
+        );
+        let footer_h = if self.skills_marketplace_help { 4u16 } else { 1 };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(footer_h),
+            ])
+            .split(area);
+        let body = Self::browser_body_chunks(chunks[1]);
+        let show_chips = area.width >= 80 && !inspecting;
+        let list = if show_chips {
+            let chip_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(body[0]);
+            chip_chunks[1]
+        } else {
+            body[0]
+        };
+        (chunks[0], list, body[1], chunks[2])
+    }
+
+    /// Mouse left-click for Skills Marketplace (Wave B dismiss + Wave C row/detail).
+    /// Returns `(consumed, suppress_double_click_capture_toggle)`.
+    fn handle_skills_marketplace_mouse(
+        &mut self,
+        column: u16,
+        row: u16,
+        is_double: bool,
+    ) -> (bool, bool) {
+        if !self.skills_marketplace_visible() {
+            return (false, false);
+        }
+        use skills_marketplace::{MarketplaceAction, MarketplaceMode, MarketplaceModeKind};
+        let area = self.skills_marketplace_terminal_area();
+        match self.skills_marketplace_mode.kind() {
+            MarketplaceModeKind::Installing => {
+                // Don't orphan a half-install — Esc cancels via keymap.
+                (true, true)
+            }
+            MarketplaceModeKind::ConfirmSafe => {
+                match skills_marketplace::confirm_safe_button_hit(area, column, row) {
+                    Some(true) => {
+                        let _ = self.apply_marketplace_action(MarketplaceAction::ConfirmSafeInstall);
+                        (true, true)
+                    }
+                    Some(false) => {
+                        let _ = self.apply_marketplace_action(MarketplaceAction::Back);
+                        (true, true)
+                    }
+                    None => {
+                        let popup = skills_marketplace::marketplace_popup_rect(area);
+                        if skills_marketplace::rect_contains_cell(popup, column, row) {
+                            (true, false)
+                        } else {
+                            let _ = self.apply_marketplace_action(MarketplaceAction::Back);
+                            (true, false)
+                        }
+                    }
+                }
+            }
+            MarketplaceModeKind::ImportFrom | MarketplaceModeKind::SourcePick => {
+                let popup = skills_marketplace::marketplace_popup_rect(area);
+                if skills_marketplace::rect_contains_cell(popup, column, row) {
+                    (true, false)
+                } else {
+                    let _ = self.apply_marketplace_action(MarketplaceAction::Back);
+                    (true, false)
+                }
+            }
+            MarketplaceModeKind::Done | MarketplaceModeKind::Error => {
+                let _ = self.apply_marketplace_action(MarketplaceAction::DismissDone);
+                (true, false)
+            }
+            MarketplaceModeKind::GuardReview => {
+                self.skill_trust_prompt = None;
+                self.skills_marketplace_mode = MarketplaceMode::SearchRemote;
+                self.needs_redraw = true;
+                (true, false)
+            }
+            MarketplaceModeKind::BrowseInstalled => {
+                // Installed home: click header/footer dismisses; list/detail stay for keyboard.
+                let chunks = Self::browser_overlay_chunks(area);
+                if skills_marketplace::rect_contains_cell(chunks[0], column, row)
+                    || skills_marketplace::rect_contains_cell(chunks[2], column, row)
+                {
+                    self.dismiss_skills_marketplace();
+                }
+                (true, false)
+            }
+            MarketplaceModeKind::SearchRemote | MarketplaceModeKind::Inspect => {
+                let (header, list, detail, footer) =
+                    self.skills_marketplace_remote_hit_rects(area);
+                if skills_marketplace::rect_contains_cell(list, column, row) {
+                    let viewport = list.height.max(1) as usize;
+                    let selected = self.remote_skill_browser.selector.selected;
+                    let total = self.remote_skill_browser.selector.filtered.len();
+                    let (scroll_start, _) =
+                        Self::browser_virtual_window(selected, total, viewport);
+                    let row_offset = row.saturating_sub(list.y) as usize;
+                    let idx = scroll_start + row_offset;
+                    if idx < total {
+                        self.remote_skill_browser.selector.selected = idx;
+                        self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+                        self.schedule_remote_skill_guard_preview();
+                        self.maybe_extend_browse_cache();
+                        self.needs_redraw = true;
+                        if is_double
+                            && matches!(
+                                self.skills_marketplace_mode.kind(),
+                                MarketplaceModeKind::SearchRemote
+                            )
+                        {
+                            let _ =
+                                self.apply_marketplace_action(MarketplaceAction::InspectSelected);
+                            return (true, true);
+                        }
+                    }
+                    return (true, is_double);
+                }
+                if skills_marketplace::rect_contains_cell(detail, column, row) {
+                    if self.simple_split_focus(DetailSurface::RemoteSkillBrowser)
+                        != SplitPaneFocus::Detail
+                    {
+                        self.toggle_simple_split_focus(DetailSurface::RemoteSkillBrowser);
+                    }
+                    self.needs_redraw = true;
+                    return (true, false);
+                }
+                if skills_marketplace::rect_contains_cell(header, column, row)
+                    || skills_marketplace::rect_contains_cell(footer, column, row)
+                {
+                    self.dismiss_skills_marketplace();
+                    return (true, false);
+                }
+                // Chip strip / gutters: keep open.
+                (true, false)
+            }
+        }
+    }
+
+    /// Backward-compatible wrapper used by unit tests.
+    #[cfg(test)]
+    fn handle_skills_marketplace_mouse_dismiss(&mut self, column: u16, row: u16) -> bool {
+        self.handle_skills_marketplace_mouse(column, row, false).0
+    }
+
+    fn enter_skills_marketplace_search(&mut self, initial_query: Option<&str>) {
         self.skill_selector.active = false;
         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
-        self.remote_skill_browser.activate(initial_query, None);
+        let filter = self.remote_skill_browser.source_filter.clone();
+        self.remote_skill_browser
+            .activate(initial_query, filter.as_deref());
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::SearchRemote;
         self.schedule_remote_skill_search(true);
         self.needs_redraw = true;
     }
 
-    fn schedule_remote_skill_search(&mut self, immediate: bool) {
-        let query = self.remote_skill_browser.current_query();
-        if query.is_empty() {
-            self.remote_skill_browser.reset_results();
-            self.needs_redraw = true;
+    fn cycle_skills_marketplace_provider_filter(&mut self) {
+        let next = skills_marketplace::next_provider_filter(
+            self.remote_skill_browser.source_filter.as_deref(),
+        );
+        self.set_skills_marketplace_source_filter(next);
+    }
+
+    fn prev_skills_marketplace_provider_filter(&mut self) {
+        let prev = skills_marketplace::prev_provider_filter(
+            self.remote_skill_browser.source_filter.as_deref(),
+        );
+        self.set_skills_marketplace_source_filter(prev);
+    }
+
+    fn set_skills_marketplace_source_filter(&mut self, filter: Option<&str>) {
+        // Cancel-on-navigate: drop prior browse + catalog ensure for the old chip.
+        self.remote_skill_browser.abort_catalog_ensure();
+        self.remote_skill_browser.abort_inflight_search();
+        self.remote_skill_browser.source_filter = filter.map(str::to_string);
+        self.remote_skill_browser.browse_page_cache.reset_for_browse();
+        // Allow rebrowse even if prior empty-query load is still marked loading.
+        self.remote_skill_browser.loading_query = None;
+        self.schedule_remote_skill_search(true);
+        self.needs_redraw = true;
+    }
+
+    fn open_skills_import_from_picker(&mut self) {
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::ImportFrom { selected: 0 };
+        self.needs_redraw = true;
+    }
+
+    fn open_skills_source_picker(&mut self) {
+        let filters = skills_marketplace::marketplace_provider_filters();
+        let cur = self
+            .remote_skill_browser
+            .source_filter
+            .as_deref()
+            .unwrap_or("all");
+        let selected = filters
+            .iter()
+            .position(|p| (*p).eq_ignore_ascii_case(cur))
+            .unwrap_or(0);
+        self.skills_marketplace_mode =
+            skills_marketplace::MarketplaceMode::SourcePick { selected };
+        self.needs_redraw = true;
+    }
+
+    fn enter_skills_marketplace_inspect(&mut self) {
+        let Some(entry) = self.remote_skill_browser.selector.current() else {
+            return;
+        };
+        let id = entry.identifier.clone();
+        self.skills_marketplace_inspected.insert(id.clone());
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::Inspect {
+            identifier: id,
+            preview_scroll: 0,
+        };
+        if !self.simple_split_detail_focused(DetailSurface::RemoteSkillBrowser) {
+            self.toggle_simple_split_focus(DetailSurface::RemoteSkillBrowser);
+        }
+        self.schedule_remote_skill_guard_preview();
+        self.needs_redraw = true;
+    }
+
+    fn open_skills_marketplace_evidence_review(&mut self) {
+        let Some(entry) = self.remote_skill_browser.selector.current().cloned() else {
+            return;
+        };
+        let Some(preview) = self.remote_skill_guard.preview.clone() else {
+            self.push_output(
+                "Skill Guard preview not ready yet — wait for scan or press s to retry.",
+                OutputRole::System,
+            );
+            return;
+        };
+        if self.remote_skill_guard.for_identifier.as_deref() != Some(entry.identifier.as_str()) {
+            self.push_output(
+                "Skill Guard preview is for a different skill — wait for scan to finish.",
+                OutputRole::System,
+            );
             return;
         }
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::GuardReview {
+            identifier: entry.identifier.clone(),
+            preserved_query: self.remote_skill_browser.current_query(),
+        };
+        self.skill_trust_prompt = Some(Self::build_skill_trust_prompt_state(entry, preview, true));
+        self.needs_redraw = true;
+    }
 
+    /// Single apply path for marketplace keymap side effects (019 C5 SOLID).
+    /// Returns true when the action was handled (caller should `return` from key dispatch).
+    fn apply_marketplace_action(
+        &mut self,
+        action: skills_marketplace::MarketplaceAction,
+    ) -> bool {
+        use skills_marketplace::{IMPORT_FROM_PEERS, MarketplaceAction, MarketplaceMode};
+        match action {
+            MarketplaceAction::Noop => false,
+            MarketplaceAction::ToggleHelp => {
+                self.skills_marketplace_help = !self.skills_marketplace_help;
+                self.needs_redraw = true;
+                true
+            }
+            MarketplaceAction::DismissDone => {
+                self.enter_skills_marketplace_installed();
+                true
+            }
+            MarketplaceAction::Refresh => {
+                self.schedule_remote_skill_search(true);
+                true
+            }
+            MarketplaceAction::CycleProviderFilter => {
+                // Cancel-on-navigate: chip change aborts inflight and rebrowses.
+                self.cycle_skills_marketplace_provider_filter();
+                true
+            }
+            MarketplaceAction::PrevProviderFilter => {
+                self.prev_skills_marketplace_provider_filter();
+                true
+            }
+            MarketplaceAction::JumpSource(idx) => {
+                let filter = skills_marketplace::provider_filter_at(idx);
+                self.set_skills_marketplace_source_filter(filter);
+                true
+            }
+            MarketplaceAction::OpenImportFrom => {
+                self.open_skills_import_from_picker();
+                true
+            }
+            MarketplaceAction::OpenSourcePick => {
+                self.open_skills_source_picker();
+                true
+            }
+            MarketplaceAction::SourcePickMoveUp => {
+                if let MarketplaceMode::SourcePick { selected } =
+                    &mut self.skills_marketplace_mode
+                {
+                    *selected = selected.saturating_sub(1);
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            MarketplaceAction::SourcePickMoveDown => {
+                if let MarketplaceMode::SourcePick { selected } =
+                    &mut self.skills_marketplace_mode
+                {
+                    let max = skills_marketplace::marketplace_provider_filters()
+                        .len()
+                        .saturating_sub(1);
+                    if *selected < max {
+                        *selected += 1;
+                    }
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            MarketplaceAction::SelectSource(idx) => {
+                let filter = skills_marketplace::provider_filter_at(idx);
+                self.skills_marketplace_mode = MarketplaceMode::SearchRemote;
+                self.set_skills_marketplace_source_filter(filter);
+                true
+            }
+            MarketplaceAction::GoBrowseInstalled => {
+                self.clear_remote_skill_guard_cache();
+                self.enter_skills_marketplace_installed();
+                true
+            }
+            MarketplaceAction::GoSearchRemote => {
+                self.enter_skills_marketplace_search(None);
+                true
+            }
+            MarketplaceAction::ImportPeer(idx) => {
+                self.run_skills_import_from_peer(idx);
+                true
+            }
+            MarketplaceAction::ImportFromMoveUp => {
+                if let MarketplaceMode::ImportFrom { selected } = &mut self.skills_marketplace_mode
+                {
+                    *selected = selected.saturating_sub(1);
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            MarketplaceAction::ImportFromMoveDown => {
+                if let MarketplaceMode::ImportFrom { selected } = &mut self.skills_marketplace_mode
+                {
+                    if *selected + 1 < IMPORT_FROM_PEERS.len() {
+                        *selected += 1;
+                    }
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            MarketplaceAction::InspectSelected => {
+                self.enter_skills_marketplace_inspect();
+                true
+            }
+            MarketplaceAction::RequestInstall => {
+                if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
+                    if !self
+                        .skills_marketplace_inspected
+                        .contains(&entry.identifier)
+                    {
+                        self.enter_skills_marketplace_inspect();
+                    } else {
+                        self.run_remote_skill_action(entry);
+                    }
+                }
+                true
+            }
+            MarketplaceAction::StartInstall => {
+                if let Some(entry) = self.remote_skill_browser.selector.current().cloned() {
+                    self.run_remote_skill_action(entry);
+                }
+                true
+            }
+            MarketplaceAction::OpenEvidence => {
+                self.open_skills_marketplace_evidence_review();
+                true
+            }
+            MarketplaceAction::RetryPreview => {
+                self.clear_remote_skill_guard_cache();
+                self.schedule_remote_skill_guard_preview();
+                self.needs_redraw = true;
+                true
+            }
+            MarketplaceAction::ScrollInspectUp => {
+                if let MarketplaceMode::Inspect { preview_scroll, .. } =
+                    &mut self.skills_marketplace_mode
+                {
+                    *preview_scroll = preview_scroll.saturating_sub(1);
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            MarketplaceAction::ScrollInspectDown => {
+                if let MarketplaceMode::Inspect { preview_scroll, .. } =
+                    &mut self.skills_marketplace_mode
+                {
+                    *preview_scroll = preview_scroll.saturating_add(1);
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            MarketplaceAction::ConfirmSafeInstall => {
+                if let MarketplaceMode::ConfirmSafe { identifier, .. } =
+                    self.skills_marketplace_mode.clone()
+                {
+                    let entry = self.remote_skill_browser.selector.current().cloned().filter(
+                        |e| e.identifier == identifier,
+                    );
+                    if let Some(entry) = entry {
+                        let gate = self
+                            .remote_skill_guard
+                            .preview
+                            .as_ref()
+                            .map(|p| p.recommended_gate())
+                            .unwrap_or_default();
+                        self.begin_remote_skill_install(entry, gate);
+                    } else {
+                        self.skills_marketplace_mode = MarketplaceMode::Error {
+                            message: format!("Lost selection for {identifier}"),
+                        };
+                        self.needs_redraw = true;
+                    }
+                }
+                true
+            }
+            MarketplaceAction::Back => {
+                match self.skills_marketplace_mode.clone() {
+                    MarketplaceMode::Installing { .. } => {
+                        self.skills_marketplace_mode = MarketplaceMode::SearchRemote;
+                        self.remote_skill_browser.action_in_flight = None;
+                        self.needs_redraw = true;
+                    }
+                    MarketplaceMode::ConfirmSafe { identifier, .. } => {
+                        self.skills_marketplace_mode = MarketplaceMode::Inspect {
+                            identifier,
+                            preview_scroll: 0,
+                        };
+                        self.needs_redraw = true;
+                    }
+                    MarketplaceMode::ImportFrom { .. } => {
+                        if self.remote_skill_browser.selector.active {
+                            self.skills_marketplace_mode = MarketplaceMode::SearchRemote;
+                        } else {
+                            self.enter_skills_marketplace_installed();
+                        }
+                        self.needs_redraw = true;
+                    }
+                    MarketplaceMode::SourcePick { .. } => {
+                        self.skills_marketplace_mode = MarketplaceMode::SearchRemote;
+                        self.needs_redraw = true;
+                    }
+                    MarketplaceMode::Inspect { .. } => {
+                        self.skills_marketplace_mode = MarketplaceMode::SearchRemote;
+                        if self.simple_split_detail_focused(DetailSurface::RemoteSkillBrowser) {
+                            self.toggle_simple_split_focus(DetailSurface::RemoteSkillBrowser);
+                        }
+                        self.needs_redraw = true;
+                    }
+                    _ => {}
+                }
+                true
+            }
+            MarketplaceAction::Close => {
+                self.skill_selector.active = false;
+                self.skills_marketplace_mode = MarketplaceMode::BrowseInstalled;
+                self.skills_marketplace_help = false;
+                self.needs_redraw = true;
+                true
+            }
+        }
+    }
+
+    fn run_skills_import_from_peer(&mut self, peer_idx: usize) {
+        let Some(peer) = skills_marketplace::IMPORT_FROM_PEERS.get(peer_idx).copied() else {
+            return;
+        };
+        let skills_dir = Self::skills_dir();
+        let tx = self.response_tx.clone();
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::Installing {
+            identifier: format!("import-from:{peer}"),
+            stage: skills_marketplace::InstallStage::Fetch,
+        };
+        self.skills_install_stage_started = Some(Instant::now());
+        self.remote_skill_browser.action_in_flight =
+            Some(format!("import-from {peer}"));
+        self.needs_redraw = true;
+        self.rt_handle.spawn(async move {
+            let _ = tx.send(AgentResponse::RemoteSkillInstallProgress {
+                identifier: format!("import-from:{peer}"),
+                stage: skills_marketplace::InstallStage::Quarantine,
+                status: Some(format!("importing peer skills from {peer}")),
+            });
+            let gate = edgecrab_tools::tools::skills_hub::InstallGate::default();
+            match edgecrab_tools::tools::skills_hub::import_skills_from(peer, &skills_dir, gate) {
+                Ok(report) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillActionComplete {
+                        message: report.format(),
+                        skill_name: peer.to_string(),
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillActionFailed {
+                        action_label: "import-from".into(),
+                        identifier: peer.to_string(),
+                        error,
+                    });
+                }
+            }
+        });
+    }
+
+    fn remote_skill_search_load_key(query: &str, source_filter: Option<&str>) -> String {
+        let q = if query.is_empty() { "*browse*" } else { query };
+        format!("{}::{q}", source_filter.unwrap_or("all"))
+    }
+
+    fn schedule_remote_skill_search(&mut self, immediate: bool) {
+        // Empty query = marketplace browse (catalog); do not clear results preemptively.
         self.remote_skill_browser.search_due_at = Some(if immediate {
             Instant::now()
         } else {
             Instant::now() + Duration::from_millis(250)
         });
         self.needs_redraw = true;
+    }
+
+    /// After a query edit: filter locally; only hit the network for remote search (≥2 chars).
+    fn maybe_schedule_remote_skill_search_after_query_edit(&mut self) {
+        let q = self.remote_skill_browser.current_query();
+        let chars = q.chars().count();
+        if chars == 0 {
+            // Restore last browse snapshot for this source — no network.
+            if self
+                .remote_skill_browser
+                .restore_browse_snapshot_if_matching()
+            {
+                self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+                self.schedule_remote_skill_guard_preview();
+                self.needs_redraw = true;
+            }
+            // Cancel any pending debounced search from prior keystrokes.
+            self.remote_skill_browser.search_due_at = None;
+            return;
+        }
+        if chars < 2 {
+            // Local fuzzy filter of the browse/search snapshot only.
+            self.remote_skill_browser.search_due_at = None;
+            self.needs_redraw = true;
+            return;
+        }
+        self.schedule_remote_skill_search(false);
     }
 
     fn poll_remote_skill_search(&mut self) {
@@ -7147,26 +7898,59 @@ impl App {
 
         let query = self.remote_skill_browser.current_query();
         self.remote_skill_browser.search_due_at = None;
-        if query.is_empty() {
-            return;
-        }
-        if self.remote_skill_browser.loading_query.as_deref() == Some(query.as_str()) {
+        let source_filter = self.remote_skill_browser.source_filter.clone();
+        let load_key =
+            Self::remote_skill_search_load_key(&query, source_filter.as_deref());
+        if self.remote_skill_browser.loading_query.as_deref() == Some(load_key.as_str()) {
             return;
         }
 
+        // Cancel-on-navigate: abort prior browse/search before scheduling a new one.
+        self.remote_skill_browser.abort_inflight_search();
         self.remote_skill_browser.next_request_id =
             self.remote_skill_browser.next_request_id.saturating_add(1);
         let request_id = self.remote_skill_browser.next_request_id;
         self.remote_skill_browser.inflight_request_id = Some(request_id);
-        self.remote_skill_browser.loading_query = Some(query.clone());
+        self.remote_skill_browser.loading_query = Some(load_key);
+        self.remote_skill_browser.loading_started = Some(Instant::now());
+        self.remote_skill_browser.loading_spinner_frame = 0;
+        self.remote_skill_browser.browse_partials_seen = 0;
+        if query.is_empty() {
+            self.remote_skill_browser.browse_page_cache.reset_for_browse();
+            // Retain prior rows (or empty → skeleton). Never blank-wipe mid-fetch.
+            // First partial for this request_id replaces; later partials merge.
+            self.remote_skill_browser.notices.clear();
+        }
+        // Browse: first page only (extend on scroll). Search: ranked cap.
+        let filter_key = source_filter.as_deref().unwrap_or("all");
+        let browse = query.is_empty();
+        let requested = if browse {
+            edgecrab_tools::tools::skills_hub::MARKETPLACE_BROWSE_PAGE_SIZE
+        } else {
+            50
+        };
+        let limit = edgecrab_tools::tools::skills_hub::marketplace_result_limit(
+            filter_key,
+            requested,
+            browse,
+        );
         let tx = self.response_tx.clone();
-        self.rt_handle.spawn(async move {
+        let join = self.rt_handle.spawn(async move {
             let config = edgecrab_core::AppConfig::load().unwrap_or_default();
-            let report = edgecrab_tools::tools::skills_hub::search_hub(
+            let tx_partial = tx.clone();
+            let query_for_partial = query.clone();
+            let report = edgecrab_tools::tools::skills_hub::search_hub_progressive(
                 &query,
-                None,
-                12,
+                source_filter.as_deref(),
+                limit,
                 config.skills.hub_url.as_deref(),
+                move |group| {
+                    let _ = tx_partial.send(AgentResponse::RemoteSkillSearchPartial {
+                        request_id,
+                        query: query_for_partial.clone(),
+                        group,
+                    });
+                },
             )
             .await;
             let _ = tx.send(AgentResponse::RemoteSkillSearchReady {
@@ -7175,6 +7959,7 @@ impl App {
                 report,
             });
         });
+        self.remote_skill_browser.search_abort = Some(join.abort_handle());
         self.needs_redraw = true;
     }
 
@@ -7234,6 +8019,8 @@ impl App {
         let source_filter = self.remote_plugin_browser.source_filter.clone();
         self.remote_plugin_browser.inflight_request_id = Some(request_id);
         self.remote_plugin_browser.loading_query = Some(query.clone());
+        self.remote_plugin_browser.loading_started = Some(Instant::now());
+        self.remote_plugin_browser.loading_spinner_frame = 0;
         let tx = self.response_tx.clone();
         self.rt_handle.spawn(async move {
             let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
@@ -7269,8 +8056,7 @@ impl App {
         }
 
         let (entries, notices) = Self::build_remote_plugin_entries(&report);
-        self.remote_plugin_browser.inflight_request_id = None;
-        self.remote_plugin_browser.loading_query = None;
+        self.remote_plugin_browser.clear_loading();
         self.remote_plugin_browser.last_completed_query = Some(query);
         self.remote_plugin_browser.notices = notices;
         self.remote_plugin_browser.selector.set_items(entries);
@@ -7342,6 +8128,52 @@ impl App {
         });
     }
 
+    fn apply_remote_skill_search_partial(
+        &mut self,
+        request_id: u64,
+        query: String,
+        group: edgecrab_tools::tools::skills_hub::SearchGroup,
+    ) {
+        if self.remote_skill_browser.inflight_request_id != Some(request_id) {
+            return;
+        }
+        if self.remote_skill_browser.current_query() != query {
+            return;
+        }
+        let report = edgecrab_tools::tools::skills_hub::SearchReport {
+            groups: vec![group],
+        };
+        let (entries, notices) = Self::build_remote_skill_entries(&report);
+        let first_paint = self.remote_skill_browser.browse_partials_seen == 0;
+        self.remote_skill_browser.browse_partials_seen =
+            self.remote_skill_browser.browse_partials_seen.saturating_add(1);
+        if first_paint {
+            // Drop retained prior-source rows on first live paint of this request.
+            for notice in notices {
+                if !self.remote_skill_browser.notices.iter().any(|n| n == &notice) {
+                    self.remote_skill_browser.notices.push(notice);
+                }
+            }
+            self.remote_skill_browser
+                .selector
+                .replace_items_preserving_state(entries);
+            if query.trim().is_empty() {
+                self.remote_skill_browser.browse_snapshot =
+                    self.remote_skill_browser.selector.items.clone();
+                self.remote_skill_browser.browse_snapshot_filter =
+                    self.remote_skill_browser.source_filter.clone();
+            }
+        } else {
+            self.merge_remote_skill_entries(entries, notices, query.trim().is_empty());
+        }
+        let loaded = self.remote_skill_browser.selector.items.len();
+        self.remote_skill_browser.browse_page_cache.fetch_cursor =
+            self.remote_skill_browser.browse_page_cache.fetch_cursor.max(loaded);
+        // Debounce guard preview during progressive stream (~250ms).
+        self.schedule_remote_skill_guard_preview_debounced();
+        self.needs_redraw = true;
+    }
+
     fn apply_remote_skill_search_result(
         &mut self,
         request_id: u64,
@@ -7356,15 +8188,326 @@ impl App {
         }
 
         let (entries, notices) = Self::build_remote_skill_entries(&report);
-        self.remote_skill_browser.inflight_request_id = None;
-        self.remote_skill_browser.loading_query = None;
-        self.remote_skill_browser.last_completed_query = Some(query);
-        self.remote_skill_browser.notices = notices;
-        self.remote_skill_browser.selector.set_items(entries);
-        self.remote_skill_browser.selector.selected = 0;
+        let prev_identifier = self
+            .remote_skill_browser
+            .selector
+            .current()
+            .map(|e| e.identifier.clone());
+        let had_partials = self.remote_skill_browser.browse_partials_seen > 0;
+        if had_partials {
+            // Merge final leftovers (don't wipe progressive rows with a smaller set).
+            self.merge_remote_skill_entries(entries, notices, query.trim().is_empty());
+        } else {
+            // No partials arrived — replace retained prior rows with the final report.
+            for notice in notices {
+                if !self.remote_skill_browser.notices.iter().any(|n| n == &notice) {
+                    self.remote_skill_browser.notices.push(notice);
+                }
+            }
+            self.remote_skill_browser
+                .selector
+                .replace_items_preserving_state(entries);
+            if query.trim().is_empty() {
+                self.remote_skill_browser.browse_snapshot =
+                    self.remote_skill_browser.selector.items.clone();
+                self.remote_skill_browser.browse_snapshot_filter =
+                    self.remote_skill_browser.source_filter.clone();
+            }
+        }
+        self.remote_skill_browser.clear_loading();
+        self.remote_skill_browser.last_completed_query = Some(query.clone());
+        let loaded = self.remote_skill_browser.selector.items.len();
+        self.remote_skill_browser
+            .browse_page_cache
+            .mark_stream_complete(loaded);
+        if query.trim().is_empty() {
+            self.remote_skill_browser.browse_snapshot =
+                self.remote_skill_browser.selector.items.clone();
+            self.remote_skill_browser.browse_snapshot_filter =
+                self.remote_skill_browser.source_filter.clone();
+            self.trim_browse_page_cache_if_needed();
+            // Fill SoT beyond first paint (GitHub tree / sitemap / ClawHub listing).
+            self.maybe_spawn_catalog_ensure();
+        }
+        if let Some(id) = prev_identifier.as_deref()
+            && let Some(pos) = self
+                .remote_skill_browser
+                .selector
+                .filtered
+                .iter()
+                .position(|&idx| {
+                    self.remote_skill_browser
+                        .selector
+                        .items
+                        .get(idx)
+                        .is_some_and(|e| e.identifier == id)
+                })
+        {
+            self.remote_skill_browser.selector.selected = pos;
+        }
         self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
         self.clear_remote_skill_guard_cache();
         self.schedule_remote_skill_guard_preview();
+        self.needs_redraw = true;
+    }
+
+    /// Merge remote skill entries by identifier (progressive + extend).
+    fn merge_remote_skill_entries(
+        &mut self,
+        entries: Vec<RemoteSkillEntry>,
+        notices: Vec<String>,
+        update_browse_snapshot: bool,
+    ) {
+        if entries.is_empty() && notices.is_empty() {
+            return;
+        }
+        for notice in notices {
+            if !self.remote_skill_browser.notices.iter().any(|n| n == &notice) {
+                self.remote_skill_browser.notices.push(notice);
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let mut items = self.remote_skill_browser.selector.items.clone();
+        let mut seen: std::collections::HashSet<String> =
+            items.iter().map(|e| e.identifier.clone()).collect();
+        for entry in entries {
+            if seen.insert(entry.identifier.clone()) {
+                items.push(entry);
+            }
+        }
+        self.remote_skill_browser
+            .selector
+            .replace_items_preserving_state(items);
+        if update_browse_snapshot {
+            self.remote_skill_browser.browse_snapshot =
+                self.remote_skill_browser.selector.items.clone();
+            self.remote_skill_browser.browse_snapshot_filter =
+                self.remote_skill_browser.source_filter.clone();
+        }
+    }
+
+    fn trim_browse_page_cache_if_needed(&mut self) {
+        let cache = &self.remote_skill_browser.browse_page_cache;
+        if !cache.stream_complete {
+            return;
+        }
+        let cap = cache.retain_cap;
+        let page = cache.page_size;
+        let items = &self.remote_skill_browser.selector.items;
+        if items.len() <= cap {
+            return;
+        }
+        let selected = self.remote_skill_browser.selector.selected.min(items.len() - 1);
+        let radius = page.saturating_mul(3);
+        let start = selected.saturating_sub(radius);
+        let end = (selected + radius + 1).min(items.len());
+        let trimmed: Vec<RemoteSkillEntry> = items[start..end].to_vec();
+        let new_selected = selected.saturating_sub(start);
+        self.remote_skill_browser
+            .selector
+            .replace_items_preserving_state(trimmed);
+        self.remote_skill_browser.selector.selected = new_selected;
+        self.remote_skill_browser.browse_page_cache.fetch_cursor =
+            start + self.remote_skill_browser.selector.items.len();
+    }
+
+    /// Authoritative catalog size for browse footer / exhaust (per-source SoT).
+    fn browse_catalog_total_hint(&self) -> Option<usize> {
+        let filter = self
+            .remote_skill_browser
+            .source_filter
+            .as_deref()
+            .unwrap_or("all");
+        edgecrab_tools::tools::skills_hub::catalog_total(filter)
+    }
+
+    fn browse_catalog_complete(&self) -> bool {
+        let filter = self
+            .remote_skill_browser
+            .source_filter
+            .as_deref()
+            .unwrap_or("all");
+        edgecrab_tools::tools::skills_hub::catalog_complete(filter)
+    }
+
+    /// Spawn background `ensure_catalog` for the active filter when incomplete.
+    fn maybe_spawn_catalog_ensure(&mut self) {
+        if !self.remote_skill_browser.selector.active {
+            return;
+        }
+        if !self.remote_skill_browser.current_query().is_empty() {
+            return;
+        }
+        if self
+            .remote_skill_browser
+            .browse_page_cache
+            .catalog_ensure_inflight
+        {
+            return;
+        }
+        let filter = self
+            .remote_skill_browser
+            .source_filter
+            .clone()
+            .unwrap_or_else(|| "all".into());
+        if edgecrab_tools::tools::skills_hub::catalog_complete(&filter) {
+            return;
+        }
+        self.remote_skill_browser
+            .browse_page_cache
+            .catalog_ensure_inflight = true;
+        self.remote_skill_browser
+            .browse_page_cache
+            .catalog_ensure_filter = Some(filter.clone());
+        let tx = self.response_tx.clone();
+        let join = self.rt_handle.spawn(async move {
+            let error = edgecrab_tools::tools::skills_hub::ensure_catalog(&filter)
+                .await
+                .err();
+            if let Some(ref err) = error {
+                tracing::warn!(filter = %filter, error = %err, "marketplace catalog ensure failed");
+            }
+            let _ = tx.send(AgentResponse::RemoteSkillCatalogEnsureDone { filter, error });
+        });
+        self.remote_skill_browser.catalog_ensure_abort = Some(join.abort_handle());
+        self.needs_redraw = true;
+    }
+
+    fn apply_remote_skill_catalog_ensure_done(&mut self, filter: String, error: Option<String>) {
+        let active = self
+            .remote_skill_browser
+            .browse_page_cache
+            .catalog_ensure_filter
+            .as_deref();
+        if active.is_some_and(|f| !f.eq_ignore_ascii_case(&filter)) {
+            return;
+        }
+        self.remote_skill_browser
+            .browse_page_cache
+            .clear_catalog_ensure();
+        self.remote_skill_browser.catalog_ensure_abort = None;
+        if let Some(err) = error {
+            let notice = format!("catalog ensure ({filter}): {err}");
+            if !self
+                .remote_skill_browser
+                .notices
+                .iter()
+                .any(|n| n == &notice)
+            {
+                self.remote_skill_browser.notices.push(notice);
+            }
+        }
+        if self.remote_skill_browser.selector.active
+            && self.remote_skill_browser.current_query().is_empty()
+        {
+            self.remote_skill_browser.browse_page_cache.exhausted = false;
+            self.maybe_extend_browse_cache();
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Extend browse window from the active filter's CatalogStore when near end.
+    ///
+    /// Dedup: `fetch_cursor` is a SoT offset. After merge-by-identifier, a page
+    /// may add zero unique rows — cursor still advances and we skip ahead so
+    /// virtual scroll does not stall on duplicate pages.
+    fn maybe_extend_browse_cache(&mut self) {
+        if !self.remote_skill_browser.selector.active {
+            return;
+        }
+        if !self.remote_skill_browser.current_query().is_empty() {
+            return;
+        }
+        // Don't pile extend requests on top of the progressive stream.
+        if self.remote_skill_browser.inflight_request_id.is_some() {
+            return;
+        }
+        let filter = self
+            .remote_skill_browser
+            .source_filter
+            .as_deref()
+            .unwrap_or("all");
+        let store = edgecrab_tools::tools::skills_hub::FilterCatalogStore::for_filter(filter);
+        // Cache may have grown after a prior empty miss — clear false exhaust.
+        if self.remote_skill_browser.browse_page_cache.exhausted {
+            let past = match store.total() {
+                Some(n) => {
+                    self.remote_skill_browser.browse_page_cache.fetch_cursor >= n
+                        && store.complete()
+                }
+                None => store.complete(),
+            };
+            if !past {
+                self.remote_skill_browser.browse_page_cache.exhausted = false;
+            }
+        }
+        let selected = self.remote_skill_browser.selector.selected;
+        let loaded = self.remote_skill_browser.selector.filtered.len();
+        if !self
+            .remote_skill_browser
+            .browse_page_cache
+            .should_extend(selected, loaded)
+        {
+            return;
+        }
+
+        let page = self.remote_skill_browser.browse_page_cache.page_size;
+        let skip_budget = self
+            .remote_skill_browser
+            .browse_page_cache
+            .dedup_skip_budget();
+        let mut grew = false;
+
+        for _ in 0..skip_budget {
+            let offset = self.remote_skill_browser.browse_page_cache.fetch_cursor;
+            let catalog = store.page_groups(offset, page);
+            let sot_rows = catalog.row_count();
+            if sot_rows == 0 {
+                if !store.complete() {
+                    self.maybe_spawn_catalog_ensure();
+                    self.remote_skill_browser.browse_page_cache.exhausted = false;
+                } else {
+                    let past_end = match store.total() {
+                        Some(n) => offset >= n,
+                        None => true,
+                    };
+                    self.remote_skill_browser.browse_page_cache.exhausted = past_end;
+                }
+                break;
+            }
+
+            let report = edgecrab_tools::tools::skills_hub::SearchReport {
+                groups: catalog.groups,
+            };
+            let (entries, notices) = Self::build_remote_skill_entries(&report);
+            let before = self.remote_skill_browser.selector.items.len();
+            self.merge_remote_skill_entries(entries, notices, true);
+            let after = self.remote_skill_browser.selector.items.len();
+            let unique_added = after.saturating_sub(before);
+            self.remote_skill_browser
+                .browse_page_cache
+                .advance_after_page(sot_rows, unique_added);
+            if unique_added > 0 {
+                grew = true;
+                self.trim_browse_page_cache_if_needed();
+                break;
+            }
+            // All duplicates — keep skipping SoT pages within budget.
+        }
+
+        if !grew
+            && store.complete()
+            && store
+                .total()
+                .is_some_and(|n| self.remote_skill_browser.browse_page_cache.fetch_cursor >= n)
+        {
+            self.remote_skill_browser.browse_page_cache.exhausted = true;
+        } else if !store.complete() {
+            self.maybe_spawn_catalog_ensure();
+            self.remote_skill_browser.browse_page_cache.exhausted = false;
+        }
         self.needs_redraw = true;
     }
 
@@ -7381,8 +8524,17 @@ impl App {
             && let Some(preview) = self.remote_skill_guard.preview.clone()
         {
             if preview.allowed {
-                self.begin_remote_skill_install(entry, preview.recommended_gate());
+                // Safe: confirm strip (orientation required) — not silent commit.
+                self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::ConfirmSafe {
+                    identifier: entry.identifier.clone(),
+                    name: entry.name.clone(),
+                };
+                self.needs_redraw = true;
             } else {
+                self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::GuardReview {
+                    identifier: entry.identifier.clone(),
+                    preserved_query: self.remote_skill_browser.current_query(),
+                };
                 self.skill_trust_prompt =
                     Some(Self::build_skill_trust_prompt_state(entry, preview, false));
                 self.needs_redraw = true;
@@ -7393,6 +8545,11 @@ impl App {
         let action_label = entry.action.label().to_string();
         self.remote_skill_browser.action_in_flight =
             Some(format!("{} {}", action_label, entry.identifier));
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::Installing {
+            identifier: entry.identifier.clone(),
+            stage: skills_marketplace::InstallStage::Fetch,
+        };
+        self.skills_install_stage_started = Some(Instant::now());
         self.needs_redraw = true;
 
         let tx = self.response_tx.clone();
@@ -7400,6 +8557,23 @@ impl App {
         self.rt_handle.spawn(async move {
             let skills_dir = edgecrab_core::edgecrab_home().join("skills");
             let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
+            let id = entry_for_task.identifier.clone();
+
+            let _ = tx.send(AgentResponse::RemoteSkillInstallProgress {
+                identifier: id.clone(),
+                stage: skills_marketplace::InstallStage::Fetch,
+                status: Some("resolving source identifier".into()),
+            });
+            let _ = tx.send(AgentResponse::RemoteSkillInstallProgress {
+                identifier: id.clone(),
+                stage: skills_marketplace::InstallStage::Quarantine,
+                status: Some("staging bundle in quarantine".into()),
+            });
+            let _ = tx.send(AgentResponse::RemoteSkillInstallProgress {
+                identifier: id.clone(),
+                stage: skills_marketplace::InstallStage::Scan,
+                status: Some("running Skill Guard scan".into()),
+            });
 
             let preview_result = edgecrab_tools::tools::skills_hub::preview_install_scan(
                 &entry_for_task.identifier,
@@ -7409,6 +8583,11 @@ impl App {
 
             let result = match preview_result {
                 Ok(preview) if preview.allowed => {
+                    let _ = tx.send(AgentResponse::RemoteSkillInstallProgress {
+                        identifier: id.clone(),
+                        stage: skills_marketplace::InstallStage::Commit,
+                        status: Some("writing skill into skills dir".into()),
+                    });
                     App::finish_remote_skill_install_async(
                         &entry_for_task,
                         &skills_dir,
@@ -7418,6 +8597,11 @@ impl App {
                     .await
                 }
                 Ok(preview) => {
+                    let _ = tx.send(AgentResponse::RemoteSkillInstallProgress {
+                        identifier: id,
+                        stage: skills_marketplace::InstallStage::Gate,
+                        status: Some("Skill Guard review required".into()),
+                    });
                     let _ = tx.send(AgentResponse::RemoteSkillGuardPrompt {
                         entry: entry_for_task,
                         preview: Box::new(preview),
@@ -7454,9 +8638,20 @@ impl App {
         let action_label = entry.action.label().to_string();
         self.remote_skill_browser.action_in_flight =
             Some(format!("{} {}", action_label, entry.identifier));
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::Installing {
+            identifier: entry.identifier.clone(),
+            stage: skills_marketplace::InstallStage::Commit,
+        };
+        self.skills_install_stage_started = Some(Instant::now());
         self.needs_redraw = true;
         let tx = self.response_tx.clone();
+        let id = entry.identifier.clone();
         self.rt_handle.spawn(async move {
+            let _ = tx.send(AgentResponse::RemoteSkillInstallProgress {
+                identifier: id,
+                stage: skills_marketplace::InstallStage::Commit,
+                status: Some("writing skill into skills dir".into()),
+            });
             let skills_dir = edgecrab_core::edgecrab_home().join("skills");
             let optional_dir = edgecrab_tools::tools::skills_sync::optional_skills_dir();
             match App::finish_remote_skill_install_async(
@@ -7523,13 +8718,17 @@ impl App {
         preview: edgecrab_tools::tools::skills_hub::InstallScanPreview,
         review_only: bool,
     ) -> SkillTrustPromptState {
+        let selected_action = skills_marketplace::default_skill_trust_selected_action(
+            preview.needs_trust,
+            review_only,
+        );
         SkillTrustPromptState {
             entry,
             preview,
             review_only,
             pane: crate::skill_trust_overlay::SkillTrustPane::Findings,
             files_focus: crate::skill_trust_overlay::SkillTrustFilesFocus::List,
-            selected_action: 0,
+            selected_action,
             findings_scroll: 0,
             selected_file: 0,
             file_content_scroll: 0,
@@ -7803,8 +9002,9 @@ impl App {
             // ── Skills hub & guard ────────────────────────────────────────────
             "skills" | "skill" => &[
                 ("list", "List installed skills"),
-                ("hub", "Open remote skill browser (TUI)"),
-                ("search", "Search hub registries: search <query>"),
+                ("browse", "Skills Hub catalog (empty-query browse)"),
+                ("hub", "Alias of browse (Skills Hub brand)"),
+                ("search", "Search Skills Hub: search <query>"),
                 ("review", "TUI guard review + file inspector: review <id>"),
                 ("inspect --scan", "Guard scan report: inspect --scan <id>"),
                 ("inspect", "Hub metadata: inspect <id>"),
@@ -8997,6 +10197,49 @@ impl App {
             return;
         }
 
+        // Virtualized browser lists: wheel drives selection (not transcript scroll).
+        let wheel_step = match event.kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
+            MouseEventKind::ScrollLeft => -8,
+            MouseEventKind::ScrollRight => 8,
+            _ => 0,
+        };
+        if wheel_step != 0 {
+            if self.remote_skill_browser.selector.active
+                && !self.simple_split_detail_focused(DetailSurface::RemoteSkillBrowser)
+                && !self.detail_fullscreen_active(DetailSurface::RemoteSkillBrowser)
+            {
+                self.remote_skill_browser.selector.page_by(wheel_step);
+                self.reset_split_detail_scroll(DetailSurface::RemoteSkillBrowser);
+                self.reset_detail_fullscreen_scroll(DetailSurface::RemoteSkillBrowser);
+                self.schedule_remote_skill_guard_preview();
+                self.maybe_extend_browse_cache();
+                self.needs_redraw = true;
+                return;
+            }
+            if self.remote_plugin_browser.selector.active
+                && !self.simple_split_detail_focused(DetailSurface::RemotePluginBrowser)
+                && !self.detail_fullscreen_active(DetailSurface::RemotePluginBrowser)
+            {
+                self.remote_plugin_browser.selector.page_by(wheel_step);
+                self.reset_split_detail_scroll(DetailSurface::RemotePluginBrowser);
+                self.reset_detail_fullscreen_scroll(DetailSurface::RemotePluginBrowser);
+                self.needs_redraw = true;
+                return;
+            }
+            if self.skill_selector.active
+                && !self.simple_split_detail_focused(DetailSurface::SkillSelector)
+                && !self.detail_fullscreen_active(DetailSurface::SkillSelector)
+            {
+                self.skill_selector.page_by(wheel_step);
+                self.reset_split_detail_scroll(DetailSurface::SkillSelector);
+                self.reset_detail_fullscreen_scroll(DetailSurface::SkillSelector);
+                self.needs_redraw = true;
+                return;
+            }
+        }
+
         match event.kind {
             // Scroll wheel up → scroll content upward (away from bottom)
             MouseEventKind::ScrollUp => {
@@ -9018,32 +10261,39 @@ impl App {
             // The reverse (SELECT→SCROLL) is not possible via click because mouse events
             // are not delivered to the process when capture is off; use F6, Ctrl+M, or
             // `/scroll on` instead.
+            // Skills Marketplace: row select / detail focus / chrome dismiss.
             MouseEventKind::Down(MouseButton::Left) => {
-                self.completion.active = false;
-                self.model_selector.active = false;
-                self.model_selector_stage.reset();
-                self.vision_model_selector.active = false;
-                self.image_model_selector.active = false;
-                self.moa_reference_selector.active = false;
-                self.mcp_selector.active = false;
-                self.remote_mcp_browser.selector.active = false;
-                self.skill_selector.active = false;
-                self.remote_skill_browser.selector.active = false;
-                self.verbose_selector_active = false;
-                self.reasoning_selector_active = false;
-                self.personality_selector_active = false;
-                self.stream_selector_active = false;
-                self.statusbar_selector_active = false;
-                self.shadow_judge_selector_active = false;
-                self.needs_redraw = true;
                 let now = Instant::now();
                 let is_double = self
                     .last_left_click
                     .map(|t| now.duration_since(t).as_millis() <= 400)
                     .unwrap_or(false);
+                let (marketplace_consumed, suppress_capture_toggle) = self
+                    .handle_skills_marketplace_mouse(event.column, event.row, is_double);
+                if !marketplace_consumed {
+                    self.completion.active = false;
+                    self.model_selector.active = false;
+                    self.model_selector_stage.reset();
+                    self.vision_model_selector.active = false;
+                    self.image_model_selector.active = false;
+                    self.moa_reference_selector.active = false;
+                    self.mcp_selector.active = false;
+                    self.remote_mcp_browser.selector.active = false;
+                    self.skill_selector.active = false;
+                    self.remote_skill_browser.selector.active = false;
+                    self.verbose_selector_active = false;
+                    self.reasoning_selector_active = false;
+                    self.personality_selector_active = false;
+                    self.stream_selector_active = false;
+                    self.statusbar_selector_active = false;
+                    self.shadow_judge_selector_active = false;
+                    self.needs_redraw = true;
+                }
                 if is_double {
                     self.last_left_click = None;
-                    self.toggle_mouse_capture_mode();
+                    if !suppress_capture_toggle && !marketplace_consumed {
+                        self.toggle_mouse_capture_mode();
+                    }
                 } else {
                     self.last_left_click = Some(now);
                 }
@@ -10177,10 +11427,61 @@ impl App {
     /// needs a redraw.
     fn tick_spinner(&mut self) -> bool {
         self.poll_voice_recording_completion();
-        if !self.animate_status_indicators {
-            return false;
-        }
         let mut animated = false;
+        // Remote marketplace/plugin/MCP fetches run while DisplayState is Idle —
+        // keep the overlay spinner moving so browse never looks frozen.
+        if self.remote_skill_browser.inflight_request_id.is_some() {
+            self.remote_skill_browser.loading_spinner_frame = self
+                .remote_skill_browser
+                .loading_spinner_frame
+                .wrapping_add(1);
+            animated = true;
+        } else if self.remote_skill_browser.selector.active
+            && self.remote_skill_browser.current_query().is_empty()
+            && self.remote_skill_browser.browse_page_cache.stream_complete
+        {
+            // Cache may grow after page-first / mid-walk / ensure — retry extend.
+            let before = self.remote_skill_browser.selector.items.len();
+            let was_exhausted = self.remote_skill_browser.browse_page_cache.exhausted;
+            let ensure_inflight = self
+                .remote_skill_browser
+                .browse_page_cache
+                .catalog_ensure_inflight;
+            self.maybe_extend_browse_cache();
+            if self.remote_skill_browser.selector.items.len() > before
+                || was_exhausted != self.remote_skill_browser.browse_page_cache.exhausted
+                || ensure_inflight
+                    != self
+                        .remote_skill_browser
+                        .browse_page_cache
+                        .catalog_ensure_inflight
+            {
+                animated = true;
+            }
+        }
+        self.poll_remote_skill_guard_preview_debounce();
+        if self.remote_plugin_browser.inflight_request_id.is_some() {
+            self.remote_plugin_browser.loading_spinner_frame = self
+                .remote_plugin_browser
+                .loading_spinner_frame
+                .wrapping_add(1);
+            animated = true;
+        }
+        if self.remote_mcp_browser.inflight_request_id.is_some() {
+            self.remote_mcp_browser.loading_spinner_frame =
+                self.remote_mcp_browser.loading_spinner_frame.wrapping_add(1);
+            animated = true;
+        }
+        // Install theatre stage elapsed needs a live redraw while Idle.
+        if matches!(
+            self.skills_marketplace_mode,
+            skills_marketplace::MarketplaceMode::Installing { .. }
+        ) {
+            animated = true;
+        }
+        if !self.animate_status_indicators {
+            return animated;
+        }
         let advance_verb = match &mut self.display_state {
             DisplayState::AwaitingFirstToken { frame, .. } => {
                 *frame = (*frame + 1) % SPINNER_FRAMES.len();
@@ -15328,7 +16629,8 @@ impl App {
             }
         }
 
-        // Hub slash commands — remote ops + index (keep hub/search TUI in match below)
+        // Hub slash commands — remote ops + index.
+        // TUI: browse/hub/search open the marketplace (match below), not transcript dumps.
         if (trimmed.starts_with("index ")
             || trimmed.starts_with("inspect ")
             || trimmed == "catalog"
@@ -15355,7 +16657,21 @@ impl App {
             || trimmed.starts_with("update")
             || trimmed.starts_with("remove ")
             || trimmed.starts_with("uninstall ")
-            || trimmed.starts_with("rm "))
+            || trimmed.starts_with("rm ")
+            || trimmed.starts_with("import-from")
+            || trimmed.starts_with("import_from")
+            || trimmed.starts_with("importfrom")
+            || trimmed.starts_with("list-modified")
+            || trimmed == "modified"
+            || trimmed.starts_with("diff-bundled")
+            || trimmed.starts_with("bundled-diff")
+            || trimmed.starts_with("repair-official")
+            || trimmed.starts_with("repair_official")
+            || trimmed.starts_with("publish ")
+            || trimmed.starts_with("bundles")
+            || trimmed.starts_with("bundle ")
+            || trimmed == "web-hub"
+            || trimmed == "webhub")
             && let Some(reply) = {
                 let config = edgecrab_core::AppConfig::load().unwrap_or_default();
                 self.rt_handle
@@ -15408,7 +16724,7 @@ impl App {
                         if skills.is_empty() {
                             self.push_output(
                                 "No skills installed. Add .md files or skill directories to ~/.edgecrab/skills/\n\
-                                 Run `/skills search` to browse remote skills or `/skills install <path>` to install a local skill.",
+                                 Run `/skills browse` (or `/skills hub`) for the Skills Hub catalog, `/skills search <query>` to search, or `/skills install <path>` for a local skill.",
                                 OutputRole::System,
                             );
                         } else {
@@ -15421,7 +16737,7 @@ impl App {
                                 text.push_str(&format!("  {skill_type} {name}\n"));
                             }
                             text.push_str(
-                                "\nUsage: /skills view <name.md>  /skills search  /skills install <path>\n\
+                                "\nUsage: /skills view <name.md>  /skills browse|hub  /skills search <query>  /skills install <path>\n\
                                  Write approval: /skills pending  /skills approve <id>  /skills diff <id>\n\
                                  Usage stats: /skills usage  /skills pin|unpin <name>\n\
                                  Skill config: /skills config  /skills config set <key> <value>",
@@ -15476,67 +16792,18 @@ impl App {
             }
 
             "install" => {
-                if operand.is_empty() {
-                    self.push_output(
-                        "Usage:\n\
-                         /skills install <local-path>              — install local skill file/dir\n\
-                         /skills install edgecrab:<path>           — install from a curated remote source\n\
-                         /skills install owner/repo/path/skill.md  — install from GitHub",
-                        OutputRole::System,
-                    );
-                    return;
-                }
-
-                let src = std::path::Path::new(operand);
-                if !src.exists() {
-                    self.push_output(
-                        format!("Path not found: {operand}. For remote installs use a hub identifier (e.g. clawhub:slug, owner/repo/path)."),
-                        OutputRole::Error,
-                    );
-                    return;
-                }
-                if let Err(e) = std::fs::create_dir_all(&skills_dir) {
-                    self.push_output(format!("Cannot create skills dir: {e}"), OutputRole::Error);
-                    return;
-                }
-                if src.is_file() {
-                    let dest = skills_dir.join(src.file_name().unwrap_or_default());
-                    match std::fs::copy(src, &dest) {
-                        Ok(_) => {
-                            edgecrab_tools::skills::invalidate_discovery_caches();
-                            if let Some(agent) = self.agent.clone() {
-                                self.rt_handle
-                                    .block_on(async { agent.invalidate_skills_zone().await });
-                            } else {
-                                edgecrab_core::prompt_builder::invalidate_skills_cache();
-                            }
-                            self.push_output(
-                                format!("Skill installed: {}", dest.file_name().unwrap_or_default().to_string_lossy()),
-                                OutputRole::System,
-                            );
-                        }
-                        Err(e) => self.push_output(format!("Install failed: {e}"), OutputRole::Error),
-                    }
-                } else if src.is_dir() {
-                    let dir_name = src.file_name().unwrap_or_default();
-                    let dest = skills_dir.join(dir_name);
-                    match copy_dir_recursive(src, &dest) {
-                        Ok(n) => {
-                            edgecrab_tools::skills::invalidate_discovery_caches();
-                            if let Some(agent) = self.agent.clone() {
-                                self.rt_handle
-                                    .block_on(async { agent.invalidate_skills_zone().await });
-                            } else {
-                                edgecrab_core::prompt_builder::invalidate_skills_cache();
-                            }
-                            self.push_output(
-                                format!("Skill directory '{}' installed ({n} files).", dir_name.to_string_lossy()),
-                                OutputRole::System,
-                            );
-                        }
-                        Err(e) => self.push_output(format!("Install failed: {e}"), OutputRole::Error),
-                    }
-                }
+                // Local + remote installs are handled by handle_skills_hub_slash
+                // (quarantine → scan → gate). This branch is a fallback only.
+                self.push_output(
+                    "Usage:\n\
+                     /skills install <local-path>              — quarantined local install\n\
+                     /skills install edgecrab:<path>           — curated remote source\n\
+                     /skills install clawhub:<slug> | @owner/slug\n\
+                     /skills install git:owner/repo[/path] | npm:package\n\
+                     /skills install owner/repo/path\n\
+                     /skills import-from claude|codex|pi|agents|openclaw",
+                    OutputRole::System,
+                );
             }
 
             "update" | "remove" | "uninstall" | "rm" => {
@@ -15547,13 +16814,19 @@ impl App {
                 );
             }
 
-            "hub" | "search" => {
+            // Hermes-aligned: browse = empty catalog; hub aliases browse; search = query.
+            "browse" | "hub" => {
+                self.open_remote_skill_selector(None);
+            }
+
+            "search" => {
                 let query = operand;
                 self.open_remote_skill_selector((!query.is_empty()).then_some(query));
             }
 
             _ => self.push_output(
-                "Usage: /skills [list | view <name> | hub [query] | search [query] | review <id> | inspect [--scan] <id> | install <id> | trust <id> | check | update | remove | audit | lock | index refresh | catalog | tap list|add|remove]",
+                "Usage: /skills [list | view <name> | browse|hub (Skills Hub catalog) | search <query> | review <id> | inspect [--scan] <id> | install <id> | trust <id> | check | update | remove | audit | lock | index refresh | catalog | tap list|add|remove]\n\
+                 Tip: bare `/skills` = installed; `/skills browse` opens the Skills Hub; `/skills search <q>` searches.",
                 OutputRole::System,
             ),
         }
@@ -21407,6 +22680,34 @@ description = "Demo plugin tool"
 
         assert!(app.remote_skill_browser.selector.active);
         assert!(app.remote_skill_browser.selector.query.is_empty());
+        assert!(matches!(
+            app.skills_marketplace_mode,
+            crate::app::skills_marketplace::MarketplaceMode::SearchRemote
+        ));
+    }
+
+    #[tokio::test]
+    async fn skills_browse_opens_remote_browser_like_hub() {
+        let mut app = App::new();
+
+        app.handle_show_skills("browse".into());
+
+        assert!(app.remote_skill_browser.selector.active);
+        assert!(app.remote_skill_browser.selector.query.is_empty());
+        assert!(matches!(
+            app.skills_marketplace_mode,
+            crate::app::skills_marketplace::MarketplaceMode::SearchRemote
+        ));
+    }
+
+    #[tokio::test]
+    async fn skills_search_empty_opens_browse_mode() {
+        let mut app = App::new();
+
+        app.handle_show_skills("search".into());
+
+        assert!(app.remote_skill_browser.selector.active);
+        assert!(app.remote_skill_browser.selector.query.is_empty());
     }
 
     #[test]
@@ -22267,6 +23568,889 @@ kind = "skill"
     }
 
     #[tokio::test]
+    async fn open_skill_selector_sets_browse_installed_marketplace_home() {
+        let mut app = App::new();
+        app.skills_marketplace_mode = skills_marketplace::MarketplaceMode::SearchRemote;
+        app.remote_skill_browser.selector.active = true;
+
+        app.open_skill_selector();
+
+        assert!(app.skill_selector.active);
+        assert!(!app.remote_skill_browser.selector.active);
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::BrowseInstalled
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_partial_paints_rows_while_still_inflight() {
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.inflight_request_id = Some(9);
+        app.remote_skill_browser.loading_query = Some("all::*browse*".into());
+        app.remote_skill_browser.selector.set_items(Vec::new());
+
+        let group = edgecrab_tools::tools::skills_hub::SearchGroup {
+            source: edgecrab_tools::tools::skills_hub::HubSourceInfo {
+                id: "unified-index".into(),
+                label: "Unified Index".into(),
+                origin: "local".into(),
+                trust_level: "mixed".into(),
+            },
+            results: vec![edgecrab_tools::tools::skills_hub::SkillMeta {
+                name: "alpha".into(),
+                description: "first paint".into(),
+                source: "unified-index".into(),
+                origin: "local".into(),
+                identifier: "openai/skills/alpha".into(),
+                trust_level: "official".into(),
+                repo: Some("openai/skills".into()),
+                path: Some("alpha".into()),
+                url: None,
+                tags: vec![],
+            }],
+            notice: None,
+        };
+        app.apply_remote_skill_search_partial(9, String::new(), group);
+
+        assert!(
+            app.remote_skill_browser.inflight_request_id.is_some(),
+            "partial must not clear inflight"
+        );
+        assert!(
+            !app.remote_skill_browser.selector.items.is_empty(),
+            "partial must paint rows"
+        );
+        assert_eq!(
+            browse_page_cache::marketplace_browse_range_label_with_catalog(0, 1, 1, true, None)
+                .contains("loading"),
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_reschedule_retains_prior_rows_until_first_partial() {
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.clear_loading();
+        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
+            name: "prior".into(),
+            identifier: "openai/skills/prior".into(),
+            description: "kept while rebrowsing".into(),
+            source_label: "Unified Index".into(),
+            origin: "local".into(),
+            trust_level: "official".into(),
+            tags: vec![],
+            search_text: "prior".into(),
+            installed_name: None,
+            action: RemoteSkillAction::Install,
+            url: None,
+            repo: None,
+            path: None,
+        }]);
+        app.remote_skill_browser.browse_snapshot =
+            app.remote_skill_browser.selector.items.clone();
+        app.remote_skill_browser.browse_snapshot_filter = None;
+
+        app.schedule_remote_skill_search(true);
+        app.poll_remote_skill_search();
+
+        assert!(
+            app.remote_skill_browser.inflight_request_id.is_some(),
+            "browse should be inflight"
+        );
+        assert_eq!(
+            app.remote_skill_browser.selector.items.len(),
+            1,
+            "reschedule must not blank-wipe prior rows"
+        );
+        assert_eq!(
+            app.remote_skill_browser.selector.items[0].identifier,
+            "openai/skills/prior"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(edgecrab_home_env)]
+    fn build_remote_skill_entries_uses_dir_set_not_recursive_walk() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("nested").join("deep-skill"))
+            .expect("nested");
+        std::fs::write(
+            skills_dir.join("nested").join("deep-skill").join("SKILL.md"),
+            "# deep",
+        )
+        .expect("skill");
+        std::fs::create_dir_all(skills_dir.join("top-level")).expect("top");
+        std::fs::write(skills_dir.join("top-level").join("SKILL.md"), "# top").expect("skill");
+
+        let names = App::installed_skill_dir_names(&skills_dir);
+        assert!(names.contains("top-level"));
+        assert!(
+            !names.contains("deep-skill"),
+            "O(1) lookup is top-level only — no recursive walk"
+        );
+
+        let report = edgecrab_tools::tools::skills_hub::SearchReport {
+            groups: vec![edgecrab_tools::tools::skills_hub::SearchGroup {
+                source: edgecrab_tools::tools::skills_hub::HubSourceInfo {
+                    id: "edgecrab".into(),
+                    label: "EdgeCrab".into(),
+                    origin: "test".into(),
+                    trust_level: "trusted".into(),
+                },
+                results: vec![
+                    edgecrab_tools::tools::skills_hub::SkillMeta {
+                        name: "top-level".into(),
+                        description: "collision".into(),
+                        source: "edgecrab".into(),
+                        origin: "test".into(),
+                        identifier: "edgecrab:top-level".into(),
+                        trust_level: "trusted".into(),
+                        repo: None,
+                        path: None,
+                        url: None,
+                        tags: vec![],
+                    },
+                    edgecrab_tools::tools::skills_hub::SkillMeta {
+                        name: "deep-skill".into(),
+                        description: "not a top-level collision".into(),
+                        source: "edgecrab".into(),
+                        origin: "test".into(),
+                        identifier: "edgecrab:deep-skill".into(),
+                        trust_level: "trusted".into(),
+                        repo: None,
+                        path: None,
+                        url: None,
+                        tags: vec![],
+                    },
+                ],
+                notice: None,
+            }],
+        };
+        let (entries, _) = App::build_remote_skill_entries(&report);
+        assert_eq!(entries[0].action, RemoteSkillAction::Replace);
+        assert_eq!(
+            entries[1].action,
+            RemoteSkillAction::Install,
+            "nested-only names must not force Replace via recursive FS"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn browse_extend_advances_fetch_cursor_without_clearing() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.clear_loading();
+        app.remote_skill_browser.source_filter = Some("skills-sh".into());
+        app.remote_skill_browser.browse_page_cache.stream_complete = true;
+        app.remote_skill_browser.browse_page_cache.fetch_cursor = 0;
+        app.remote_skill_browser.browse_page_cache.page_size = 2;
+        // Seed two rows so should_extend(near end) can fire.
+        app.remote_skill_browser.selector.set_items(vec![
+            RemoteSkillEntry {
+                name: "a".into(),
+                identifier: "openai/skills/a".into(),
+                description: "a".into(),
+                source_label: "openai".into(),
+                origin: "https://github.com/openai/skills".into(),
+                trust_level: "official".into(),
+                tags: vec![],
+                search_text: "a".into(),
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                url: None,
+                repo: Some("openai/skills".into()),
+                path: Some("a".into()),
+            },
+            RemoteSkillEntry {
+                name: "b".into(),
+                identifier: "openai/skills/b".into(),
+                description: "b".into(),
+                source_label: "openai".into(),
+                origin: "https://github.com/openai/skills".into(),
+                trust_level: "official".into(),
+                tags: vec![],
+                search_text: "b".into(),
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                url: None,
+                repo: Some("openai/skills".into()),
+                path: Some("b".into()),
+            },
+        ]);
+        app.remote_skill_browser.selector.selected = 1;
+        let before = app.remote_skill_browser.selector.items.len();
+        app.maybe_extend_browse_cache();
+        // Isolated home with no sitemap/index cache: empty extend must not clear
+        // rows and must NOT sticky-exhaust (cache may still be filling).
+        assert_eq!(app.remote_skill_browser.selector.items.len(), before);
+        assert!(
+            !app.remote_skill_browser.browse_page_cache.exhausted,
+            "cache miss must stay retryable"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    fn write_test_skills_sh_sitemap_cache(home: &std::path::Path, count: usize) {
+        write_test_skills_sh_sitemap_cache_with_complete(home, count, true);
+    }
+
+    fn write_test_skills_sh_sitemap_cache_with_complete(
+        home: &std::path::Path,
+        count: usize,
+        complete: bool,
+    ) {
+        let cache_dir = home.join("skills").join(".hub").join("index-cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        let items: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("skill-{i:03}"),
+                    "description": format!("desc {i}"),
+                    "source": "skills.sh",
+                    "origin": "https://skills.sh",
+                    "identifier": format!("skills.sh:owner/repo/skill-{i:03}"),
+                    "trust_level": "community",
+                    "repo": "owner/repo",
+                    "path": format!("skill-{i:03}"),
+                    "url": null,
+                    "tags": []
+                })
+            })
+            .collect();
+        let envelope = serde_json::json!({
+            "fetched_at": chrono::Utc::now().timestamp(),
+            "items": items,
+        });
+        std::fs::write(
+            cache_dir.join("skills_sh_sitemap_v1.json"),
+            serde_json::to_vec_pretty(&envelope).expect("json"),
+        )
+        .expect("write cache");
+        let complete_path = cache_dir.join("skills_sh_sitemap_v1.complete");
+        if complete {
+            std::fs::write(&complete_path, b"1").expect("complete marker");
+        } else {
+            let _ = std::fs::remove_file(&complete_path);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn browse_extend_grows_past_first_page_from_sitemap_cache() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        write_test_skills_sh_sitemap_cache(dir.path(), 200);
+
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.clear_loading();
+        app.remote_skill_browser.source_filter = Some("skills-sh".into());
+        app.remote_skill_browser.browse_page_cache.stream_complete = true;
+        app.remote_skill_browser.browse_page_cache.exhausted = false;
+        app.remote_skill_browser.browse_page_cache.page_size = 80;
+        app.remote_skill_browser.browse_page_cache.fetch_cursor = 80;
+
+        // First page already loaded in the selector.
+        let page1 = edgecrab_tools::tools::skills_hub::browse_skills_sh_cache_slice(0, 80)
+            .expect("page1");
+        let (entries, _) = App::build_remote_skill_entries(
+            &edgecrab_tools::tools::skills_hub::SearchReport {
+                groups: vec![page1],
+            },
+        );
+        app.remote_skill_browser.selector.set_items(entries);
+        app.remote_skill_browser.selector.selected =
+            app.remote_skill_browser.selector.items.len().saturating_sub(1);
+
+        let before = app.remote_skill_browser.selector.items.len();
+        assert_eq!(before, 80);
+        app.maybe_extend_browse_cache();
+        let after = app.remote_skill_browser.selector.items.len();
+        assert!(
+            after > before,
+            "extend must grow past first page ({before} → {after})"
+        );
+        assert!(!app.remote_skill_browser.browse_page_cache.exhausted);
+        assert!(app.remote_skill_browser.browse_page_cache.fetch_cursor > 80);
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn browse_extend_exhausts_only_past_catalog_end() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        write_test_skills_sh_sitemap_cache(dir.path(), 100);
+
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.clear_loading();
+        app.remote_skill_browser.source_filter = Some("skills-sh".into());
+        app.remote_skill_browser.browse_page_cache.stream_complete = true;
+        app.remote_skill_browser.browse_page_cache.page_size = 80;
+        app.remote_skill_browser.browse_page_cache.fetch_cursor = 100;
+        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
+            name: "last".into(),
+            identifier: "skills.sh:owner/repo/skill-099".into(),
+            description: "last".into(),
+            source_label: "skills.sh".into(),
+            origin: "https://skills.sh".into(),
+            trust_level: "community".into(),
+            tags: vec![],
+            search_text: "last".into(),
+            installed_name: None,
+            action: RemoteSkillAction::Install,
+            url: None,
+            repo: None,
+            path: None,
+        }]);
+        app.remote_skill_browser.selector.selected = 0;
+
+        app.maybe_extend_browse_cache();
+        assert!(
+            app.remote_skill_browser.browse_page_cache.exhausted,
+            "cursor past SoT len must exhaust"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn browse_extend_incomplete_catalog_does_not_exhaust() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        write_test_skills_sh_sitemap_cache_with_complete(dir.path(), 78, false);
+
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.clear_loading();
+        app.remote_skill_browser.abort_catalog_ensure();
+        app.remote_skill_browser.source_filter = Some("skills-sh".into());
+        app.remote_skill_browser.browse_page_cache.stream_complete = true;
+        app.remote_skill_browser.browse_page_cache.page_size = 80;
+        app.remote_skill_browser.browse_page_cache.fetch_cursor = 78;
+        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
+            name: "last".into(),
+            identifier: "skills.sh:owner/repo/skill-077".into(),
+            description: "last".into(),
+            source_label: "skills.sh".into(),
+            origin: "https://skills.sh".into(),
+            trust_level: "community".into(),
+            tags: vec![],
+            search_text: "last".into(),
+            installed_name: None,
+            action: RemoteSkillAction::Install,
+            url: None,
+            repo: None,
+            path: None,
+        }]);
+        app.remote_skill_browser.selector.selected = 0;
+
+        app.maybe_extend_browse_cache();
+        assert!(
+            !app.remote_skill_browser.browse_page_cache.exhausted,
+            "incomplete SoT must not sticky-exhaust at loaded end"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    fn write_test_github_source_cache(home: &std::path::Path, source_id: &str, count: usize) {
+        let cache_dir = home.join("skills").join(".hub").join("index-cache");
+        std::fs::create_dir_all(&cache_dir).expect("cache dir");
+        let entries: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("skill-{i:03}"),
+                    "relative_path": format!("skills/skill-{i:03}"),
+                    "identifier": format!("{source_id}:skills/skill-{i:03}"),
+                    "description": format!("d{i}"),
+                    "tags": []
+                })
+            })
+            .collect();
+        let envelope = serde_json::json!({
+            "fetched_at": chrono::Utc::now().timestamp(),
+            "entries": entries,
+        });
+        std::fs::write(
+            cache_dir.join(format!("{source_id}.json")),
+            serde_json::to_vec_pretty(&envelope).expect("json"),
+        )
+        .expect("write github cache");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn browse_openai_extend_grows_from_github_cache_without_network() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        write_test_github_source_cache(dir.path(), "openai", 200);
+
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.clear_loading();
+        app.remote_skill_browser.abort_catalog_ensure();
+        app.remote_skill_browser.source_filter = Some("openai".into());
+        app.remote_skill_browser.browse_page_cache.stream_complete = true;
+        app.remote_skill_browser.browse_page_cache.exhausted = false;
+        app.remote_skill_browser.browse_page_cache.page_size = 80;
+        app.remote_skill_browser.browse_page_cache.fetch_cursor = 80;
+
+        let page1 = edgecrab_tools::tools::skills_hub::browse_github_cache_slice("openai", 0, 80)
+            .expect("page1");
+        let (entries, _) = App::build_remote_skill_entries(
+            &edgecrab_tools::tools::skills_hub::SearchReport {
+                groups: vec![page1],
+            },
+        );
+        app.remote_skill_browser.selector.set_items(entries);
+        app.remote_skill_browser.selector.selected =
+            app.remote_skill_browser.selector.items.len().saturating_sub(1);
+
+        let before = app.remote_skill_browser.selector.items.len();
+        assert_eq!(before, 80);
+        app.maybe_extend_browse_cache();
+        let after = app.remote_skill_browser.selector.items.len();
+        assert!(
+            after > before,
+            "openai extend must slice page 2 from tree cache ({before} → {after})"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
+    async fn browse_extend_skips_duplicate_sot_pages() {
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("EDGECRAB_HOME", dir.path());
+        }
+        // Two pages with overlapping identifiers — first page all dups of loaded rows.
+        write_test_skills_sh_sitemap_cache(dir.path(), 160);
+
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.clear_loading();
+        app.remote_skill_browser.abort_catalog_ensure();
+        app.remote_skill_browser.source_filter = Some("skills-sh".into());
+        app.remote_skill_browser.browse_page_cache.stream_complete = true;
+        app.remote_skill_browser.browse_page_cache.page_size = 80;
+        app.remote_skill_browser.browse_page_cache.fetch_cursor = 0;
+
+        let page1 = edgecrab_tools::tools::skills_hub::browse_skills_sh_cache_slice(0, 80)
+            .expect("page1");
+        let (entries, _) = App::build_remote_skill_entries(
+            &edgecrab_tools::tools::skills_hub::SearchReport {
+                groups: vec![page1],
+            },
+        );
+        app.remote_skill_browser.selector.set_items(entries);
+        // Pretend cursor is still at 0 (would re-fetch dups) — extend must skip ahead.
+        app.remote_skill_browser.browse_page_cache.fetch_cursor = 0;
+        app.remote_skill_browser.selector.selected =
+            app.remote_skill_browser.selector.items.len().saturating_sub(1);
+
+        let before = app.remote_skill_browser.selector.items.len();
+        app.maybe_extend_browse_cache();
+        let after = app.remote_skill_browser.selector.items.len();
+        assert!(
+            after > before,
+            "dedup skip must advance past duplicate SoT page ({before} → {after})"
+        );
+        assert!(
+            app.remote_skill_browser.browse_page_cache.fetch_cursor >= 80,
+            "cursor must advance as SoT offset even when first page was all dups"
+        );
+
+        unsafe {
+            std::env::remove_var("EDGECRAB_HOME");
+        }
+    }
+
+    #[tokio::test]
+    async fn chip_switch_resets_catalog_ensure_and_cursor() {
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.browse_page_cache.fetch_cursor = 160;
+        app.remote_skill_browser
+            .browse_page_cache
+            .catalog_ensure_inflight = true;
+        app.remote_skill_browser
+            .browse_page_cache
+            .catalog_ensure_filter = Some("skills-sh".into());
+        app.set_skills_marketplace_source_filter(Some("openai"));
+        assert_eq!(
+            app.remote_skill_browser.browse_page_cache.fetch_cursor, 0,
+            "chip switch must reset SoT cursor"
+        );
+        assert!(
+            !app.remote_skill_browser
+                .browse_page_cache
+                .catalog_ensure_inflight,
+            "chip switch must clear ensure inflight"
+        );
+    }
+
+    #[tokio::test]
+    async fn marketplace_loading_spinner_ticks_while_inflight() {
+        let mut app = App::new();
+        app.animate_status_indicators = false;
+        app.remote_skill_browser.inflight_request_id = Some(1);
+        app.remote_skill_browser.loading_started = Some(Instant::now());
+        let before = app.remote_skill_browser.loading_spinner_frame;
+        assert!(app.tick_spinner());
+        assert_eq!(
+            app.remote_skill_browser.loading_spinner_frame,
+            before.wrapping_add(1)
+        );
+        let status = app.remote_skill_browser.loading_status_line(
+            true,
+            "All",
+            TerminalGlyphProfile::Unicode,
+        );
+        assert!(status.contains("Browsing All"), "{status}");
+    }
+
+    #[tokio::test]
+    async fn mouse_dismisses_skills_marketplace_search_remote() {
+        let mut app = App::new();
+        app.mouse_capture_enabled = true;
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.inflight_request_id = Some(42);
+        app.remote_skill_browser.loading_query = Some("all::*browse*".into());
+        assert!(app.skills_marketplace_visible());
+
+        // Header row dismisses (list/detail clicks select/focus instead).
+        app.handle_mouse_event(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(!app.skills_marketplace_visible());
+        assert!(!app.remote_skill_browser.selector.active);
+        assert!(app.remote_skill_browser.inflight_request_id.is_none());
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::BrowseInstalled
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_list_click_selects_remote_skill_row() {
+        let mut app = App::new();
+        app.mouse_capture_enabled = true;
+        app.last_terminal_width = 100;
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.clear_loading();
+        app.remote_skill_browser.selector.set_items(vec![
+            RemoteSkillEntry {
+                source_label: "openai".into(),
+                trust_level: "official".into(),
+                name: "one".into(),
+                identifier: "openai/skills/one".into(),
+                description: "d1".into(),
+                origin: "https://github.com/openai/skills".into(),
+                tags: vec![],
+                search_text: "one".into(),
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                url: None,
+                repo: Some("openai/skills".into()),
+                path: Some("one".into()),
+            },
+            RemoteSkillEntry {
+                source_label: "openai".into(),
+                trust_level: "official".into(),
+                name: "two".into(),
+                identifier: "openai/skills/two".into(),
+                description: "d2".into(),
+                origin: "https://github.com/openai/skills".into(),
+                tags: vec![],
+                search_text: "two".into(),
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                url: None,
+                repo: Some("openai/skills".into()),
+                path: Some("two".into()),
+            },
+        ]);
+        assert_eq!(app.remote_skill_browser.selector.selected, 0);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let (_h, list, _d, _f) = app.skills_marketplace_remote_hit_rects(area);
+        let click_row = list.y.saturating_add(1);
+        assert!(app.handle_skills_marketplace_mouse(list.x + 2, click_row, false).0);
+        assert!(app.remote_skill_browser.selector.active);
+        assert_eq!(app.remote_skill_browser.selector.selected, 1);
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::SearchRemote
+        );
+    }
+
+    #[tokio::test]
+    async fn source_jump_cancels_and_rebrowses_while_catalog_loading() {
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        // Simulate an inflight openai browse, then jump to All (index 0 → None).
+        app.remote_skill_browser.inflight_request_id = Some(7);
+        app.remote_skill_browser.loading_query = Some("openai::*browse*".into());
+        app.remote_skill_browser.source_filter = Some("openai".into());
+        let prev_id = app.remote_skill_browser.next_request_id;
+        assert!(app.apply_marketplace_action(
+            skills_marketplace::MarketplaceAction::JumpSource(0)
+        ));
+        assert_eq!(
+            app.remote_skill_browser.source_filter.as_deref(),
+            None,
+            "cancel-on-navigate must apply the new All filter while inflight"
+        );
+        // schedule_remote_skill_search sets due_at; poll starts a new request_id.
+        app.poll_remote_skill_search();
+        assert!(
+            app.remote_skill_browser.next_request_id > prev_id
+                || app.remote_skill_browser.inflight_request_id.is_some(),
+            "chip change must schedule a new browse request"
+        );
+        assert_ne!(
+            app.remote_skill_browser.loading_query.as_deref(),
+            Some("openai::*browse*"),
+            "prior load key must be cleared / replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_dismiss_skips_installing_theatre() {
+        let mut app = App::new();
+        app.mouse_capture_enabled = true;
+        app.remote_skill_browser.selector.active = true;
+        app.skills_marketplace_mode = skills_marketplace::MarketplaceMode::Installing {
+            identifier: "owner/repo/skill".into(),
+            stage: skills_marketplace::InstallStage::Fetch,
+        };
+        assert!(app.handle_skills_marketplace_mouse_dismiss(5, 5));
+        assert!(matches!(
+            app.skills_marketplace_mode,
+            skills_marketplace::MarketplaceMode::Installing { .. }
+        ));
+        assert!(app.remote_skill_browser.selector.active);
+    }
+
+    #[tokio::test]
+    async fn mouse_outside_source_pick_goes_back() {
+        let mut app = App::new();
+        app.mouse_capture_enabled = true;
+        app.remote_skill_browser.selector.active = true;
+        app.skills_marketplace_mode =
+            skills_marketplace::MarketplaceMode::SourcePick { selected: 0 };
+        // Corner of a typical 80×24 terminal is outside the centered popup.
+        assert!(app.handle_skills_marketplace_mouse_dismiss(0, 0));
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::SearchRemote
+        );
+    }
+
+    #[tokio::test]
+    async fn open_remote_skill_selector_none_opens_search_remote() {
+        let mut app = App::new();
+        app.open_skill_selector();
+        assert!(app.skill_selector.active);
+
+        app.open_remote_skill_selector(None);
+
+        assert!(!app.skill_selector.active);
+        assert!(app.remote_skill_browser.selector.active);
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::SearchRemote
+        );
+        // Empty query schedules browse (not a cleared no-op).
+        assert!(app.remote_skill_browser.search_due_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn marketplace_source_filter_change_schedules_browse() {
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.search_due_at = None;
+        app.set_skills_marketplace_source_filter(Some("openai"));
+        assert_eq!(
+            app.remote_skill_browser.source_filter.as_deref(),
+            Some("openai")
+        );
+        assert!(app.remote_skill_browser.search_due_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn open_remote_skill_selector_with_query_opens_search_remote() {
+        let mut app = App::new();
+        app.open_remote_skill_selector(Some("pdf"));
+        assert!(app.remote_skill_browser.selector.active);
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::SearchRemote
+        );
+        assert!(
+            app.remote_skill_browser
+                .selector
+                .query
+                .to_ascii_lowercase()
+                .contains("pdf")
+        );
+    }
+
+    #[tokio::test]
+    async fn search_remote_lowercase_letters_type_into_query_not_install() {
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
+            source_label: "skills.sh".into(),
+            trust_level: "community".into(),
+            name: "seo".into(),
+            identifier: "skills.sh:owner/repo/seo".into(),
+            description: "seo skill".into(),
+            origin: "https://skills.sh".into(),
+            tags: vec![],
+            installed_name: None,
+            action: RemoteSkillAction::Install,
+            search_text: "seo".into(),
+            url: None,
+            repo: None,
+            path: None,
+        }]);
+        app.remote_skill_browser.selector.selected = 0;
+        app.remote_skill_browser.search_due_at = None;
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        assert_eq!(app.remote_skill_browser.selector.query, "si");
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::SearchRemote,
+            "lowercase i must not trigger install"
+        );
+        assert!(app.remote_skill_browser.action_in_flight.is_none());
+    }
+
+    #[tokio::test]
+    async fn browse_installed_lowercase_s_stays_in_filter() {
+        let mut app = App::new();
+        app.open_skill_selector();
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::BrowseInstalled
+        );
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert!(app.skill_selector.active);
+        assert!(!app.remote_skill_browser.selector.active);
+        assert_eq!(app.skill_selector.query, "s");
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::BrowseInstalled
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_installed_slash_opens_search_remote() {
+        let mut app = App::new();
+        app.open_skill_selector();
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.remote_skill_browser.selector.active);
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::SearchRemote
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_mode_lowercase_a_does_not_mutate_query() {
+        let mut app = App::new();
+        app.open_remote_skill_selector(None);
+        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
+            source_label: "OpenAI".into(),
+            trust_level: "trusted".into(),
+            name: "demo".into(),
+            identifier: "openai/skills/demo".into(),
+            description: "demo".into(),
+            origin: "https://github.com/openai/skills".into(),
+            tags: vec![],
+            installed_name: None,
+            action: RemoteSkillAction::Install,
+            search_text: "demo".into(),
+            url: None,
+            repo: Some("openai/skills".into()),
+            path: Some("skills/.curated/demo".into()),
+        }]);
+        app.remote_skill_browser.selector.query = "se".into();
+        app.remote_skill_browser.selector.update_filter();
+        app.skills_marketplace_mode = skills_marketplace::MarketplaceMode::Inspect {
+            identifier: "openai/skills/demo".into(),
+            preview_scroll: 0,
+        };
+
+        app.handle_key_event(event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert_eq!(app.remote_skill_browser.selector.query, "se");
+        assert_eq!(
+            app.skills_marketplace_mode.kind(),
+            skills_marketplace::MarketplaceModeKind::Inspect
+        );
+    }
+
+    #[tokio::test]
     async fn remote_skill_browser_detail_focus_pages_split_detail() {
         let mut app = App::new();
         app.remote_skill_browser
@@ -22285,6 +24469,9 @@ kind = "skill"
                 installed_name: None,
                 action: RemoteSkillAction::Install,
                 search_text: "long detail tui audit".into(),
+                url: Some("https://example.com/skills/long-detail".into()),
+                repo: None,
+                path: None,
             }]);
         app.remote_skill_browser.selector.active = true;
 

@@ -524,27 +524,48 @@ fn check_memories(home: &Path) -> Check {
 
 fn check_skills(home: &Path) -> Check {
     let skills_dir = home.join("skills");
-    if skills_dir.exists() {
-        let count = count_installed_skills(&skills_dir);
-        if count == 0 {
-            Check::warn(
-                "Skills",
-                format!(
-                    "{} exists but contains no installed skills",
-                    skills_dir.display()
-                ),
-            )
+    let seeded = edgecrab_tools::tools::skills_hub::ensure_default_taps();
+    let federation = edgecrab_tools::tools::skills_hub::federation_endpoints();
+    let health = edgecrab_tools::tools::skills_hub::assess_hub_health();
+
+    if !skills_dir.exists() {
+        let token = if health.github_token_set {
+            "GITHUB_TOKEN/GH_TOKEN set"
         } else {
-            Check::pass(
-                "Skills",
-                format!("{} ({count} installed skills)", skills_dir.display()),
-            )
-        }
-    } else {
-        Check::warn(
+            "warn: set GITHUB_TOKEN or GH_TOKEN"
+        };
+        return Check::warn(
             "Skills",
-            format!("{} not found — will be created", skills_dir.display()),
-        )
+            format!(
+                "{} not found — will be created ({} default taps ready, federation {}, {token})",
+                skills_dir.display(),
+                health.taps_count,
+                federation.len(),
+            ),
+        );
+    }
+
+    let count = count_installed_skills(&skills_dir);
+    let mut detail = health.doctor_detail(count, &skills_dir.display().to_string());
+    if seeded > 0 {
+        detail.push_str(&format!(" [seeded {seeded} default taps]"));
+    }
+    detail.push_str(&format!(" federation={}", federation.len()));
+
+    // Missing token is always at least a warn (exact env names in detail).
+    match health.doctor_severity() {
+        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Fail => {
+            Check::fail("Skills", detail)
+        }
+        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Warn => {
+            Check::warn("Skills", detail)
+        }
+        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Pass if count == 0 => {
+            Check::warn("Skills", detail)
+        }
+        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Pass => {
+            Check::pass("Skills", detail)
+        }
     }
 }
 

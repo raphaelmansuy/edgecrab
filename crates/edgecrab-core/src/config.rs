@@ -1962,6 +1962,9 @@ pub struct SkillsConfig {
     /// Local skills in ~/.edgecrab/skills/ take precedence over external dirs.
     #[serde(default)]
     pub external_dirs: Vec<String>,
+    /// Extra `/.well-known/skills/index.json` federation hubs (agentskills.io always included).
+    #[serde(default)]
+    pub federation_hubs: Vec<String>,
     /// Skills to preload into the system prompt before the first turn.
     /// Set via the `-s`/`--skill` CLI flag or programmatically.
     /// Equivalent to `hermes -s skill1,skill2`.
@@ -1998,6 +2001,7 @@ impl Default for SkillsConfig {
             disabled: Vec::new(),
             platform_disabled: std::collections::HashMap::new(),
             external_dirs: Vec::new(),
+            federation_hubs: Vec::new(),
             preloaded: Vec::new(),
             write_approval: false,
             template_vars: true,

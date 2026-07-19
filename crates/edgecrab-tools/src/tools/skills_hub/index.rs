@@ -14,7 +14,8 @@ use super::{HubSourceInfo, SearchGroup, SearchReport, SkillBundle, SkillMeta};
 
 /// Public Hermes CI-built catalog (resolved install paths). Best-effort fetch.
 const REMOTE_INDEX_URL: &str = "https://hermes-agent.nousresearch.com/docs/api/skills-index.json";
-const INDEX_TTL_SECS: i64 = 6 * 3600;
+/// Unified index TTL (seconds). Doctor warns when age exceeds `2 × INDEX_TTL_SECS`.
+pub const INDEX_TTL_SECS: i64 = 6 * 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UnifiedIndexFile {
@@ -165,6 +166,11 @@ pub fn unified_index_available() -> bool {
 
 /// Search the local unified index (sync, zero network).
 pub fn search_unified_index(query: &str, limit: usize) -> SearchGroup {
+    browse_unified_index_slice(query, 0, limit)
+}
+
+/// Slice the unified index for on-demand browse pages (`offset` + `limit`).
+pub fn browse_unified_index_slice(query: &str, offset: usize, limit: usize) -> SearchGroup {
     let summary = HubSourceInfo {
         id: "unified-index".into(),
         label: "Unified Index".into(),
@@ -197,10 +203,26 @@ pub fn search_unified_index(query: &str, limit: usize) -> SearchGroup {
         .filter(|entry| query.trim().is_empty() || index_entry_matches(entry, query))
         .collect();
     ranked.sort_by_key(|entry| index_entry_score(entry, query));
-    let results: Vec<SkillMeta> = ranked.into_iter().take(limit).map(entry_to_meta).collect();
+    let total = ranked.len();
+    let results: Vec<SkillMeta> = ranked
+        .into_iter()
+        .skip(offset)
+        .take(limit.max(1))
+        .map(entry_to_meta)
+        .collect();
 
     let notice = if index_is_fresh(&index) {
-        None
+        if offset > 0 || results.len() < total.saturating_sub(offset).min(limit.max(1)) {
+            None
+        } else if offset + results.len() < total {
+            Some(format!(
+                "index page {}–{} of {total}",
+                offset + 1,
+                offset + results.len()
+            ))
+        } else {
+            None
+        }
     } else {
         Some(format!(
             "index age {}h — live sources may supplement stale entries",
@@ -382,6 +404,26 @@ pub fn format_index_status() -> String {
     )
 }
 
+/// Whether a unified index file exists on disk.
+pub fn index_file_exists() -> bool {
+    index_path().is_file()
+}
+
+/// Skill count in the on-disk unified index (browse SoT for All/index pages).
+pub fn unified_index_len() -> Option<usize> {
+    let index = read_index_file()?;
+    if index.skills.is_empty() {
+        return None;
+    }
+    Some(index.skills.len())
+}
+
+/// Age of the unified index in seconds, if readable.
+pub fn index_age_secs() -> Option<i64> {
+    let index = read_index_file()?;
+    Some(chrono::Utc::now().timestamp() - index.fetched_at)
+}
+
 /// Seed unified index from curated GitHub tree caches (zero network).
 pub fn bootstrap_index_from_local_caches() -> usize {
     let cache_dir = crate::config_ref::resolve_edgecrab_home()
@@ -405,12 +447,7 @@ pub fn bootstrap_index_from_local_caches() -> usize {
         tags: Vec<String>,
     }
 
-    let repos: &[(&str, &str, &str)] = &[
-        ("edgecrab", "raphaelmansuy/edgecrab", "trusted"),
-        ("hermes-agent", "NousResearch/hermes-agent", "trusted"),
-        ("openai", "openai/skills", "trusted"),
-        ("anthropics", "anthropics/skills", "trusted"),
-    ];
+    let repos = super::catalog::index_bootstrap_repos();
 
     let mut merged: std::collections::HashMap<String, IndexEntry> = read_index_file()
         .map(|f| {
@@ -421,7 +458,7 @@ pub fn bootstrap_index_from_local_caches() -> usize {
         })
         .unwrap_or_default();
 
-    for (source_id, repo, trust) in repos {
+    for (source_id, repo, trust) in &repos {
         let path = cache_dir.join(format!("{source_id}.json"));
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;

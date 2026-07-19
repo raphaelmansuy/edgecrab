@@ -15,25 +15,8 @@ use std::path::Path;
 
 // ─── Data structures ───────────────────────────────────────────
 
-/// Severity level for a detected threat.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-impl std::fmt::Display for Severity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Severity::Low => write!(f, "low"),
-            Severity::Medium => write!(f, "medium"),
-            Severity::High => write!(f, "high"),
-            Severity::Critical => write!(f, "critical"),
-        }
-    }
-}
+/// Severity SoT: [`edgecrab_security::threat_patterns::ThreatSeverity`].
+pub type Severity = edgecrab_security::threat_patterns::ThreatSeverity;
 
 /// Category of the detected threat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +91,8 @@ pub const TRUSTED_REPOS: &[&str] = &[
     "raphaelmansuy/edgecrab",
     "openai/skills",
     "anthropics/skills",
+    "huggingface/skills",
+    "nvidia/skills",
 ];
 
 // ─── Install policy ────────────────────────────────────────────
@@ -381,7 +366,7 @@ fn scan_file(path: &Path, root: &Path, findings: &mut Vec<Finding>) {
         for f in result.findings {
             findings.push(Finding {
                 pattern_id: f.pattern_id.to_string(),
-                severity: map_severity(f.severity),
+                severity: f.severity,
                 category: map_category(f.category),
                 file: rel_path.clone(),
                 line: line_num + 1,
@@ -389,15 +374,6 @@ fn scan_file(path: &Path, root: &Path, findings: &mut Vec<Finding>) {
                 description: f.description.to_string(),
             });
         }
-    }
-}
-
-fn map_severity(s: edgecrab_security::threat_patterns::ThreatSeverity) -> Severity {
-    match s {
-        edgecrab_security::threat_patterns::ThreatSeverity::Low => Severity::Low,
-        edgecrab_security::threat_patterns::ThreatSeverity::Medium => Severity::Medium,
-        edgecrab_security::threat_patterns::ThreatSeverity::High => Severity::High,
-        edgecrab_security::threat_patterns::ThreatSeverity::Critical => Severity::Critical,
     }
 }
 

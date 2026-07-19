@@ -1064,12 +1064,22 @@ impl App {
                         }
                     }
                 }
+                AgentResponse::RemoteSkillSearchPartial {
+                    request_id,
+                    query,
+                    group,
+                } => {
+                    self.apply_remote_skill_search_partial(request_id, query, group);
+                }
                 AgentResponse::RemoteSkillSearchReady {
                     request_id,
                     query,
                     report,
                 } => {
                     self.apply_remote_skill_search_result(request_id, query, report);
+                }
+                AgentResponse::RemoteSkillCatalogEnsureDone { filter, error } => {
+                    self.apply_remote_skill_catalog_ensure_done(filter, error);
                 }
                 AgentResponse::RemotePluginSearchReady {
                     request_id,
@@ -1116,12 +1126,40 @@ impl App {
                     );
                     self.needs_redraw = true;
                 }
+                AgentResponse::RemoteSkillInstallProgress {
+                    identifier,
+                    stage,
+                    status,
+                } => {
+                    if matches!(
+                        self.skills_marketplace_mode,
+                        super::skills_marketplace::MarketplaceMode::Installing { .. }
+                            | super::skills_marketplace::MarketplaceMode::SearchRemote
+                            | super::skills_marketplace::MarketplaceMode::Inspect { .. }
+                    ) || self.remote_skill_browser.action_in_flight.is_some()
+                    {
+                        if super::skills_marketplace::advance_install_stage(
+                            &mut self.skills_marketplace_mode,
+                            &identifier,
+                            stage,
+                        ) {
+                            self.skills_install_stage_started = Some(std::time::Instant::now());
+                        }
+                        self.skills_marketplace_status = status;
+                        self.needs_redraw = true;
+                    }
+                }
                 AgentResponse::RemoteSkillGuardPrompt {
                     entry,
                     preview,
                     review_only,
                 } => {
                     self.remote_skill_browser.action_in_flight = None;
+                    self.skills_marketplace_mode =
+                        super::skills_marketplace::MarketplaceMode::GuardReview {
+                            identifier: entry.identifier.clone(),
+                            preserved_query: self.remote_skill_browser.current_query(),
+                        };
                     self.skill_trust_prompt = Some(App::build_skill_trust_prompt_state(
                         entry,
                         *preview,
@@ -1143,14 +1181,21 @@ impl App {
                     skill_name,
                 } => {
                     self.remote_skill_browser.action_in_flight = None;
+                    self.skills_marketplace_mode =
+                        super::skills_marketplace::MarketplaceMode::Done {
+                            name: skill_name.clone(),
+                        };
                     self.refresh_skills_list();
                     self.push_output(
-                        format!("{message}\nActivate with: /skills view {skill_name}"),
+                        format!(
+                            "{message}\nAsk the agent to use `{skill_name}`, or remove with `/skills remove {skill_name}`."
+                        ),
                         OutputRole::System,
                     );
                     if self.remote_skill_browser.selector.active {
                         self.schedule_remote_skill_search(true);
                     }
+                    self.needs_redraw = true;
                 }
                 AgentResponse::RemoteSkillActionFailed {
                     action_label,
@@ -1158,6 +1203,10 @@ impl App {
                     error,
                 } => {
                     self.remote_skill_browser.action_in_flight = None;
+                    self.skills_marketplace_mode =
+                        super::skills_marketplace::MarketplaceMode::Error {
+                            message: format!("{action_label} failed: {error}"),
+                        };
                     self.push_output(
                         format!("Remote {action_label} failed for '{identifier}': {error}"),
                         OutputRole::Error,

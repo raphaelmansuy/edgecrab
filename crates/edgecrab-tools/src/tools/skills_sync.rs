@@ -889,6 +889,482 @@ fn remove_dir_all_writable(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// A bundled skill the user has edited (Hermes `list_user_modified_bundled_skills`).
+#[derive(Debug, Clone)]
+pub struct ModifiedBundledSkill {
+    pub name: String,
+    pub dest: PathBuf,
+    pub bundled_src: Option<PathBuf>,
+}
+
+/// List bundled skills whose on-disk copy diverged from the sync origin hash.
+pub fn list_user_modified_bundled_skills() -> Vec<ModifiedBundledSkill> {
+    let manifest = read_manifest();
+    if manifest.is_empty() {
+        return Vec::new();
+    }
+    let user_skills = skills_dir();
+    let snapshots = load_bundled_snapshots();
+    let mut out = Vec::new();
+    for snapshot in &snapshots {
+        let Some(origin_hash) = manifest.get(&snapshot.name) else {
+            continue;
+        };
+        if origin_hash.is_empty() {
+            continue;
+        }
+        let dest = user_skills.join(&snapshot.name);
+        if !dest.is_dir() {
+            continue;
+        }
+        let user_hash = dir_hash(&dest);
+        if user_hash != *origin_hash {
+            let bundled_src = bundled_skills_dir().map(|root| root.join(&snapshot.name));
+            out.push(ModifiedBundledSkill {
+                name: snapshot.name.clone(),
+                dest,
+                bundled_src,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Diff entry for a single relative path inside a skill tree.
+#[derive(Debug, Clone)]
+pub struct BundledSkillDiffEntry {
+    pub path: String,
+    /// `modified` | `added` | `removed` | `binary`
+    pub status: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BundledSkillDiffResult {
+    pub ok: bool,
+    pub name: String,
+    pub found: bool,
+    pub modified: bool,
+    pub message: String,
+    pub diffs: Vec<BundledSkillDiffEntry>,
+}
+
+/// Diff the user's copy of a bundled skill against the stock snapshot.
+pub fn diff_bundled_skill(name: &str) -> BundledSkillDiffResult {
+    let snapshots = load_bundled_snapshots();
+    let Some(snapshot) = resolve_bundled_skill_query(name, &snapshots) else {
+        return BundledSkillDiffResult {
+            ok: false,
+            name: name.to_string(),
+            found: false,
+            modified: false,
+            message: format!(
+                "'{name}' is not a tracked bundled skill (no stock version to diff against). \
+                 Hub-installed skills use `/skills inspect`."
+            ),
+            diffs: Vec::new(),
+        };
+    };
+    let dest = skills_dir().join(&snapshot.name);
+    if !dest.is_dir() {
+        return BundledSkillDiffResult {
+            ok: false,
+            name: snapshot.name.clone(),
+            found: true,
+            modified: false,
+            message: format!("No local copy of '{}' found at {}.", snapshot.name, dest.display()),
+            diffs: Vec::new(),
+        };
+    }
+
+    let stock: HashMap<String, String> = snapshot
+        .files
+        .iter()
+        .map(|f| (f.relative_path.clone(), f.content.clone()))
+        .collect();
+    let mut user_files: HashMap<String, Vec<u8>> = HashMap::new();
+    if let Ok(paths) = walkdir(&dest) {
+        for path in paths {
+            if let Ok(rel) = path.strip_prefix(&dest) {
+                let key = rel.to_string_lossy().replace('\\', "/");
+                if let Ok(bytes) = std::fs::read(&path) {
+                    user_files.insert(key, bytes);
+                }
+            }
+        }
+    }
+
+    let mut keys: HashSet<String> = stock.keys().cloned().collect();
+    keys.extend(user_files.keys().cloned());
+    let mut keys: Vec<String> = keys.into_iter().collect();
+    keys.sort();
+
+    let mut diffs = Vec::new();
+    for rel in keys {
+        let in_user = user_files.contains_key(&rel);
+        let in_stock = stock.contains_key(&rel);
+        if in_user && in_stock {
+            let user_bytes = &user_files[&rel];
+            let stock_text = &stock[&rel];
+            let user_is_binary = user_bytes.contains(&0);
+            if user_is_binary {
+                if user_bytes.as_slice() != stock_text.as_bytes() {
+                    diffs.push(BundledSkillDiffEntry {
+                        path: rel,
+                        status: "binary".into(),
+                        diff: "<binary file differs>".into(),
+                    });
+                }
+                continue;
+            }
+            let user_text = String::from_utf8_lossy(user_bytes);
+            if user_text.as_ref() == stock_text.as_str() {
+                continue;
+            }
+            diffs.push(BundledSkillDiffEntry {
+                path: rel.clone(),
+                status: "modified".into(),
+                diff: simple_unified_diff(&rel, stock_text, user_text.as_ref()),
+            });
+        } else if in_user {
+            diffs.push(BundledSkillDiffEntry {
+                path: rel.clone(),
+                status: "added".into(),
+                diff: format!("+ only in your copy: {rel}"),
+            });
+        } else {
+            diffs.push(BundledSkillDiffEntry {
+                path: rel.clone(),
+                status: "removed".into(),
+                diff: format!("- only in stock: {rel}"),
+            });
+        }
+    }
+
+    let modified = !diffs.is_empty();
+    BundledSkillDiffResult {
+        ok: true,
+        name: snapshot.name.clone(),
+        found: true,
+        modified,
+        message: if modified {
+            format!("'{}' differs from stock ({} file(s)).", snapshot.name, diffs.len())
+        } else {
+            format!("'{}' matches the stock bundled copy.", snapshot.name)
+        },
+        diffs,
+    }
+}
+
+fn simple_unified_diff(path: &str, stock: &str, yours: &str) -> String {
+    let mut out = format!("--- stock/{path}\n+++ yours/{path}\n");
+    let stock_lines: Vec<&str> = stock.lines().collect();
+    let yours_lines: Vec<&str> = yours.lines().collect();
+    let max = stock_lines.len().max(yours_lines.len());
+    for i in 0..max {
+        match (stock_lines.get(i), yours_lines.get(i)) {
+            (Some(a), Some(b)) if a == b => {
+                out.push(' ');
+                out.push_str(a);
+                out.push('\n');
+            }
+            (Some(a), Some(b)) => {
+                out.push('-');
+                out.push_str(a);
+                out.push('\n');
+                out.push('+');
+                out.push_str(b);
+                out.push('\n');
+            }
+            (Some(a), None) => {
+                out.push('-');
+                out.push_str(a);
+                out.push('\n');
+            }
+            (None, Some(b)) => {
+                out.push('+');
+                out.push_str(b);
+                out.push('\n');
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+/// Repair / backfill official optional skill provenance (Hermes `restore_official_optional_skill`).
+#[derive(Debug, Clone)]
+pub struct RepairOfficialResult {
+    pub ok: bool,
+    pub message: String,
+    pub restored: Vec<String>,
+    pub backfilled: Vec<String>,
+    pub backed_up: Vec<String>,
+    pub backup_dir: String,
+}
+
+pub fn repair_official_optional_skill(name: &str, restore: bool) -> RepairOfficialResult {
+    let Some(optional_dir) = optional_skills_dir() else {
+        // Embedded-only: still allow backfill from embedded optional catalog.
+        return repair_official_from_embedded(name, restore);
+    };
+    if !optional_dir.is_dir() {
+        return repair_official_from_embedded(name, restore);
+    }
+
+    let mut targets = discover_optional_skill_dirs(&optional_dir);
+    if name != "all" && name != "*" {
+        targets.retain(|(_folder, rel, _src)| {
+            rel == name
+                || rel.ends_with(&format!("/{name}"))
+                || rel.rsplit('/').next() == Some(name)
+        });
+        if targets.is_empty() {
+            return RepairOfficialResult {
+                ok: false,
+                message: format!("Official optional skill not found: {name}"),
+                restored: Vec::new(),
+                backfilled: Vec::new(),
+                backed_up: Vec::new(),
+                backup_dir: String::new(),
+            };
+        }
+    }
+    if targets.is_empty() {
+        return RepairOfficialResult {
+            ok: false,
+            message: "No official optional skills directory found.".into(),
+            restored: Vec::new(),
+            backfilled: Vec::new(),
+            backed_up: Vec::new(),
+            backup_dir: String::new(),
+        };
+    }
+
+    let user_skills = skills_dir();
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let backup_root = user_skills
+        .join(".restore-backups")
+        .join(format!("official-optional-{timestamp}"));
+    let mut restored = Vec::new();
+    let mut backed_up = Vec::new();
+
+    for (_folder, rel, src) in &targets {
+        let dest = user_skills.join(rel);
+        let src_hash = dir_hash(src);
+        let canonical_ok = dest.is_dir() && dir_hash(&dest) == src_hash;
+        if restore {
+            if dest.is_dir() && !canonical_ok {
+                let backup = backup_root.join(rel);
+                if let Some(parent) = backup.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let moved = std::fs::rename(&dest, &backup).is_ok()
+                    || remove_dir_all_writable(&dest).is_ok();
+                if moved {
+                    backed_up.push(rel.clone());
+                }
+            }
+            if !dest.exists() {
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if copy_dir_recursive(src, &dest).is_ok() {
+                    restored.push(rel.clone());
+                }
+            }
+        } else if !canonical_ok {
+            continue;
+        }
+    }
+
+    let backfilled = backfill_optional_provenance(&optional_dir);
+    let backup_dir = if backed_up.is_empty() {
+        String::new()
+    } else {
+        backup_root.display().to_string()
+    };
+    RepairOfficialResult {
+        ok: true,
+        message: "Official optional skill repair complete.".into(),
+        restored,
+        backfilled,
+        backed_up,
+        backup_dir,
+    }
+}
+
+fn repair_official_from_embedded(name: &str, restore: bool) -> RepairOfficialResult {
+    let skills = embedded_optional_skills();
+    if skills.is_empty() {
+        return RepairOfficialResult {
+            ok: false,
+            message: "No official optional skills directory found.".into(),
+            restored: Vec::new(),
+            backfilled: Vec::new(),
+            backed_up: Vec::new(),
+            backup_dir: String::new(),
+        };
+    }
+    let mut matched: Vec<&EmbeddedSkill> = skills
+        .iter()
+        .filter(|s| {
+            name == "all"
+                || name == "*"
+                || s.name == name
+                || s.name.ends_with(&format!("/{name}"))
+                || s.name.rsplit('/').next() == Some(name)
+        })
+        .collect();
+    if matched.is_empty() {
+        return RepairOfficialResult {
+            ok: false,
+            message: format!("Official optional skill not found: {name}"),
+            restored: Vec::new(),
+            backfilled: Vec::new(),
+            backed_up: Vec::new(),
+            backup_dir: String::new(),
+        };
+    }
+    matched.sort_by(|a, b| a.name.cmp(b.name));
+    let user_skills = skills_dir();
+    let mut restored = Vec::new();
+    let mut backfilled = Vec::new();
+    if restore {
+        for skill in matched {
+            let dest = user_skills.join(skill.name);
+            let snapshot = SkillSnapshot {
+                name: skill.name.to_string(),
+                files: skill
+                    .files
+                    .iter()
+                    .map(|f| SkillSnapshotFile {
+                        relative_path: f.relative_path.to_string(),
+                        content: f.content.to_string(),
+                    })
+                    .collect(),
+            };
+            write_skill_snapshot(&snapshot, &dest);
+            restored.push(skill.name.to_string());
+            backfilled.push(skill.name.to_string());
+        }
+    } else {
+        for skill in matched {
+            let dest = user_skills.join(skill.name);
+            if dest.is_dir() {
+                backfilled.push(skill.name.to_string());
+            }
+        }
+    }
+    RepairOfficialResult {
+        ok: true,
+        message: "Official optional skill repair complete.".into(),
+        restored,
+        backfilled,
+        backed_up: Vec::new(),
+        backup_dir: String::new(),
+    }
+}
+
+fn discover_optional_skill_dirs(optional_dir: &Path) -> Vec<(String, String, PathBuf)> {
+    let mut out = Vec::new();
+    let mut stack = vec![optional_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.join("SKILL.md").is_file() {
+                let rel = path
+                    .strip_prefix(optional_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let folder = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rel.clone());
+                out.push((folder, rel, path));
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Mark byte-identical optional skills as hub-installed in lock.json (best-effort).
+/// Lock format matches `skills_hub::LockEntry` flat map (not Hermes nested `installed`).
+fn backfill_optional_provenance(optional_dir: &Path) -> Vec<String> {
+    let user_skills = skills_dir();
+    let lock_path = user_skills.join(".hub").join("lock.json");
+    let mut lock: HashMap<String, serde_json::Value> = if lock_path.is_file() {
+        std::fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let mut backfilled = Vec::new();
+    for (_folder, rel, src) in discover_optional_skill_dirs(optional_dir) {
+        let dest = user_skills.join(&rel);
+        if !dest.is_dir() {
+            continue;
+        }
+        if dir_hash(&dest) != dir_hash(&src) {
+            continue;
+        }
+        let leaf = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        if lock.contains_key(&leaf) || lock.contains_key(&rel) {
+            continue;
+        }
+        lock.insert(
+            leaf,
+            serde_json::json!({
+                "source": "official",
+                "identifier": format!("official/{rel}"),
+                "installed_at": chrono::Utc::now().to_rfc3339(),
+                "content_hash": "",
+                "source_url": "",
+                "scanner_version": "skills-guard-v1",
+            }),
+        );
+        backfilled.push(rel);
+    }
+    if !backfilled.is_empty() {
+        if let Some(parent) = lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&lock) {
+            let _ = std::fs::write(lock_path, text);
+        }
+    }
+    backfilled
+}
+
 #[cfg(unix)]
 fn make_tree_writable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;

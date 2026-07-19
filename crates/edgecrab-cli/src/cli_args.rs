@@ -1398,6 +1398,26 @@ pub enum SkillsCommand {
     Search {
         /// Search query
         query: String,
+        /// Source / provider filter (openai, anthropic, clawhub, …)
+        #[arg(long, short = 'S')]
+        source: Option<String>,
+    },
+    /// Browse remote Skills Hub catalog (paginated; Hermes `skills browse` parity).
+    /// Alias: `hub` (branding — same as browse, not search).
+    #[command(visible_alias = "hub")]
+    Browse {
+        /// Source / provider filter (skills.sh, clawhub, openai, all, …)
+        #[arg(long, short = 'S')]
+        source: Option<String>,
+        /// Page number (1-based)
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+        /// Page size (1–100)
+        #[arg(long = "page-size", default_value_t = 20)]
+        page_size: usize,
+        /// Emit JSON page payload
+        #[arg(long)]
+        json: bool,
     },
     /// Install a skill from a git repository or local path
     Install {
@@ -1406,7 +1426,80 @@ pub enum SkillsCommand {
         /// Override the skill name (default: last segment of source)
         #[arg(long)]
         name: Option<String>,
+        /// Override caution verdict
+        #[arg(long, short = 'f')]
+        force: bool,
+        /// Allow dangerous verdict (hash-bound)
+        #[arg(long)]
+        trust: bool,
+        /// Non-interactive caution confirm (same policy as `--force`; never bypasses Dangerous)
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
+        /// Invalidate skills prompt cache immediately (default)
+        #[arg(long)]
+        now: bool,
+        /// Defer prompt-cache invalidate (Anthropic cache cost control)
+        #[arg(long)]
+        deferred: bool,
+        /// Emit install stages + outcome as JSON
+        #[arg(long)]
+        json: bool,
     },
+    /// List bundled skills the user has modified (kept by sync)
+    ListModified {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diff a bundled skill against stock (or pending write id via slash)
+    Diff {
+        /// Bundled skill name or pending write id
+        name: String,
+    },
+    /// Repair / backfill official optional skill provenance
+    RepairOfficial {
+        /// Skill name or `all`
+        name: String,
+        /// Restore from optional source (backup existing first)
+        #[arg(long, short = 'r')]
+        restore: bool,
+    },
+    /// Publish a local skill to GitHub or ClawHub
+    Publish {
+        /// Skill directory or installed skill name
+        path: String,
+        /// Target registry
+        #[arg(long = "to", default_value = "github")]
+        to: String,
+        /// GitHub owner/repo (required for --to github)
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Skill bundles (multi-skill install groups)
+    Bundles {
+        #[command(subcommand)]
+        command: SkillsBundlesCommand,
+    },
+    /// Show web hub API status (Wave C — not mounted by default)
+    WebHub,
+    /// Import skills from a peer agent home (claude|codex|pi|agents|openclaw) or path
+    ImportFrom {
+        /// Peer alias or directory path
+        spec: String,
+        /// Override caution verdict
+        #[arg(long, short = 'f')]
+        force: bool,
+        /// Allow dangerous verdict
+        #[arg(long)]
+        trust: bool,
+        /// Non-interactive caution confirm (same policy as `--force`)
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
+        /// Emit import report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List remote sources / taps catalog
+    Sources,
     /// Update one or all hub-installed remote skills to the latest version
     Update {
         /// Skill name to update; omit to update all hub-installed skills
@@ -1416,6 +1509,147 @@ pub enum SkillsCommand {
     Remove {
         /// Skill name to remove
         name: String,
+    },
+    /// Manage community/official taps (`/skills tap …`)
+    Tap {
+        #[command(subcommand)]
+        command: SkillsTapCommand,
+    },
+    /// Record hash-bound trust for a dangerous skill (no install)
+    Trust {
+        /// Skill identifier (same forms as install)
+        identifier: String,
+    },
+    /// Remove a stored guard approval
+    Untrust {
+        /// Skill identifier or skill name
+        identifier: String,
+    },
+    /// List hash-bound guard approvals
+    Trusted,
+    /// Audit hub-installed skills (or `--log` for audit trail)
+    Audit {
+        /// Optional skill name to audit
+        name: Option<String>,
+        /// Deep re-scan of on-disk skill trees
+        #[arg(long)]
+        deep: bool,
+        /// Show recent audit log instead of scanning
+        #[arg(long)]
+        log: bool,
+    },
+    /// Export/import hub snapshot
+    Snapshot {
+        #[command(subcommand)]
+        command: SkillsSnapshotCommand,
+    },
+    /// Check hub lock entries against upstream
+    Check {
+        /// Optional skill name
+        name: Option<String>,
+    },
+    /// Inspect a remote/local skill (optional `--scan`)
+    Inspect {
+        /// Skill identifier
+        identifier: String,
+        /// Run Skill Guard scan preview
+        #[arg(long)]
+        scan: bool,
+    },
+    /// Opt out of bundled skill sync
+    OptOut {
+        /// Also remove pristine bundled copies
+        #[arg(long)]
+        remove: bool,
+        /// Preview removals only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Opt back into bundled skill sync
+    OptIn {
+        /// Re-seed bundled skills immediately
+        #[arg(long)]
+        sync: bool,
+    },
+    /// Reset a bundled skill to upstream
+    Reset {
+        /// Bundled skill name
+        name: String,
+        /// Restore after reset
+        #[arg(long, short = 'r')]
+        restore: bool,
+    },
+    /// Show hub lock file entries
+    Lock,
+    /// Unified remote index status / refresh
+    Index {
+        #[command(subcommand)]
+        command: SkillsIndexCommand,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SkillsTapCommand {
+    /// List configured taps
+    List,
+    /// Add a GitHub tap (`owner/repo` or `owner/repo/path`)
+    Add {
+        /// Tap target, e.g. `owner/repo` or `owner/repo/skills`
+        repo: String,
+        /// Optional skills root path (default: skills)
+        root: Option<String>,
+    },
+    /// Remove a tap by name or repo
+    Remove {
+        /// Tap name or `owner/repo`
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SkillsSnapshotCommand {
+    /// Export hub snapshot to a file (`-` for stdout)
+    Export {
+        /// Output path or `-`
+        file: String,
+    },
+    /// Import hub snapshot from a file
+    Import {
+        /// Snapshot file path
+        file: String,
+        /// Override caution findings during import installs
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SkillsIndexCommand {
+    /// Refresh the unified remote skills index
+    Refresh,
+    /// Show index status
+    Status,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SkillsBundlesCommand {
+    /// Show help / format
+    Help,
+    /// Show skills listed in a bundle file
+    Show {
+        /// Bundle JSON or newline list
+        file: String,
+    },
+    /// Install every skill in a bundle file
+    Install {
+        /// Bundle JSON or newline list
+        file: String,
+        #[arg(long, short = 'f')]
+        force: bool,
+        #[arg(long)]
+        trust: bool,
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
     },
 }
 
@@ -2030,6 +2264,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_skills_hub_alias_is_browse() {
+        let args = CliArgs::parse_from(["edgecrab", "skills", "hub", "--page", "2"]);
+        match args.command {
+            Some(Command::Skills {
+                command: SkillsCommand::Browse { page, .. },
+            }) => assert_eq!(page, 2),
+            other => panic!("expected Browse via hub alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_browse_subcommand() {
+        let args = CliArgs::parse_from(["edgecrab", "skills", "browse", "--page-size", "10"]);
+        match args.command {
+            Some(Command::Skills {
+                command: SkillsCommand::Browse { page_size, .. },
+            }) => assert_eq!(page_size, 10),
+            other => panic!("expected Browse, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_skills_install_subcommand() {
         let args = CliArgs::parse_from([
             "edgecrab",
@@ -2043,6 +2299,32 @@ mod tests {
                 command: SkillsCommand::Install { .. }
             })
         ));
+    }
+
+    #[test]
+    fn parse_skills_install_yes_json_flags() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "skills",
+            "install",
+            "owner/repo/skill",
+            "-y",
+            "--json",
+            "--force",
+        ]);
+        match args.command {
+            Some(Command::Skills {
+                command:
+                    SkillsCommand::Install {
+                        yes: true,
+                        json: true,
+                        force: true,
+                        trust: false,
+                        ..
+                    },
+            }) => {}
+            other => panic!("expected Install with -y/--json/--force, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2082,6 +2364,89 @@ mod tests {
             args.command,
             Some(Command::Skills {
                 command: SkillsCommand::Update { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_skills_tap_add_subcommand() {
+        let args = CliArgs::parse_from([
+            "edgecrab",
+            "skills",
+            "tap",
+            "add",
+            "owner/repo",
+            "skills",
+        ]);
+        match args.command {
+            Some(Command::Skills {
+                command: SkillsCommand::Tap {
+                    command: SkillsTapCommand::Add { repo, root },
+                },
+            }) => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(root.as_deref(), Some("skills"));
+            }
+            other => panic!("expected SkillsCommand::Tap::Add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_trust_and_inspect_scan() {
+        let trust = CliArgs::parse_from(["edgecrab", "skills", "trust", "openai/demo"]);
+        assert!(matches!(
+            trust.command,
+            Some(Command::Skills {
+                command: SkillsCommand::Trust { .. }
+            })
+        ));
+        let inspect = CliArgs::parse_from([
+            "edgecrab",
+            "skills",
+            "inspect",
+            "openai/demo",
+            "--scan",
+        ]);
+        match inspect.command {
+            Some(Command::Skills {
+                command: SkillsCommand::Inspect { identifier, scan },
+            }) => {
+                assert_eq!(identifier, "openai/demo");
+                assert!(scan);
+            }
+            other => panic!("expected SkillsCommand::Inspect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_skills_audit_snapshot_lock() {
+        let audit = CliArgs::parse_from(["edgecrab", "skills", "audit", "--log"]);
+        assert!(matches!(
+            audit.command,
+            Some(Command::Skills {
+                command: SkillsCommand::Audit { log: true, .. }
+            })
+        ));
+        let snap = CliArgs::parse_from([
+            "edgecrab",
+            "skills",
+            "snapshot",
+            "export",
+            "-",
+        ]);
+        assert!(matches!(
+            snap.command,
+            Some(Command::Skills {
+                command: SkillsCommand::Snapshot {
+                    command: SkillsSnapshotCommand::Export { .. }
+                }
+            })
+        ));
+        let lock = CliArgs::parse_from(["edgecrab", "skills", "lock"]);
+        assert!(matches!(
+            lock.command,
+            Some(Command::Skills {
+                command: SkillsCommand::Lock
             })
         ));
     }

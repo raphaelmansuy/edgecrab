@@ -7,8 +7,8 @@ use serde::Serialize;
 
 use super::guard_approvals;
 use super::{
-    InstallGate, SkillBundle, bundle_content_hash, fetch_bundle_for_identifier,
-    normalize_source_identifier, read_lock, scan_quarantined_dir, stage_bundle_in_quarantine,
+    InstallGate, SkillBundle, bundle_content_hash, fetch_bundle_for_identifier, read_lock,
+    scan_quarantined_dir, stage_bundle_in_quarantine,
 };
 use crate::tools::skills_guard::{self, InstallPolicyContext, ScanResult, Verdict};
 
@@ -59,6 +59,8 @@ impl InstallScanPreview {
         InstallGate {
             force: self.needs_force,
             trust: self.needs_trust || self.already_trusted,
+            yes: false,
+            ..Default::default()
         }
     }
 }
@@ -207,7 +209,8 @@ pub async fn preview_install_scan(
     identifier: &str,
     optional_dir: Option<&Path>,
 ) -> Result<InstallScanPreview, String> {
-    let normalized = normalize_source_identifier(identifier);
+    // Resolve tap/cache browse ids (tap-openai-skills-system:…) to owner/repo/path.
+    let normalized = super::resolve_fetchable_identifier(identifier);
     let bundle = fetch_bundle_for_identifier(&normalized, optional_dir).await?;
     let qdir = stage_bundle_in_quarantine(&bundle)?;
     let scan = scan_quarantined_dir(&bundle, &qdir);

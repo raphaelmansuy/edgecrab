@@ -84,10 +84,14 @@ pub fn map_skill_trust_key(
         KeyCode::Esc => SkillTrustOverlayAction::Cancel,
         KeyCode::Tab | KeyCode::BackTab => SkillTrustOverlayAction::TogglePane,
         KeyCode::Enter => SkillTrustOverlayAction::Confirm,
-        KeyCode::Char('f') if ctx.pane == SkillTrustPane::Findings => {
-            SkillTrustOverlayAction::JumpToFindingFile
+        // 008: f = force (caution), t = trust+install (dangerous); v = jump to finding.
+        KeyCode::Char('f') if !ctx.needs_trust && !ctx.review_only => {
+            SkillTrustOverlayAction::Choose(0) // force install
         }
-        KeyCode::Char('v') if ctx.pane == SkillTrustPane::Findings => {
+        KeyCode::Char('t') if ctx.needs_trust && !ctx.review_only => {
+            SkillTrustOverlayAction::Choose(0) // trust & install
+        }
+        KeyCode::Char('v') | KeyCode::Char('g') if ctx.pane == SkillTrustPane::Findings => {
             SkillTrustOverlayAction::JumpToFindingFile
         }
         KeyCode::Left | KeyCode::Char('h') if ctx.pane == SkillTrustPane::Findings => {
@@ -171,6 +175,46 @@ mod tests {
                 }
             ),
             SkillTrustOverlayAction::TogglePane
+        );
+    }
+
+    #[test]
+    fn f_forces_caution_t_trusts_dangerous() {
+        assert_eq!(
+            map_skill_trust_key(
+                KeyCode::Char('f'),
+                KeyModifiers::NONE,
+                SkillTrustKeyContext {
+                    needs_trust: false,
+                    review_only: false,
+                    ..Default::default()
+                }
+            ),
+            SkillTrustOverlayAction::Choose(0)
+        );
+        assert_eq!(
+            map_skill_trust_key(
+                KeyCode::Char('t'),
+                KeyModifiers::NONE,
+                SkillTrustKeyContext {
+                    needs_trust: true,
+                    review_only: false,
+                    ..Default::default()
+                }
+            ),
+            SkillTrustOverlayAction::Choose(0)
+        );
+        assert_eq!(
+            map_skill_trust_key(
+                KeyCode::Char('v'),
+                KeyModifiers::NONE,
+                SkillTrustKeyContext {
+                    pane: SkillTrustPane::Findings,
+                    needs_trust: true,
+                    ..Default::default()
+                }
+            ),
+            SkillTrustOverlayAction::JumpToFindingFile
         );
     }
 }

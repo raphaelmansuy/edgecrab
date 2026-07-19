@@ -3403,7 +3403,7 @@ impl Gateway {
                                     }
                                 } else {
                                     Some(
-                                        "Unknown /skills subcommand. Try: /skills list, /skills search <q>, /skills review <id>, /skills inspect --scan <id>, /skills install <id>, /skills trust <id>, /skills check, /skills update, /skills reset, /skills opt-out, /skills snapshot export, /skills audit, /skills lock, /skills index refresh, /skills config, /skills pending."
+                                        "Unknown /skills subcommand. Try: /skills list, /skills browse (alias: hub), /skills search <q>, /skills review <id>, /skills inspect --scan <id>, /skills install <id>, /skills trust <id>, /skills check, /skills update, /skills list-modified, /skills diff <name>, /skills repair-official <name>, /skills publish <path>, /skills reset, /skills opt-out, /skills snapshot export, /skills audit, /skills lock, /skills index refresh, /skills config, /skills pending."
                                             .into(),
                                     )
                                 }

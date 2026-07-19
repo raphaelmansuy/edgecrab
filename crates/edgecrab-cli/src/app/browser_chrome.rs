@@ -19,6 +19,73 @@ impl App {
         crate::overlay_layout::browser_scroll_start(selected, max_visible)
     }
 
+    pub(super) fn browser_virtual_window(
+        selected: usize,
+        total: usize,
+        max_visible: usize,
+    ) -> (usize, usize) {
+        crate::overlay_layout::browser_virtual_window(selected, total, max_visible)
+    }
+
+    pub(super) fn browser_virtual_range_label(
+        scroll_start: usize,
+        visible: usize,
+        total: usize,
+    ) -> String {
+        crate::overlay_layout::browser_virtual_range_label(scroll_start, visible, total)
+    }
+
+    /// Render a virtualized list: only `items` (already windowed) are drawn, with
+    /// a scrollbar reflecting position in the full `total` catalog.
+    pub(super) fn render_virtualized_list(
+        frame: &mut Frame,
+        area: Rect,
+        items: Vec<ListItem>,
+        scroll_start: usize,
+        total: usize,
+        bg: Color,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let max_visible = area.height as usize;
+        let needs_scrollbar = total > max_visible && area.width > 1;
+        let list_area = if needs_scrollbar {
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width.saturating_sub(1),
+                height: area.height,
+            }
+        } else {
+            area
+        };
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(bg)),
+            list_area,
+        );
+        if needs_scrollbar {
+            let max_scroll = total.saturating_sub(max_visible.max(1));
+            let mut scrollbar_state =
+                ScrollbarState::new(max_scroll).position(scroll_start.min(max_scroll));
+            let scrollbar_area = Rect {
+                x: area.right().saturating_sub(1),
+                y: area.y,
+                width: 1,
+                height: area.height,
+            };
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█"),
+                scrollbar_area,
+                &mut scrollbar_state,
+            );
+        }
+    }
+
     pub(super) fn best_session_message_selection(
         items: &[SessionMessageEntry],
         matched_role: Option<&str>,
@@ -316,10 +383,14 @@ impl App {
                 PagingIntent::Up => self.remote_mcp_browser.selector.page_up(),
                 PagingIntent::Down => self.remote_mcp_browser.selector.page_down(),
             },
-            DetailSurface::RemoteSkillBrowser => match intent {
-                PagingIntent::Up => self.remote_skill_browser.selector.page_up(),
-                PagingIntent::Down => self.remote_skill_browser.selector.page_down(),
-            },
+            DetailSurface::RemoteSkillBrowser => {
+                match intent {
+                    PagingIntent::Up => self.remote_skill_browser.selector.page_up(),
+                    PagingIntent::Down => self.remote_skill_browser.selector.page_down(),
+                }
+                self.schedule_remote_skill_guard_preview();
+                self.maybe_extend_browse_cache();
+            }
             DetailSurface::RemotePluginBrowser => match intent {
                 PagingIntent::Up => self.remote_plugin_browser.selector.page_up(),
                 PagingIntent::Down => self.remote_plugin_browser.selector.page_down(),

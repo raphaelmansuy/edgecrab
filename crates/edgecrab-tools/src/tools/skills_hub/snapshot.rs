@@ -174,6 +174,8 @@ pub async fn import_hub_snapshot(
             InstallGate {
                 force,
                 trust: force,
+                yes: false,
+                ..Default::default()
             },
         )
         .await

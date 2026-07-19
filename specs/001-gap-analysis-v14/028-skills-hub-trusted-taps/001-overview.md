@@ -3,6 +3,13 @@
 **Tier:** C | **Impact:** 3 | **Value-per-Effort:** 3 | **Risk:** 3
 **Primitive moved:** Trust + Ecosystem (curated extensibility)
 
+> **Implementation status (2026-07-18):** Crypto signed taps are implemented under
+> [`specs/019-skills-install/`](../../019-skills-install/) **W4** —
+> [`signed_taps.rs`](../../../crates/edgecrab-tools/src/tools/skills_hub/signed_taps.rs)
+> + [proof/w4-signed-taps.md](../../019-skills-install/proof/w4-signed-taps.md).
+> This 028 pack remains historical context; do not duplicate implementation plans here.
+> Note: Hermes “signed taps” in older gap text were **overstated** vs Hermes code (unsigned GitHub taps + regex guard).
+
 ## Why It Matters (First Principles)
 
 Skills are arbitrary text injected into the system prompt. An attacker

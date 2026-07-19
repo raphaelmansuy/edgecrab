@@ -103,6 +103,14 @@ pub fn load_runtime(
 
 fn schedule_startup_skills_sync() {
     STARTUP_SKILLS_SYNC.call_once(|| {
+        // Apply skills hub config + seed Hermes-parity default taps early.
+        if let Ok(cfg) = AppConfig::load() {
+            edgecrab_tools::tools::skills_hub::set_config_federation_hubs(
+                &cfg.skills.federation_hubs,
+            );
+        }
+        let _ = edgecrab_tools::tools::skills_hub::ensure_default_taps();
+
         // Skills sync can scan and hash a non-trivial tree. Run it off the
         // blocking startup path so the CLI can render sooner.
         std::thread::spawn(|| {

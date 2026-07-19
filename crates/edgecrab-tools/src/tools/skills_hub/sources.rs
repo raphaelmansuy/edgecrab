@@ -8,19 +8,18 @@ use std::io::{Cursor, Read};
 use std::path::{Component, Path};
 use std::time::Duration;
 
-use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 use super::{
-    HubSourceInfo, SOURCE_TIMEOUT_SECS, SearchGroup, SkillBundle, SkillMeta, ensure_safe_url,
-    fetch_github_bundle, hub_client,
+    HubSourceInfo, MARKETPLACE_BROWSE_FETCH_MAX, SOURCE_TIMEOUT_SECS, SearchGroup, SkillBundle,
+    SkillMeta, ensure_safe_url, fetch_github_bundle, hub_client,
 };
 
 const CLAWHUB_BASE: &str = "https://clawhub.ai/api/v1";
 const BROWSE_SH_CATALOG: &str = "https://browse.sh/api/skills";
 const BROWSE_SH_DETAIL: &str = "https://browse.sh/api/skills";
-const REGISTRY_CACHE_TTL_SECS: i64 = 15 * 60;
+use super::catalog::REGISTRY_CACHE_TTL_SECS;
 
 /// Public registry sources searched in parallel alongside curated GitHub trees.
 pub const REGISTRY_SOURCES: &[RegistrySource] = &[
@@ -98,7 +97,7 @@ pub fn registry_filter_includes_any(filter: &str) -> bool {
         || filter == "agentskills.io"
 }
 
-fn registry_source_included(source: &RegistrySource, filter: &str) -> bool {
+pub(crate) fn registry_source_included(source: &RegistrySource, filter: &str) -> bool {
     let filter = filter.trim().to_lowercase();
     if filter.is_empty() || filter == "all" || filter == "registry" {
         return true;
@@ -121,11 +120,24 @@ pub async fn search_registry_sources(
     filter: &str,
     limit_per_source: usize,
 ) -> Vec<SearchGroup> {
-    let limit = limit_per_source.clamp(1, 20);
+    search_registry_sources_progressive(query, filter, limit_per_source, &mut |_| {}).await
+}
+
+/// Stream registry groups as each source finishes (TUI progressive browse).
+pub async fn search_registry_sources_progressive(
+    query: &str,
+    filter: &str,
+    limit_per_source: usize,
+    on_partial: &mut (dyn FnMut(SearchGroup) + Send),
+) -> Vec<SearchGroup> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    // Honor marketplace registry browse/search caps (page-sized browse, ≤50 search).
+    let limit = limit_per_source.clamp(1, 200);
     let client = match hub_client() {
         Ok(client) => client,
         Err(error) => {
-            return vec![SearchGroup {
+            let g = SearchGroup {
                 source: HubSourceInfo {
                     id: "registry".into(),
                     label: "Registry Sources".into(),
@@ -134,19 +146,30 @@ pub async fn search_registry_sources(
                 },
                 results: Vec::new(),
                 notice: Some(error),
-            }];
+            };
+            on_partial(g.clone());
+            return vec![g];
         }
     };
 
-    let futures = REGISTRY_SOURCES
+    let mut pending = FuturesUnordered::new();
+    for source in REGISTRY_SOURCES
         .iter()
         .filter(|source| registry_source_included(source, filter))
-        .map(|source| search_one_registry(&client, source, query, limit));
-
-    join_all(futures).await
+    {
+        let client = client.clone();
+        let q = query.to_string();
+        pending.push(async move { search_one_registry(&client, source, &q, limit).await });
+    }
+    let mut groups = Vec::new();
+    while let Some(group) = pending.next().await {
+        on_partial(group.clone());
+        groups.push(group);
+    }
+    groups
 }
 
-async fn search_one_registry(
+pub(crate) async fn search_one_registry(
     client: &reqwest::Client,
     source: &RegistrySource,
     query: &str,
@@ -218,6 +241,9 @@ pub async fn fetch_registry_bundle(identifier: &str) -> Result<SkillBundle, Stri
     {
         return fetch_claude_marketplace_bundle(&client, &normalized.1).await;
     }
+    if normalized.0.eq_ignore_ascii_case("well-known") {
+        return fetch_well_known_bundle(&client, &normalized.1).await;
+    }
 
     // Bare slug — try ClawHub then browse.sh (Hermes-style resolution).
     if looks_like_slug(&normalized.1) {
@@ -275,6 +301,10 @@ pub async fn inspect_registry_skill(identifier: &str) -> Option<SkillMeta> {
 
 pub fn strip_registry_prefix(identifier: &str) -> (String, String) {
     let trimmed = identifier.trim().trim_matches('/');
+    // well-known:https://… — keep URL after first colon-prefix
+    if let Some(rest) = trimmed.strip_prefix("well-known:") {
+        return ("well-known".into(), rest.to_string());
+    }
     if let Some((prefix, rest)) = trimmed.split_once(':') {
         return (prefix.to_string(), rest.to_string());
     }
@@ -310,12 +340,6 @@ fn looks_like_slug(value: &str) -> bool {
 
 // ─── Cache helpers ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RegistryCache<T> {
-    fetched_at: i64,
-    items: T,
-}
-
 fn registry_cache_path(name: &str) -> std::path::PathBuf {
     crate::config_ref::resolve_edgecrab_home()
         .join("skills")
@@ -324,12 +348,14 @@ fn registry_cache_path(name: &str) -> std::path::PathBuf {
         .join(format!("{name}.json"))
 }
 
-fn read_registry_cache<T: for<'de> Deserialize<'de>>(name: &str) -> Option<RegistryCache<T>> {
+pub(crate) fn read_registry_cache<T: for<'de> Deserialize<'de>>(
+    name: &str,
+) -> Option<RegistryCache<T>> {
     let content = std::fs::read_to_string(registry_cache_path(name)).ok()?;
     serde_json::from_str(&content).ok()
 }
 
-fn write_registry_cache<T: Serialize>(name: &str, items: T) {
+pub(crate) fn write_registry_cache<T: Serialize>(name: &str, items: T) {
     let path = registry_cache_path(name);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -343,8 +369,39 @@ fn write_registry_cache<T: Serialize>(name: &str, items: T) {
     }
 }
 
-fn cache_fresh(fetched_at: i64) -> bool {
+pub(crate) fn cache_fresh(fetched_at: i64) -> bool {
     chrono::Utc::now().timestamp() - fetched_at <= REGISTRY_CACHE_TTL_SECS
+}
+
+fn registry_complete_path(name: &str) -> std::path::PathBuf {
+    crate::config_ref::resolve_edgecrab_home()
+        .join("skills")
+        .join(".hub")
+        .join("index-cache")
+        .join(format!("{name}.complete"))
+}
+
+pub(crate) fn mark_catalog_complete(name: &str) {
+    let path = registry_complete_path(name);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, b"1");
+}
+
+pub(crate) fn clear_catalog_complete(name: &str) {
+    let _ = std::fs::remove_file(registry_complete_path(name));
+}
+
+pub(crate) fn is_catalog_complete(name: &str) -> bool {
+    registry_complete_path(name).is_file()
+}
+
+/// Shared cache envelope (skills.sh browse, ClawHub, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RegistryCache<T> {
+    pub fetched_at: i64,
+    pub items: T,
 }
 
 // ─── ClawHub ───────────────────────────────────────────────────
@@ -387,12 +444,15 @@ async fn search_clawhub(
         .collect())
 }
 
+const CLAWHUB_LISTING_CACHE: &str = "clawhub_listing";
+
 async fn search_clawhub_listing(
     client: &reqwest::Client,
     limit: usize,
 ) -> Result<Vec<SkillMeta>, String> {
-    if let Some(cache) = read_registry_cache::<Vec<SkillMeta>>("clawhub_listing")
-        && cache_fresh(cache.fetched_at)
+    if let Some(cache) = read_registry_cache::<Vec<SkillMeta>>(CLAWHUB_LISTING_CACHE)
+        && !cache.items.is_empty()
+        && (cache_fresh(cache.fetched_at) || is_catalog_complete(CLAWHUB_LISTING_CACHE))
     {
         return Ok(cache.items.into_iter().take(limit).collect());
     }
@@ -414,8 +474,134 @@ async fn search_clawhub_listing(
         .cloned()
         .unwrap_or_default();
     let metas: Vec<SkillMeta> = items.into_iter().filter_map(clawhub_item_to_meta).collect();
-    write_registry_cache("clawhub_listing", metas.clone());
+    // Never overwrite a larger complete listing with a truncated first-paint page.
+    if let Some(existing) = read_registry_cache::<Vec<SkillMeta>>(CLAWHUB_LISTING_CACHE)
+        && is_catalog_complete(CLAWHUB_LISTING_CACHE)
+        && existing.items.len() > metas.len()
+    {
+        return Ok(existing.items.into_iter().take(limit).collect());
+    }
+    write_registry_cache(CLAWHUB_LISTING_CACHE, metas.clone());
+    // Truncated first-paint fetch is not a complete catalog.
+    if metas.len() < limit {
+        mark_catalog_complete(CLAWHUB_LISTING_CACHE);
+    } else {
+        clear_catalog_complete(CLAWHUB_LISTING_CACHE);
+    }
     Ok(metas.into_iter().take(limit).collect())
+}
+
+/// Fill ClawHub listing cache with a large limit (API has no offset).
+pub async fn ensure_clawhub_listing_catalog() -> Result<(), String> {
+    if clawhub_listing_catalog_complete()
+        && clawhub_listing_cache_len().is_some_and(|n| n > 0)
+    {
+        return Ok(());
+    }
+    let client = hub_client()?;
+    let limit = MARKETPLACE_BROWSE_FETCH_MAX;
+    let url = format!("{CLAWHUB_BASE}/skills?limit={limit}");
+    ensure_safe_url(&url)?;
+    let resp = client
+        .get(&url)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("ClawHub listing ensure failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("ClawHub returned HTTP {}", resp.status()));
+    }
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let items = data
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let metas: Vec<SkillMeta> = items.into_iter().filter_map(clawhub_item_to_meta).collect();
+    if metas.is_empty() {
+        return Err("ClawHub listing returned no skills".into());
+    }
+    write_registry_cache(CLAWHUB_LISTING_CACHE, metas);
+    // API has no offset — treat successful large fetch as complete SoT.
+    mark_catalog_complete(CLAWHUB_LISTING_CACHE);
+    Ok(())
+}
+
+pub fn browse_clawhub_cache_slice(offset: usize, limit: usize) -> Option<SearchGroup> {
+    browse_registry_meta_cache_slice(
+        CLAWHUB_LISTING_CACHE,
+        "clawhub",
+        "ClawHub",
+        "https://clawhub.ai",
+        "community",
+        offset,
+        limit,
+    )
+}
+
+pub fn clawhub_listing_cache_len() -> Option<usize> {
+    registry_meta_cache_len(CLAWHUB_LISTING_CACHE)
+}
+
+pub fn clawhub_listing_catalog_complete() -> bool {
+    is_catalog_complete(CLAWHUB_LISTING_CACHE)
+}
+
+/// Sync slice of a registry SkillMeta listing cache.
+pub fn browse_registry_meta_cache_slice(
+    cache_name: &str,
+    source_id: &str,
+    label: &str,
+    origin: &str,
+    trust_level: &str,
+    offset: usize,
+    limit: usize,
+) -> Option<SearchGroup> {
+    let cache = read_registry_cache::<Vec<SkillMeta>>(cache_name)?;
+    if cache.items.is_empty() {
+        return None;
+    }
+    let total = cache.items.len();
+    let results: Vec<SkillMeta> = cache
+        .items
+        .into_iter()
+        .skip(offset)
+        .take(limit.max(1))
+        .collect();
+    if results.is_empty() {
+        return None;
+    }
+    let shown = results.len();
+    Some(SearchGroup {
+        source: HubSourceInfo {
+            id: source_id.into(),
+            label: label.into(),
+            origin: origin.into(),
+            trust_level: trust_level.into(),
+        },
+        results,
+        notice: Some(format!(
+            "{label} browse: showing {}–{} of {total} (disk cache). Type ≥2 chars to search.",
+            offset + 1,
+            offset + shown
+        )),
+    })
+}
+
+pub fn registry_meta_cache_len(cache_name: &str) -> Option<usize> {
+    let cache = read_registry_cache::<Vec<SkillMeta>>(cache_name)?;
+    if cache.items.is_empty() {
+        return None;
+    }
+    Some(cache.items.len())
+}
+
+pub fn registry_meta_cache_complete(cache_name: &str) -> bool {
+    is_catalog_complete(cache_name)
+}
+
+pub fn mark_registry_meta_cache_complete(cache_name: &str) {
+    mark_catalog_complete(cache_name);
 }
 
 fn clawhub_item_to_meta(item: serde_json::Value) -> Option<SkillMeta> {
@@ -1219,7 +1405,44 @@ fn lobehub_to_skill_md(agent_data: &serde_json::Value, agent_id: &str) -> String
 
 // ─── agentskills.io federation ─────────────────────────────────
 
-const FEDERATION_ENDPOINTS: &[&str] = &["https://agentskills.io"];
+const DEFAULT_FEDERATION_ENDPOINTS: &[&str] = &["https://agentskills.io"];
+
+static CONFIG_FEDERATION_HUBS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Merge `skills.federation_hubs` from config (called at CLI/gateway startup).
+pub fn set_config_federation_hubs(hubs: &[String]) {
+    if let Ok(mut guard) = CONFIG_FEDERATION_HUBS.lock() {
+        *guard = hubs
+            .iter()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+    }
+}
+
+/// Resolve federation hubs: defaults + config + `EDGECRAB_FEDERATION_HUBS`.
+pub fn federation_endpoints() -> Vec<String> {
+    let mut out: Vec<String> = DEFAULT_FEDERATION_ENDPOINTS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Ok(guard) = CONFIG_FEDERATION_HUBS.lock() {
+        for u in guard.iter() {
+            if !out.iter().any(|e| e.eq_ignore_ascii_case(u)) {
+                out.push(u.clone());
+            }
+        }
+    }
+    if let Ok(extra) = std::env::var("EDGECRAB_FEDERATION_HUBS") {
+        for part in extra.split(',') {
+            let u = part.trim();
+            if !u.is_empty() && !out.iter().any(|e| e.eq_ignore_ascii_case(u)) {
+                out.push(u.to_string());
+            }
+        }
+    }
+    out
+}
 
 async fn search_agentskills_federation(
     client: &reqwest::Client,
@@ -1227,8 +1450,8 @@ async fn search_agentskills_federation(
     limit: usize,
 ) -> Result<Vec<SkillMeta>, String> {
     let mut all = Vec::new();
-    for base in FEDERATION_ENDPOINTS {
-        if let Ok(mut items) = fetch_well_known_index(client, base).await {
+    for base in federation_endpoints() {
+        if let Ok(mut items) = fetch_well_known_index(client, &base).await {
             if !query.trim().is_empty() {
                 let q = query.to_lowercase();
                 items.retain(|m| {
@@ -1305,8 +1528,8 @@ async fn fetch_well_known_index(
 
 async fn inspect_agentskills(client: &reqwest::Client, name: &str) -> Option<SkillMeta> {
     let name = name.split('/').next_back().unwrap_or(name);
-    for base in FEDERATION_ENDPOINTS {
-        if let Ok(items) = fetch_well_known_index(client, base).await
+    for base in federation_endpoints() {
+        if let Ok(items) = fetch_well_known_index(client, &base).await
             && let Some(meta) = items
                 .into_iter()
                 .find(|m| m.name.eq_ignore_ascii_case(name))
@@ -1322,7 +1545,7 @@ async fn fetch_agentskills_bundle(
     name: &str,
 ) -> Result<SkillBundle, String> {
     let name = name.split('/').next_back().unwrap_or(name).to_string();
-    for base in FEDERATION_ENDPOINTS {
+    for base in federation_endpoints() {
         let url = format!(
             "{}/.well-known/skills/{name}/SKILL.md",
             base.trim_end_matches('/')
@@ -1349,6 +1572,113 @@ async fn fetch_agentskills_bundle(
     Err(format!(
         "agentskills.io skill '{name}' not found in federation endpoints"
     ))
+}
+
+/// Fetch `well-known:<base_url>/<skill_name>` (Hermes WellKnownSkillSource parity).
+pub async fn fetch_well_known_bundle(
+    client: &reqwest::Client,
+    rest: &str,
+) -> Result<SkillBundle, String> {
+    let rest = rest.trim().trim_end_matches('/');
+    // rest = https://host/.../name  OR  https://host|name
+    let (base, name) = if let Some((base, name)) = rest.rsplit_once('/') {
+        // If base still looks like URL with host
+        if base.contains("://") {
+            (base.to_string(), name.to_string())
+        } else {
+            return Err(format!(
+                "well-known identifier must be well-known:https://host/<skill>; got well-known:{rest}"
+            ));
+        }
+    } else {
+        return Err(format!(
+            "well-known identifier must be well-known:https://host/<skill>; got well-known:{rest}"
+        ));
+    };
+
+    // Prefer index.json file list when available
+    let index_url = format!("{}/.well-known/skills/index.json", base.trim_end_matches('/'));
+    ensure_safe_url(&index_url)?;
+    if let Ok(resp) = client.get(&index_url).send().await
+        && resp.status().is_success()
+        && let Ok(data) = resp.json::<serde_json::Value>().await
+        && let Some(skills) = data.get("skills").and_then(|s| s.as_array())
+    {
+        for item in skills {
+            let item_name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if !item_name.eq_ignore_ascii_case(&name) {
+                continue;
+            }
+            let mut files = HashMap::new();
+            if let Some(file_list) = item.get("files").and_then(|f| f.as_array()) {
+                for f in file_list {
+                    let rel = f.as_str().unwrap_or("SKILL.md");
+                    let file_url = format!(
+                        "{}/.well-known/skills/{name}/{}",
+                        base.trim_end_matches('/'),
+                        rel.trim_start_matches('/')
+                    );
+                    if ensure_safe_url(&file_url).is_err() {
+                        continue;
+                    }
+                    if let Ok(r) = client.get(&file_url).send().await
+                        && r.status().is_success()
+                        && let Ok(text) = r.text().await
+                    {
+                        files.insert(rel.to_string(), text);
+                    }
+                }
+            }
+            if !files.contains_key("SKILL.md") {
+                let skill_url = format!(
+                    "{}/.well-known/skills/{name}/SKILL.md",
+                    base.trim_end_matches('/')
+                );
+                ensure_safe_url(&skill_url)?;
+                let content = client
+                    .get(&skill_url)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .error_for_status()
+                    .map_err(|e| e.to_string())?
+                    .text()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                files.insert("SKILL.md".into(), content);
+            }
+            return Ok(SkillBundle {
+                name: name.clone(),
+                files,
+                source: "well-known".into(),
+                identifier: format!("well-known:{base}/{name}"),
+                trust_level: "community".into(),
+            });
+        }
+    }
+
+    let skill_url = format!(
+        "{}/.well-known/skills/{name}/SKILL.md",
+        base.trim_end_matches('/')
+    );
+    ensure_safe_url(&skill_url)?;
+    let content = client
+        .get(&skill_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(SkillBundle {
+        name: name.clone(),
+        files: HashMap::from([("SKILL.md".to_string(), content)]),
+        source: "well-known".into(),
+        identifier: format!("well-known:{base}/{name}"),
+        trust_level: "community".into(),
+    })
 }
 
 /// Install a skill from a direct URL to SKILL.md (Hermes UrlSource parity).
@@ -1508,6 +1838,37 @@ mod tests {
         assert_eq!(
             marketplace_trust_level("aiskillstore/marketplace/x"),
             "community"
+        );
+    }
+
+    #[test]
+    fn clawhub_cache_slice_pages_past_first() {
+        let _home = crate::test_support::TestEdgecrabHome::new();
+        let items: Vec<SkillMeta> = (0..200)
+            .map(|i| SkillMeta {
+                name: format!("claw-{i:03}"),
+                description: format!("d{i}"),
+                source: "clawhub".into(),
+                origin: "https://clawhub.ai".into(),
+                identifier: format!("clawhub:claw-{i:03}"),
+                trust_level: "community".into(),
+                repo: None,
+                path: None,
+                url: None,
+                tags: vec![],
+            })
+            .collect();
+        write_registry_cache(CLAWHUB_LISTING_CACHE, items);
+        mark_catalog_complete(CLAWHUB_LISTING_CACHE);
+        assert_eq!(clawhub_listing_cache_len(), Some(200));
+        assert!(clawhub_listing_catalog_complete());
+        let page2 = browse_clawhub_cache_slice(80, 80).expect("page 2");
+        assert_eq!(page2.results.len(), 80);
+        assert!(
+            page2.results[0].identifier.contains("claw-080")
+                || page2.results[0].identifier.contains("claw-081"),
+            "expected mid-range clawhub id, got {}",
+            page2.results[0].identifier
         );
     }
 }

@@ -117,8 +117,82 @@ impl App {
             self.render_remote_plugin_selector(frame, frame.area());
         }
 
-        if self.remote_skill_browser.selector.active {
-            self.render_remote_skill_selector(frame, frame.area());
+        if self.remote_skill_browser.selector.active
+            || matches!(
+                self.skills_marketplace_mode.kind(),
+                super::skills_marketplace::MarketplaceModeKind::ImportFrom
+                    | super::skills_marketplace::MarketplaceModeKind::SourcePick
+                    | super::skills_marketplace::MarketplaceModeKind::Done
+                    | super::skills_marketplace::MarketplaceModeKind::Error
+                    | super::skills_marketplace::MarketplaceModeKind::Installing
+                    | super::skills_marketplace::MarketplaceModeKind::ConfirmSafe
+            )
+        {
+            if self.remote_skill_browser.selector.active {
+                self.render_remote_skill_selector(frame, frame.area());
+            }
+            match &self.skills_marketplace_mode {
+                super::skills_marketplace::MarketplaceMode::Installing {
+                    identifier,
+                    stage,
+                } => {
+                    let stage_elapsed = self
+                        .skills_install_stage_started
+                        .map(|t| t.elapsed());
+                    super::skills_marketplace::render_install_theatre(
+                        frame,
+                        frame.area(),
+                        identifier,
+                        *stage,
+                        self.skills_marketplace_status
+                            .as_deref()
+                            .or(self.remote_skill_browser.action_in_flight.as_deref()),
+                        stage_elapsed,
+                    );
+                }
+                super::skills_marketplace::MarketplaceMode::ConfirmSafe { name, .. } => {
+                    super::skills_marketplace::render_confirm_safe_banner(
+                        frame,
+                        frame.area(),
+                        name,
+                    );
+                }
+                super::skills_marketplace::MarketplaceMode::ImportFrom { selected } => {
+                    super::skills_marketplace::render_import_from_picker(
+                        frame,
+                        frame.area(),
+                        *selected,
+                    );
+                }
+                super::skills_marketplace::MarketplaceMode::SourcePick { selected } => {
+                    super::skills_marketplace::render_source_picker(
+                        frame,
+                        frame.area(),
+                        *selected,
+                    );
+                }
+                super::skills_marketplace::MarketplaceMode::Done { name } => {
+                    super::skills_marketplace::render_marketplace_banner(
+                        frame,
+                        frame.area(),
+                        " Skill Install · Done ",
+                        &format!(
+                            "Installed `{name}`. Ask the agent to use it, or remove with `/skills remove {name}`. Press Enter."
+                        ),
+                        super::skills_marketplace::MARKETPLACE_ACCENT,
+                    );
+                }
+                super::skills_marketplace::MarketplaceMode::Error { message } => {
+                    super::skills_marketplace::render_marketplace_banner(
+                        frame,
+                        frame.area(),
+                        " Skill Install · Error ",
+                        message,
+                        super::skills_marketplace::MARKETPLACE_WARN,
+                    );
+                }
+                _ => {}
+            }
         }
 
         if self.config_selector.active {

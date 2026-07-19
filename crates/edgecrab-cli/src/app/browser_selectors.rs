@@ -839,95 +839,119 @@ impl App {
         frame.render_widget(help, chunks[2]);
     }
 
-    pub(super) fn render_skill_selector(&self, frame: &mut Frame, area: Rect) {
+    pub(super) fn render_skill_selector(&mut self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
         let chunks = Self::browser_overlay_chunks(area);
         let body = Self::browser_body_chunks(chunks[1]);
+        let accent = Color::Rgb(110, 220, 210);
+        let warn = Color::Rgb(255, 191, 0);
         self.render_browser_header(
             frame,
             chunks[0],
             &self.skill_selector.query,
             BrowserChrome {
-                title: "Browse Skills",
-                placeholder: "Search local skills by name, category, path, preview, or support files.",
+                title: "Skills · Installed",
+                placeholder:
+                    "Filter installed · / or S → marketplace · M import-from · ? help",
                 icon: "📚",
-                icon_color: Color::Rgb(255, 191, 0),
-                border_color: Color::Rgb(255, 191, 0),
+                icon_color: accent,
+                border_color: warn,
             },
         );
 
-        let max_visible = body[0].height as usize;
+        let max_visible = body[0].height.max(1) as usize;
+        self.skill_selector.list_viewport_rows = max_visible;
         let filtered = &self.skill_selector.filtered;
         let selected = self.skill_selector.selected;
-        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+        let total = filtered.len();
+        let (scroll_start, visible) =
+            Self::browser_virtual_window(selected, total, max_visible);
 
-        let items: Vec<ListItem> = filtered
-            .iter()
-            .skip(scroll_start)
-            .take(max_visible)
-            .enumerate()
-            .map(|(vis_idx, &skill_idx)| {
-                let entry = &self.skill_selector.items[skill_idx];
-                let is_selected = vis_idx + scroll_start == selected;
+        let items: Vec<ListItem> = if filtered.is_empty() {
+            let empty = if self.skill_selector.items.is_empty() {
+                "  No local skills — press R (or /) to browse the marketplace."
+            } else {
+                "  No local skills matched — try a broader filter, or R for marketplace."
+            };
+            vec![ListItem::new(Line::from(Span::styled(
+                empty.to_string(),
+                Style::default().fg(Color::Rgb(120, 120, 135)),
+            )))]
+        } else {
+            // Virtual scroll — only viewport rows become ListItems.
+            filtered
+                .iter()
+                .skip(scroll_start)
+                .take(visible)
+                .enumerate()
+                .map(|(vis_idx, &skill_idx)| {
+                    let entry = &self.skill_selector.items[skill_idx];
+                    let is_selected = vis_idx + scroll_start == selected;
 
-                let bg = if is_selected {
-                    Color::Rgb(40, 35, 15)
-                } else {
-                    Color::Rgb(20, 20, 28)
-                };
-                let state_style = if is_selected {
-                    Style::default().bg(bg).fg(Color::Rgb(150, 140, 90))
-                } else {
-                    Style::default().fg(Color::Rgb(90, 80, 45))
-                };
-                let name_style = if is_selected {
-                    Style::default()
-                        .bg(bg)
-                        .fg(Color::Rgb(255, 215, 0))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Rgb(220, 200, 100))
-                };
-                let desc_style = if is_selected {
-                    Style::default().bg(bg).fg(Color::Rgb(160, 150, 90))
-                } else {
-                    Style::default().fg(Color::Rgb(100, 95, 55))
-                };
+                    let bg = if is_selected {
+                        Color::Rgb(24, 40, 44)
+                    } else {
+                        Color::Rgb(20, 20, 28)
+                    };
+                    let state_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(145, 170, 170))
+                    } else {
+                        Style::default().fg(Color::Rgb(90, 80, 45))
+                    };
+                    let name_style = if is_selected {
+                        Style::default()
+                            .bg(bg)
+                            .fg(accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(220, 200, 100))
+                    };
+                    let desc_style = if is_selected {
+                        Style::default().bg(bg).fg(Color::Rgb(160, 180, 180))
+                    } else {
+                        Style::default().fg(Color::Rgb(100, 95, 55))
+                    };
 
-                ListItem::new(Line::from(vec![
-                    selector_marker(is_selected, Color::Rgb(255, 191, 0), Some(bg)),
-                    Span::styled(
-                        format!("  {:<7}", if entry.active { "active" } else { "ready" }),
-                        state_style,
-                    ),
-                    Span::styled(
-                        format!("{:<7}", entry.kind_label()),
-                        if is_selected {
-                            Style::default().bg(bg).fg(Color::Rgb(120, 110, 60))
-                        } else {
-                            Style::default().fg(Color::Rgb(80, 75, 40))
-                        },
-                    ),
-                    Span::styled(unicode_trunc(&entry.display_title(), 34), name_style),
-                    Span::raw("  "),
-                    Span::styled(unicode_trunc(&entry.list_detail(), 42), desc_style),
-                ]))
-            })
-            .collect();
+                    ListItem::new(Line::from(vec![
+                        selector_marker(is_selected, accent, Some(bg)),
+                        Span::styled(
+                            format!("  {:<7}", if entry.active { "active" } else { "ready" }),
+                            state_style,
+                        ),
+                        Span::styled(
+                            format!("{:<7}", entry.kind_label()),
+                            if is_selected {
+                                Style::default().bg(bg).fg(Color::Rgb(120, 140, 140))
+                            } else {
+                                Style::default().fg(Color::Rgb(80, 75, 40))
+                            },
+                        ),
+                        Span::styled(unicode_trunc(&entry.display_title(), 34), name_style),
+                        Span::raw("  "),
+                        Span::styled(unicode_trunc(&entry.list_detail(), 42), desc_style),
+                    ]))
+                })
+                .collect()
+        };
 
-        let skill_count = filtered.len();
-        let list = List::new(items).style(Style::default().bg(Color::Rgb(20, 20, 28)));
-        frame.render_widget(list, body[0]);
+        let skill_count = total;
+        let virtual_range = Self::browser_virtual_range_label(scroll_start, visible, total);
+        Self::render_virtualized_list(
+            frame,
+            body[0],
+            items,
+            scroll_start,
+            total,
+            Color::Rgb(20, 20, 28),
+        );
 
         let mut detail_lines = Vec::new();
         if let Some(entry) = self.skill_selector.current() {
             detail_lines.push(Line::from(vec![
                 Span::styled(
                     format!("{} ", if entry.active { "ACTIVE" } else { "READY" }),
-                    Style::default()
-                        .fg(Color::Rgb(255, 191, 0))
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(entry.display_title()),
             ]));
@@ -937,29 +961,46 @@ impl App {
             }
             detail_lines.push(Line::from(""));
             detail_lines.push(Line::from(entry.detail_actions_line()));
-        } else if self.skill_selector.query.trim().is_empty() {
+            detail_lines.push(Line::from(""));
             detail_lines.push(Line::from(Span::styled(
-                "Local Skills",
-                Style::default()
-                    .fg(Color::Rgb(255, 191, 0))
-                    .add_modifier(Modifier::BOLD),
+                "Marketplace: press / or S to browse remote skills.",
+                Style::default().fg(Color::Rgb(145, 170, 170)),
+            )));
+        } else if self.skill_selector.items.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "No local skills",
+                Style::default().fg(warn).add_modifier(Modifier::BOLD),
             )));
             detail_lines.push(Line::from(""));
             detail_lines.push(Line::from(
-                "Browse installed skills with fuzzy search across names, categories, previews, and supporting files.",
+                "No local skills — press R (or /) to browse the marketplace.",
             ));
             detail_lines.push(Line::from(""));
             detail_lines.push(Line::from(
-                "Space toggles whether a skill is injected into your next prompt.",
+                "Or run `/skills search <query>` / `/skills hub` from the composer.",
             ));
+        } else if self.skill_selector.query.trim().is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "Skills · Installed",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(""));
             detail_lines.push(Line::from(
-                "Enter inserts `/skill-name` into the composer if you want the explicit slash flow instead.",
+                "Browse installed skills. Space toggles injection; Enter inserts `/skill-name`.",
+            ));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Press / or S to open the Skills Marketplace (remote browse).",
+                Style::default().fg(Color::Rgb(145, 170, 170)),
+            )));
+            detail_lines.push(Line::from(
+                "Press M for import-from (Claude / Codex / Pi / agents / OpenClaw).",
             ));
         } else {
             detail_lines.push(Line::from("No local skills matched this query."));
             detail_lines.push(Line::from(""));
             detail_lines.push(Line::from(
-                "Try a broader term, a category name, or press R to search remote sources.",
+                "Try a broader term, or press R (or /) to browse the marketplace.",
             ));
         }
         if self.detail_fullscreen_active(DetailSurface::SkillSelector) {
@@ -969,34 +1010,32 @@ impl App {
                 FullscreenBrowserChrome {
                     query: &self.skill_selector.query,
                     header: BrowserChrome {
-                        title: "Browse Skills",
+                        title: "Skills · Installed",
                         placeholder:
-                            "Search local skills by name, category, path, preview, or support files.",
+                            "Filter installed · / or S → marketplace · M import-from",
                         icon: "📚",
-                        icon_color: Color::Rgb(255, 191, 0),
-                        border_color: Color::Rgb(255, 191, 0),
+                        icon_color: accent,
+                        border_color: warn,
                     },
                     detail: ScrollableDetailChrome {
                         title: "Details",
-                        border_color: Color::Rgb(255, 191, 0),
+                        border_color: warn,
                         focused: true,
                         requested_scroll: self
                             .detail_fullscreen_scroll(DetailSurface::SkillSelector),
                     },
                     help: Line::from(vec![
-                        Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled(" ↑↓ ", Style::default().fg(accent)),
                         Span::styled("change item  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
-                        Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-                        self.paging_key_help_span(Color::Rgb(255, 191, 0)),
-                        Span::styled("scroll detail  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
-                        Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("/ S ", Style::default().fg(accent)),
+                        Span::styled("marketplace  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("M ", Style::default().fg(accent)),
+                        Span::styled("import  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Space ", Style::default().fg(accent)),
+                        Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Enter ", Style::default().fg(accent)),
                         Span::styled("insert /skill  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("Z ", Style::default().fg(Color::Rgb(255, 191, 0))),
-                        Span::styled("split view  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 191, 0))),
+                        Span::styled("Esc ", Style::default().fg(accent)),
                         Span::styled("close  ", Style::default().fg(Color::DarkGray)),
                     ]),
                 },
@@ -1008,63 +1047,109 @@ impl App {
             frame,
             body[1],
             DetailSurface::SkillSelector,
-            Color::Rgb(255, 191, 0),
+            warn,
             detail_lines,
         );
 
         let mut help_spans = vec![
-            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled(" ↑↓ ", Style::default().fg(accent)),
             Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("type ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("type ", Style::default().fg(accent)),
             Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
         ];
-        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(255, 191, 0)));
-        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(255, 191, 0)));
+        help_spans.extend(self.focus_pane_help_spans(accent));
+        help_spans.extend(self.page_or_scroll_help_spans(accent));
         help_spans.extend([
-            Span::styled("Space ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled("toggle active  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Enter ", Style::default().fg(Color::Rgb(255, 191, 0))),
+            Span::styled("/ S ", Style::default().fg(accent)),
+            Span::styled("marketplace  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("M ", Style::default().fg(accent)),
+            Span::styled("import  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Space ", Style::default().fg(accent)),
+            Span::styled("toggle  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter ", Style::default().fg(accent)),
             Span::styled("insert /skill-name  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Z ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("R ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled("remote search  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc ", Style::default().fg(Color::Rgb(255, 191, 0))),
-            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc ", Style::default().fg(accent)),
+            Span::styled("close  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!(
-                    "{skill_count} skill(s) · {} pane",
+                    "{virtual_range} · {skill_count} skill(s) · {} pane",
                     self.simple_split_focus_label(DetailSurface::SkillSelector)
                 ),
-                Style::default().fg(Color::Rgb(80, 75, 40)),
+                Style::default().fg(Color::Rgb(80, 100, 100)),
             ),
         ]);
         let help = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help, chunks[2]);
     }
 
-    pub(super) fn render_remote_skill_selector(&self, frame: &mut Frame, area: Rect) {
+    pub(super) fn render_remote_skill_selector(&mut self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
-        let chunks = Self::browser_overlay_chunks(area);
+        let query = self.remote_skill_browser.current_query();
+        let filter = self
+            .remote_skill_browser
+            .source_filter
+            .as_deref()
+            .unwrap_or("all")
+            .to_string();
+        let filter_label = super::skills_marketplace::provider_filter_label(&filter);
+        let inspecting = matches!(
+            self.skills_marketplace_mode,
+            super::skills_marketplace::MarketplaceMode::Inspect { .. }
+        );
+        let browsing =
+            query.is_empty() && self.remote_skill_browser.inflight_request_id.is_some();
+        let searching = self.remote_skill_browser.inflight_request_id.is_some();
+        // Expanded `?` help needs a multi-line footer (collapsed stays 1 row).
+        let footer_h = if self.skills_marketplace_help { 4u16 } else { 1 };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(footer_h),
+            ])
+            .split(area);
         let body = Self::browser_body_chunks(chunks[1]);
-
-        let browser = &self.remote_skill_browser;
-        let query = browser.current_query();
+        let header_query = self.remote_skill_browser.selector.query.clone();
+        let source_filter_chip = self.remote_skill_browser.source_filter.clone();
+        let title = if searching {
+            let spin = crate::status_chrome::compact_spinner_frame(
+                self.remote_skill_browser.loading_spinner_frame,
+                self.terminal_glyph_profile,
+            );
+            let elapsed = self
+                .remote_skill_browser
+                .loading_started
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            let elapsed_hint = crate::status_chrome::format_elapsed_hint(elapsed, 1);
+            if browsing {
+                format!("Skills Marketplace · {filter_label} · {spin} Browsing…{elapsed_hint}")
+            } else {
+                format!("Skills Marketplace · {filter_label} · {spin} Searching…{elapsed_hint}")
+            }
+        } else if inspecting {
+            format!("Skills Marketplace · Inspect · {filter_label}")
+        } else if query.is_empty() {
+            format!("Skills Marketplace · {filter_label} · Browse")
+        } else {
+            format!("Skills Marketplace · {filter_label}")
+        };
         self.render_browser_header(
             frame,
             chunks[0],
-            &browser.selector.query,
+            &header_query,
             BrowserChrome {
-                title: if browser.inflight_request_id.is_some() {
-                    "Remote Skills · Searching…"
+                title: &title,
+                placeholder: if inspecting {
+                    "Inspect dossier · ↑↓ scroll · i install · e evidence · s retry · Esc back · ? help"
                 } else {
-                    "Remote Skills"
+                    "Type to filter · [ ] source · S pick · Enter inspect · I install · Esc back"
                 },
-                placeholder: "Type to search remote skills from EdgeCrab, Hermes, OpenAI, Anthropic, skills.sh, or a well-known URL",
                 icon: "🌐",
                 icon_color: Color::Rgb(110, 220, 210),
-                border_color: if browser.inflight_request_id.is_some() {
+                border_color: if searching || inspecting {
                     Color::Rgb(110, 220, 210)
                 } else {
                     Color::Rgb(255, 191, 0)
@@ -1072,28 +1157,103 @@ impl App {
             },
         );
 
+        let show_chips = area.width >= 80 && !inspecting;
+        let list_area = if show_chips {
+            let chip_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(body[0]);
+            frame.render_widget(
+                Paragraph::new(Line::from(super::skills_marketplace::source_chip_spans(
+                    source_filter_chip.as_deref(),
+                    searching,
+                )))
+                .style(Style::default().bg(Color::Rgb(16, 18, 24))),
+                chip_chunks[0],
+            );
+            chip_chunks[1]
+        } else {
+            body[0]
+        };
+
+        let max_visible = list_area.height.max(1) as usize;
+        self.remote_skill_browser.list_viewport_rows = max_visible;
+        self.remote_skill_browser.selector.list_viewport_rows = max_visible;
+
+        let browser = &self.remote_skill_browser;
         let filtered = &browser.selector.filtered;
         let selected = browser.selector.selected;
-        let max_visible = body[0].height as usize;
-        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+        let total = filtered.len();
+        // Reserve one column for the virtual scrollbar when the catalog overflows.
+        let list_inner_width = if total > max_visible && list_area.width > 1 {
+            list_area.width.saturating_sub(1)
+        } else {
+            list_area.width
+        };
+        let (scroll_start, visible) =
+            Self::browser_virtual_window(selected, total, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
-            let empty_text = if query.is_empty() {
-                "  Start typing to search remote skills."
-            } else if browser.inflight_request_id.is_some() {
-                "  Searching remote sources…"
+            let mut empty_lines: Vec<ListItem> = Vec::new();
+            if browser.inflight_request_id.is_some() {
+                let status = browser.loading_status_line(
+                    query.is_empty(),
+                    &filter_label,
+                    self.terminal_glyph_profile,
+                );
+                empty_lines.push(ListItem::new(Line::from(Span::styled(
+                    format!("  {status}"),
+                    Style::default().fg(Color::Rgb(110, 220, 210)),
+                ))));
+                // Skeleton stubs so the list never reads as a long blank 0-of-0.
+                for i in 0..4 {
+                    let pad = "·".repeat(12 + (i % 3) * 4);
+                    empty_lines.push(ListItem::new(Line::from(Span::styled(
+                        format!("  ░ {pad}"),
+                        Style::default().fg(Color::Rgb(55, 58, 72)),
+                    ))));
+                }
+                empty_lines.push(ListItem::new(Line::from(Span::styled(
+                    "  Esc or click to leave · typing / [ ] / S still work".to_string(),
+                    Style::default().fg(Color::Rgb(120, 120, 135)),
+                ))));
+            } else if !browser.notices.is_empty() && query.is_empty() {
+                let notice = browser.notices[0].as_str();
+                empty_lines.push(ListItem::new(Line::from(Span::styled(
+                    format!("  {}", unicode_trunc(notice, list_inner_width.saturating_sub(2) as usize)),
+                    Style::default().fg(Color::Rgb(255, 191, 0)),
+                ))));
+                if let Some(cta) = super::skill_inspect_view::marketplace_notice_cta(notice) {
+                    empty_lines.push(ListItem::new(Line::from(Span::styled(
+                        format!("  → {cta}"),
+                        Style::default().fg(Color::Rgb(110, 220, 210)),
+                    ))));
+                } else {
+                    empty_lines.push(ListItem::new(Line::from(Span::styled(
+                        "  → Press r to retry, or [ ] / S to change source.".to_string(),
+                        Style::default().fg(Color::Rgb(110, 220, 210)),
+                    ))));
+                }
+            } else if query.is_empty() {
+                empty_lines.push(ListItem::new(Line::from(Span::styled(
+                    "  Catalog empty for this source — try S / [ ] another source, or type a query."
+                        .to_string(),
+                    Style::default().fg(Color::Rgb(120, 120, 135)),
+                ))));
             } else {
-                "  No remote skills matched this query."
-            };
-            vec![ListItem::new(Line::from(Span::styled(
-                empty_text.to_string(),
-                Style::default().fg(Color::Rgb(120, 120, 135)),
-            )))]
+                empty_lines.push(ListItem::new(Line::from(Span::styled(
+                    "  No matches — broaden filter, or type ≥2 chars for remote search."
+                        .to_string(),
+                    Style::default().fg(Color::Rgb(120, 120, 135)),
+                ))));
+            }
+            empty_lines
         } else {
+            // Virtual scroll: materialize only the visible viewport rows.
             filtered
                 .iter()
                 .skip(scroll_start)
-                .take(max_visible)
+                .take(visible)
                 .enumerate()
                 .map(|(vis_idx, &entry_idx)| {
                     let entry = &browser.selector.items[entry_idx];
@@ -1126,10 +1286,31 @@ impl App {
                     } else {
                         Style::default().fg(Color::Rgb(120, 140, 140))
                     };
+                    // Fixed columns so long labels ("Unified Index") never smash into "install".
+                    const SOURCE_COLS: usize = 14;
+                    const ACTION_COLS: usize = 8;
+                    let id_cols = ((list_inner_width as usize)
+                        .saturating_sub(SOURCE_COLS + ACTION_COLS + 6))
+                    .clamp(20, 48);
+                    let desc_cols = ((list_inner_width as usize)
+                        .saturating_sub(SOURCE_COLS + ACTION_COLS + id_cols + 6))
+                    .clamp(12, 40);
                     let mut spans = vec![
                         selector_marker(is_selected, Color::Rgb(110, 220, 210), Some(bg)),
-                        Span::styled(format!("  {:<11}", entry.source_label), source_style),
-                        Span::styled(format!("{:<8}", entry.action.label()), action_style),
+                        Span::styled(
+                            format!(
+                                "  {}",
+                                unicode_pad_right(
+                                    &unicode_trunc(&entry.source_label, SOURCE_COLS),
+                                    SOURCE_COLS
+                                )
+                            ),
+                            source_style,
+                        ),
+                        Span::styled(
+                            unicode_pad_right(entry.action.label(), ACTION_COLS),
+                            action_style,
+                        ),
                     ];
                     if is_selected && let Some(guard) = &self.remote_skill_guard.preview {
                         if self.remote_skill_guard.for_identifier.as_deref()
@@ -1151,12 +1332,12 @@ impl App {
                         }
                     }
                     spans.push(Span::styled(
-                        unicode_trunc(&entry.identifier, 40),
+                        unicode_trunc(&entry.identifier, id_cols),
                         main_style,
                     ));
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled(
-                        unicode_trunc(&entry.description, 32),
+                        unicode_trunc(&entry.description, desc_cols),
                         desc_style,
                     ));
                     ListItem::new(Line::from(spans))
@@ -1164,15 +1345,68 @@ impl App {
                 .collect()
         };
 
-        frame.render_widget(
-            List::new(items).style(Style::default().bg(Color::Rgb(18, 24, 26))),
-            body[0],
+        Self::render_virtualized_list(
+            frame,
+            list_area,
+            items,
+            scroll_start,
+            total.max(if filtered.is_empty() { 0 } else { total }),
+            Color::Rgb(18, 24, 26),
         );
 
         let mut detail_lines = Vec::new();
-        if let Some(entry) = browser.selector.current() {
+        let inspect_scroll = match &self.skills_marketplace_mode {
+            super::skills_marketplace::MarketplaceMode::Inspect {
+                identifier,
+                preview_scroll,
+            } => Some((identifier.clone(), *preview_scroll)),
+            _ => None,
+        };
+
+        if let Some((inspect_id, preview_scroll)) = inspect_scroll.as_ref() {
+            if let Some(entry) = browser.selector.current().filter(|e| e.identifier == *inspect_id)
+            {
+                let loading = self.remote_skill_guard.inflight.as_deref()
+                    == Some(entry.identifier.as_str());
+                let preview = self
+                    .remote_skill_guard
+                    .preview
+                    .as_ref()
+                    .filter(|_| {
+                        self.remote_skill_guard.for_identifier.as_deref()
+                            == Some(entry.identifier.as_str())
+                    });
+                let error = self
+                    .remote_skill_guard
+                    .error
+                    .as_deref()
+                    .filter(|_| {
+                        self.remote_skill_guard.for_identifier.as_deref()
+                            == Some(entry.identifier.as_str())
+                            || loading
+                    });
+                let model = super::skill_inspect_view::SkillInspectModel::from_catalog_and_preview(
+                    entry.to_inspect_catalog(),
+                    preview,
+                    loading,
+                    error,
+                );
+                detail_lines =
+                    super::skill_inspect_view::render_inspect_dossier_lines(&model, *preview_scroll);
+            } else if let Some(entry) = browser.selector.current() {
+                // Selection drifted; show catalog dossier for current row.
+                let model = super::skill_inspect_view::SkillInspectModel::from_catalog_and_preview(
+                    entry.to_inspect_catalog(),
+                    None,
+                    false,
+                    Some("Selection changed — press Enter again to inspect."),
+                );
+                detail_lines =
+                    super::skill_inspect_view::render_inspect_dossier_lines(&model, *preview_scroll);
+            }
+        } else if let Some(entry) = browser.selector.current() {
             let status_line = match entry.action {
-                RemoteSkillAction::Install => "Default action: install".to_string(),
+                RemoteSkillAction::Install => "Default action: install (Enter inspect first)".to_string(),
                 RemoteSkillAction::Update => format!(
                     "Default action: update ({})",
                     entry.installed_name.as_deref().unwrap_or(&entry.name)
@@ -1201,6 +1435,23 @@ impl App {
                 Span::styled("Origin: ", Style::default().fg(Color::Rgb(145, 170, 170))),
                 Span::raw(entry.origin.clone()),
             ]));
+            if let Some(url) = entry.url.as_deref().filter(|u| !u.is_empty()) {
+                detail_lines.push(Line::from(vec![
+                    Span::styled("URL: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                    Span::raw(url.to_string()),
+                ]));
+            } else if let Some(repo) = entry.repo.as_deref().filter(|r| !r.is_empty()) {
+                let path = entry.path.as_deref().unwrap_or("");
+                let provenance = if path.is_empty() {
+                    repo.to_string()
+                } else {
+                    format!("{repo}/{path}")
+                };
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Repo: ", Style::default().fg(Color::Rgb(145, 170, 170))),
+                    Span::raw(provenance),
+                ]));
+            }
             detail_lines.push(Line::from(vec![
                 Span::styled("Action: ", Style::default().fg(Color::Rgb(145, 170, 170))),
                 Span::raw(status_line),
@@ -1220,33 +1471,70 @@ impl App {
             }
             self.append_remote_skill_guard_detail(&mut detail_lines);
         } else if query.is_empty() {
+            if browser.inflight_request_id.is_some() {
+                let status = browser.loading_status_line(
+                    true,
+                    &filter_label,
+                    self.terminal_glyph_profile,
+                );
+                detail_lines.push(Line::from(Span::styled(
+                    status,
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                )));
+                detail_lines.extend(
+                    super::skills_marketplace::skeleton_detail_lines(&filter_label, true)
+                        .into_iter()
+                        .skip(1),
+                );
+            } else {
+                detail_lines.push(Line::from(Span::styled(
+                    format!("Browse · {filter_label}"),
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                )));
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(
+                    "Empty query lists remote skills. Type to filter; [ ] or S to change source.",
+                ));
+                detail_lines.push(Line::from(""));
+                detail_lines.push(Line::from(Span::styled(
+                    "Sources",
+                    Style::default()
+                        .fg(Color::Rgb(255, 191, 0))
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for source in edgecrab_tools::tools::skills_hub::curated_source_summaries() {
+                    detail_lines.push(Line::from(format!(
+                        "- {} [{}]",
+                        source.label, source.trust_level
+                    )));
+                }
+            }
+        } else if browser.inflight_request_id.is_some() {
+            let status = browser.loading_status_line(
+                false,
+                &filter_label,
+                self.terminal_glyph_profile,
+            );
             detail_lines.push(Line::from(Span::styled(
-                "Curated Sources",
+                status,
                 Style::default()
                     .fg(Color::Rgb(110, 220, 210))
                     .add_modifier(Modifier::BOLD),
             )));
-            for source in edgecrab_tools::tools::skills_hub::curated_source_summaries() {
-                detail_lines.push(Line::from(format!(
-                    "- {} [{}]",
-                    source.label, source.trust_level
-                )));
-            }
-            detail_lines.push(Line::from(""));
-            detail_lines.push(Line::from(
-                "Paste an https:// URL to search a .well-known skills endpoint too.",
-            ));
-        } else if browser.inflight_request_id.is_some() {
-            detail_lines.push(Line::from("Searching remote sources…"));
-            detail_lines.push(Line::from(""));
-            detail_lines.push(Line::from(
-                "You can keep typing while results refresh. Slow or failing sources are reported here without blocking the UI.",
-            ));
+            detail_lines.extend(
+                super::skills_marketplace::skeleton_detail_lines(&filter_label, false)
+                    .into_iter()
+                    .skip(1),
+            );
         } else {
             detail_lines.push(Line::from("No results for the current query."));
             detail_lines.push(Line::from(""));
             detail_lines.push(Line::from(
-                "Try a broader term, a source name like 'edgecrab', or a full https:// URL for well-known skill discovery.",
+                "Try a broader query, another source (S / [ ]), or paste owner/repo/path.",
             ));
         }
 
@@ -1260,6 +1548,12 @@ impl App {
             )));
             for notice in &browser.notices {
                 detail_lines.push(Line::from(format!("- {notice}")));
+                if let Some(cta) = super::skill_inspect_view::marketplace_notice_cta(notice) {
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  → {cta}"),
+                        Style::default().fg(Color::Rgb(160, 180, 180)),
+                    )));
+                }
             }
         }
 
@@ -1327,67 +1621,106 @@ impl App {
             detail_lines,
         );
 
-        let mut help_spans = vec![
-            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("browse  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
-        ];
-        help_spans.extend(self.focus_pane_help_spans(Color::Rgb(110, 220, 210)));
-        help_spans.extend(self.page_or_scroll_help_spans(Color::Rgb(110, 220, 210)));
-        help_spans.extend([
-            Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("default action  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("install/update  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("U ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("force update  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Z ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("detail  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("refresh  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("S ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("guard scan  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("L ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("local browser  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc ", Style::default().fg(Color::Rgb(110, 220, 210))),
-            Span::styled("cancel  ", Style::default().fg(Color::DarkGray)),
-        ]);
-        let status_text = if browser.inflight_request_id.is_some() {
-            "searching"
-        } else if !query.is_empty() && filtered.is_empty() {
-            "no matches"
+        let catalog_total = if query.is_empty() {
+            self.browse_catalog_total_hint()
         } else {
-            "matches"
+            None
         };
-        help_spans.push(Span::styled(
-            format!(
-                "{} {} · {} pane",
-                filtered.len(),
-                status_text,
-                self.simple_split_focus_label(DetailSurface::RemoteSkillBrowser)
-            ),
-            Style::default().fg(Color::Rgb(100, 120, 120)),
-        ));
-        let help = Paragraph::new(Line::from(help_spans));
-        frame.render_widget(help, chunks[2]);
+        let catalog_loading = query.is_empty()
+            && (self
+                .remote_skill_browser
+                .browse_page_cache
+                .catalog_ensure_inflight
+                || (!self.browse_catalog_complete()
+                    && self
+                        .remote_skill_browser
+                        .browse_page_cache
+                        .stream_complete));
+        let range = if catalog_loading {
+            super::browse_page_cache::marketplace_browse_range_label_full(
+                scroll_start,
+                visible,
+                total,
+                searching,
+                catalog_total,
+                true,
+            )
+        } else {
+            super::browse_page_cache::marketplace_browse_range_label_with_catalog(
+                scroll_start,
+                visible,
+                total,
+                searching,
+                catalog_total,
+            )
+        };
+        if self.skills_marketplace_help {
+            let help = super::skills_marketplace::marketplace_footer_help(
+                true,
+                self.skills_marketplace_mode.kind(),
+            );
+            let mut lines: Vec<Line> = help
+                .lines()
+                .map(|line| {
+                    Line::from(Span::styled(
+                        format!(" {line}"),
+                        Style::default().fg(Color::Rgb(160, 180, 180)),
+                    ))
+                })
+                .collect();
+            lines.push(Line::from(Span::styled(
+                format!(" {range} · ? collapse "),
+                Style::default()
+                    .fg(Color::Rgb(110, 220, 210))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(Color::Rgb(16, 18, 24))),
+                chunks[2],
+            );
+        } else {
+            let help_spans = vec![
+                Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                Span::styled("move  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("type ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                Span::styled("filter  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[ ] ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                Span::styled("source  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                Span::styled("inspect  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("I ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                Span::styled("install  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("R ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                Span::styled("retry  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("? ", Style::default().fg(Color::Rgb(110, 220, 210))),
+                Span::styled("help  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(" {range} "),
+                    Style::default()
+                        .fg(Color::Rgb(110, 220, 210))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(help_spans)), chunks[2]);
+        }
     }
 
-    pub(super) fn render_remote_plugin_selector(&self, frame: &mut Frame, area: Rect) {
+    pub(super) fn render_remote_plugin_selector(&mut self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Clear, area);
 
         let chunks = Self::browser_overlay_chunks(area);
         let body = Self::browser_body_chunks(chunks[1]);
 
-        let browser = &self.remote_plugin_browser;
-        let query = browser.current_query();
-        let title = if let Some(source) = browser.source_filter.as_deref() {
-            if browser.inflight_request_id.is_some() {
+        let query = self.remote_plugin_browser.current_query();
+        let searching = self.remote_plugin_browser.inflight_request_id.is_some();
+        let header_query = self.remote_plugin_browser.selector.query.clone();
+        let title = if let Some(source) = self.remote_plugin_browser.source_filter.as_deref() {
+            if searching {
                 format!("Remote Plugins · {source} · Searching…")
             } else {
                 format!("Remote Plugins · {source}")
             }
-        } else if browser.inflight_request_id.is_some() {
+        } else if searching {
             "Remote Plugins · Searching…".to_string()
         } else {
             "Remote Plugins".to_string()
@@ -1395,14 +1728,14 @@ impl App {
         self.render_browser_header(
             frame,
             chunks[0],
-            &browser.selector.query,
+            &header_query,
             BrowserChrome {
                 title: &title,
                 placeholder:
                     "Type to search official and configured plugin registries, or use /plugins search --source <name> <query>",
                 icon: "🔌",
                 icon_color: Color::Rgb(210, 190, 110),
-                border_color: if browser.inflight_request_id.is_some() {
+                border_color: if searching {
                     Color::Rgb(210, 190, 110)
                 } else {
                     Color::Rgb(255, 191, 0)
@@ -1410,10 +1743,16 @@ impl App {
             },
         );
 
+        let max_visible = body[0].height.max(1) as usize;
+        self.remote_plugin_browser.list_viewport_rows = max_visible;
+        self.remote_plugin_browser.selector.list_viewport_rows = max_visible;
+
+        let browser = &self.remote_plugin_browser;
         let filtered = &browser.selector.filtered;
         let selected = browser.selector.selected;
-        let max_visible = body[0].height as usize;
-        let scroll_start = Self::browser_scroll_start(selected, max_visible);
+        let total = filtered.len();
+        let (scroll_start, visible) =
+            Self::browser_virtual_window(selected, total, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             let empty_text = if query.is_empty() {
@@ -1431,7 +1770,7 @@ impl App {
             filtered
                 .iter()
                 .skip(scroll_start)
-                .take(max_visible)
+                .take(visible)
                 .enumerate()
                 .map(|(vis_idx, &entry_idx)| {
                     let entry = &browser.selector.items[entry_idx];
@@ -1483,10 +1822,16 @@ impl App {
                 .collect()
         };
 
-        frame.render_widget(
-            List::new(items).style(Style::default().bg(Color::Rgb(24, 22, 16))),
+        let plugin_range = Self::browser_virtual_range_label(scroll_start, visible, total);
+        Self::render_virtualized_list(
+            frame,
             body[0],
+            items,
+            scroll_start,
+            total,
+            Color::Rgb(24, 22, 16),
         );
+        let browser = &self.remote_plugin_browser;
 
         let mut detail_lines = Vec::new();
         if let Some(entry) = browser.selector.current() {
@@ -1687,13 +2032,11 @@ impl App {
         } else if !query.is_empty() && filtered.is_empty() {
             "no matches"
         } else {
-            "matches"
+            "virtual"
         };
         help_spans.push(Span::styled(
             format!(
-                "{} {} · {} pane",
-                filtered.len(),
-                status_text,
+                " {plugin_range} · {status_text} · {} pane",
                 self.simple_split_focus_label(DetailSurface::RemotePluginBrowser)
             ),
             Style::default().fg(Color::Rgb(155, 140, 105)),

@@ -462,10 +462,12 @@ The `send_message` tool (in `advanced.rs`) uses the `GatewaySender` trait to sen
 |------------|-------------|
 | `/skills` or `/skills list` | List installed skills from `~/.edgecrab/skills/` |
 | `/skills view <name>` | Print skill content |
+| `/skills browse` | Skills Hub catalog (empty-query browse; TUI marketplace) |
+| `/skills hub` | Alias of `/skills browse` (Hermes brand; not search) |
+| `/skills search <query>` | Query-ranked Skills Hub search |
 | `/skills install <local-path>` | Copy a local .md file or directory to the skills dir |
 | `/skills install owner/repo/path` | Install a skill directly from a public GitHub repo |
 | `/skills remove <name>` | Delete an installed skill |
-| `/skills hub` | Show Skills Hub usage guidance |
 
 ### Activity Shelf & Disclosure
 

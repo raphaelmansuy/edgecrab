@@ -53,11 +53,45 @@ pub fn browser_list_visible_rows(area: Rect, bordered: bool) -> usize {
 }
 
 pub fn browser_scroll_start(selected: usize, max_visible: usize) -> usize {
-    if selected >= max_visible {
-        selected - max_visible + 1
-    } else {
-        0
+    browser_virtual_window(selected, usize::MAX, max_visible).0
+}
+
+/// Virtual scroll window for large picker lists.
+///
+/// Returns `(scroll_start, visible_count)` so only a viewport-sized slice is
+/// materialized as widgets while the selection stays on-screen.
+pub fn browser_virtual_window(
+    selected: usize,
+    total: usize,
+    max_visible: usize,
+) -> (usize, usize) {
+    let max_visible = max_visible.max(1);
+    if total == 0 {
+        return (0, 0);
     }
+    let total = total.max(1);
+    let selected = selected.min(total.saturating_sub(1));
+    let visible = max_visible.min(total);
+    let scroll_start = if selected < visible {
+        0
+    } else {
+        selected + 1 - visible
+    };
+    let max_start = total.saturating_sub(visible);
+    (scroll_start.min(max_start), visible)
+}
+
+/// Human label for a virtualized window, e.g. `"12–31 of 847"`.
+pub fn browser_virtual_range_label(scroll_start: usize, visible: usize, total: usize) -> String {
+    if total == 0 {
+        return "0 of 0".into();
+    }
+    let from = scroll_start.saturating_add(1);
+    let to = scroll_start
+        .saturating_add(visible.max(1))
+        .min(total)
+        .max(from);
+    format!("{from}–{to} of {total}")
 }
 
 /// Standard help-bar `Line` for picker overlays: `↑↓ browse  Tab next  Enter apply  Esc cancel`.
@@ -82,6 +116,33 @@ mod tests {
     fn browser_scroll_start_keeps_selection_visible() {
         assert_eq!(browser_scroll_start(0, 10), 0);
         assert_eq!(browser_scroll_start(15, 10), 6);
+    }
+
+    #[test]
+    fn browser_virtual_window_clamps_and_labels() {
+        assert_eq!(browser_virtual_window(0, 100, 10), (0, 10));
+        assert_eq!(browser_virtual_window(15, 100, 10), (6, 10));
+        assert_eq!(browser_virtual_window(99, 100, 10), (90, 10));
+        assert_eq!(browser_virtual_window(0, 3, 10), (0, 3));
+        assert_eq!(browser_virtual_range_label(0, 10, 100), "1–10 of 100");
+        assert_eq!(browser_virtual_range_label(90, 10, 100), "91–100 of 100");
+        assert_eq!(browser_virtual_range_label(0, 0, 0), "0 of 0");
+    }
+
+    #[test]
+    fn marketplace_scale_catalog_only_materializes_viewport() {
+        // skills.sh-scale: 1000 rows, 24-row TUI pane → only 24 widgets.
+        let total = 1000usize;
+        let max_visible = 24usize;
+        let selected = 500usize;
+        let (start, visible) = browser_virtual_window(selected, total, max_visible);
+        assert_eq!(visible, 24);
+        assert_eq!(start, 477); // selected at bottom of window
+        let materialized: Vec<usize> = (0..total).skip(start).take(visible).collect();
+        assert_eq!(materialized.len(), 24);
+        assert!(materialized.contains(&selected));
+        assert!(!materialized.contains(&0));
+        assert!(!materialized.contains(&(total - 1)) || selected >= total - visible);
     }
 
     #[test]

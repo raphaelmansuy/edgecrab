@@ -15,6 +15,8 @@ pub(super) struct RemoteSkillGuardCache {
     pub inflight: Option<String>,
     pub preview: Option<InstallScanPreview>,
     pub error: Option<String>,
+    /// Debounce deadline for progressive-stream preview scheduling.
+    pub preview_due_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -22,7 +24,25 @@ impl App {
         self.remote_skill_guard = RemoteSkillGuardCache::default();
     }
 
+    /// Queue a guard preview after ~250ms (avoids preview storm on every partial).
+    pub(super) fn schedule_remote_skill_guard_preview_debounced(&mut self) {
+        self.remote_skill_guard.preview_due_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+    }
+
+    pub(super) fn poll_remote_skill_guard_preview_debounce(&mut self) {
+        let Some(due) = self.remote_skill_guard.preview_due_at else {
+            return;
+        };
+        if std::time::Instant::now() < due {
+            return;
+        }
+        self.remote_skill_guard.preview_due_at = None;
+        self.schedule_remote_skill_guard_preview();
+    }
+
     pub(super) fn schedule_remote_skill_guard_preview(&mut self) {
+        self.remote_skill_guard.preview_due_at = None;
         if !self.remote_skill_browser.selector.active {
             return;
         }
