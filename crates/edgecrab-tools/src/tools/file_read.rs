@@ -61,8 +61,8 @@ fn binary_media_redirect_stub(path: &str) -> Option<String> {
             ))
         }
         "pptx" | "ppt" | "docx" | "doc" | "xlsx" | "xls" | "odt" | "odp" | "pdf" | "zip"
-        | "jar" | "whl" | "gz" | "tgz" | "bz2" | "7z" | "rar" | "wasm" | "so" | "dylib"
-        | "dll" | "exe" | "bin" => {
+        | "jar" | "whl" | "gz" | "tgz" | "bz2" | "7z" | "rar" | "wasm" | "so" | "dylib" | "dll"
+        | "exe" | "bin" => {
             let mime = mime_for_office_ext(&ext);
             Some(
                 serde_json::json!({
@@ -83,7 +83,9 @@ fn binary_media_redirect_stub(path: &str) -> Option<String> {
 
 fn mime_for_office_ext(ext: &str) -> &'static str {
     match ext {
-        "pptx" | "ppt" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pptx" | "ppt" => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
         "docx" | "doc" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" | "xls" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "pdf" => "application/pdf",
@@ -109,7 +111,9 @@ fn binary_stub_from_magic(path: &str, bytes: &[u8]) -> Option<String> {
         return None;
     }
     // ZIP-based Office (PK..)
-    if bytes[0] == 0x50 && bytes[1] == 0x4B && (bytes[2] == 0x03 || bytes[2] == 0x05 || bytes[2] == 0x07)
+    if bytes[0] == 0x50
+        && bytes[1] == 0x4B
+        && (bytes[2] == 0x03 || bytes[2] == 0x05 || bytes[2] == 0x07)
     {
         let mime = "application/zip";
         return Some(
@@ -709,15 +713,17 @@ mod tests {
     async fn read_file_pptx_returns_binary_stub_not_utf8_error() {
         let dir = TempDir::new().expect("tmpdir");
         // Minimal ZIP/PK magic (Office Open XML container).
-        std::fs::write(dir.path().join("deck.pptx"), b"PK\x03\x04fake-office")
-            .expect("write");
+        std::fs::write(dir.path().join("deck.pptx"), b"PK\x03\x04fake-office").expect("write");
         let ctx = ctx_in(dir.path());
         let result = ReadFileTool
             .execute(json!({"path": "deck.pptx"}), &ctx)
             .await
             .expect("binary stub ok");
         assert!(result.contains("binary"), "got: {result}");
-        assert!(result.contains("mime") || result.contains("suggested_tools"), "got: {result}");
+        assert!(
+            result.contains("mime") || result.contains("suggested_tools"),
+            "got: {result}"
+        );
         assert!(
             !result.contains("stream did not contain valid UTF-8"),
             "must not surface UTF-8 decode panic: {result}"

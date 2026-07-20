@@ -58,13 +58,7 @@ pub fn plan_tool_batch(registry: Option<&ToolRegistry>, calls: &[ToolCall]) -> T
         };
 
         let is_parallel = registry
-            .map(|r| {
-                r.can_parallelize_in_batch(
-                    &planned.name,
-                    &planned.arguments,
-                    &claimed_paths,
-                )
-            })
+            .map(|r| r.can_parallelize_in_batch(&planned.name, &planned.arguments, &claimed_paths))
             .unwrap_or(false);
 
         if is_parallel {

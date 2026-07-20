@@ -657,7 +657,9 @@ pub fn scan_for_injection(text: &str) -> Vec<InjectionThreat> {
     if text
         .chars()
         .any(|c| edgecrab_security::threat_patterns::INVISIBLE_CHARS.contains(&c))
-        && !threats.iter().any(|t| t.pattern_name == "invisible_unicode")
+        && !threats
+            .iter()
+            .any(|t| t.pattern_name == "invisible_unicode")
     {
         threats.push(InjectionThreat {
             pattern_name: "invisible_unicode".to_string(),

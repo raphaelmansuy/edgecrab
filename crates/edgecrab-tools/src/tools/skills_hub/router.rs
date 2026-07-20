@@ -199,7 +199,8 @@ impl SkillSourceRouter {
             || is_provider_filter(filter)
             || curated_search_entries().any(|s| source_id_matches_filter(s.id, filter))
         {
-            for source in curated_search_entries().filter(|s| super::source_matches_filter(s, filter))
+            for source in
+                curated_search_entries().filter(|s| super::source_matches_filter(s, filter))
             {
                 let client = client.clone();
                 let q = query.to_string();
@@ -562,8 +563,8 @@ impl SkillSource for LocalSource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::source_trait::ALL_SOURCE_IDS;
+    use super::*;
     use std::time::Duration;
 
     #[test]

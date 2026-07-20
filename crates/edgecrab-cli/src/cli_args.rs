@@ -2103,10 +2103,7 @@ mod tests {
                 assert_eq!(name, "linear");
                 assert_eq!(url.as_deref(), Some("https://mcp.example.com/mcp"));
                 assert_eq!(auth, "oauth");
-                assert_eq!(
-                    token_url.as_deref(),
-                    Some("https://auth.example.com/token")
-                );
+                assert_eq!(token_url.as_deref(), Some("https://auth.example.com/token"));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -2449,19 +2446,14 @@ mod tests {
 
     #[test]
     fn parse_skills_tap_add_subcommand() {
-        let args = CliArgs::parse_from([
-            "edgecrab",
-            "skills",
-            "tap",
-            "add",
-            "owner/repo",
-            "skills",
-        ]);
+        let args =
+            CliArgs::parse_from(["edgecrab", "skills", "tap", "add", "owner/repo", "skills"]);
         match args.command {
             Some(Command::Skills {
-                command: SkillsCommand::Tap {
-                    command: SkillsTapCommand::Add { repo, root },
-                },
+                command:
+                    SkillsCommand::Tap {
+                        command: SkillsTapCommand::Add { repo, root },
+                    },
             }) => {
                 assert_eq!(repo, "owner/repo");
                 assert_eq!(root.as_deref(), Some("skills"));
@@ -2479,13 +2471,8 @@ mod tests {
                 command: SkillsCommand::Trust { .. }
             })
         ));
-        let inspect = CliArgs::parse_from([
-            "edgecrab",
-            "skills",
-            "inspect",
-            "openai/demo",
-            "--scan",
-        ]);
+        let inspect =
+            CliArgs::parse_from(["edgecrab", "skills", "inspect", "openai/demo", "--scan"]);
         match inspect.command {
             Some(Command::Skills {
                 command: SkillsCommand::Inspect { identifier, scan },
@@ -2506,13 +2493,7 @@ mod tests {
                 command: SkillsCommand::Audit { log: true, .. }
             })
         ));
-        let snap = CliArgs::parse_from([
-            "edgecrab",
-            "skills",
-            "snapshot",
-            "export",
-            "-",
-        ]);
+        let snap = CliArgs::parse_from(["edgecrab", "skills", "snapshot", "export", "-"]);
         assert!(matches!(
             snap.command,
             Some(Command::Skills {

@@ -108,6 +108,7 @@ pub fn discovery_availability_detail(
     }
 }
 
+#[allow(dead_code)] // Thin wrapper retained for call sites that omit auth readiness.
 pub fn build_model_selector_entries(
     grouped: &[(String, Vec<String>)],
     dynamic_lookup: Option<&BTreeMap<String, (DiscoverySource, BTreeSet<String>)>>,
@@ -323,11 +324,7 @@ mod tests {
     fn auth_ready_fn_marks_sign_in() {
         let grouped = vec![("super-grok".into(), vec!["grok-4.5".into()])];
         let ready = |p: &str| {
-            if p == "super-grok" {
-                Some(false)
-            } else {
-                None
-            }
+            if p == "super-grok" { Some(false) } else { None }
         };
         let entries = build_model_selector_entries_with_auth(&grouped, None, Some(&ready));
         assert!(

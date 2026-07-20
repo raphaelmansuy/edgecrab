@@ -257,11 +257,7 @@ pub fn provider_filter_repos(filter: &str) -> Option<Vec<&'static str>> {
             CatalogKind::SkillsSh => {}
         }
     }
-    if repos.is_empty() {
-        None
-    } else {
-        Some(repos)
-    }
+    if repos.is_empty() { None } else { Some(repos) }
 }
 
 pub fn is_provider_filter(filter: &str) -> bool {
@@ -360,7 +356,11 @@ mod tests {
     #[test]
     fn openai_filter_includes_openai_skills() {
         let repos = provider_filter_repos("openai").expect("openai");
-        assert!(repos.iter().any(|r| r.eq_ignore_ascii_case("openai/skills")));
+        assert!(
+            repos
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case("openai/skills"))
+        );
     }
 
     #[test]

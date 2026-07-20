@@ -94,7 +94,10 @@ pub fn catalog_page(filter: &str, offset: usize, limit: usize) -> CatalogPage {
         "voltagent" => page_voltagent(offset, limit),
         other if super::is_provider_filter(other) => page_github_provider(other, offset, limit),
         other => {
-            if let Some(entry) = HUB_CATALOG.iter().find(|e| e.id.eq_ignore_ascii_case(other)) {
+            if let Some(entry) = HUB_CATALOG
+                .iter()
+                .find(|e| e.id.eq_ignore_ascii_case(other))
+            {
                 page_github_source_ids(&[entry.id], offset, limit)
             } else {
                 CatalogPage::default()
@@ -169,11 +172,7 @@ pub async fn ensure_catalog(filter: &str) -> Result<(), String> {
 
 fn normalize_filter(filter: &str) -> String {
     let f = filter.trim().to_ascii_lowercase();
-    if f.is_empty() {
-        "all".into()
-    } else {
-        f
-    }
+    if f.is_empty() { "all".into() } else { f }
 }
 
 fn page_all(offset: usize, limit: usize) -> CatalogPage {
@@ -294,11 +293,8 @@ fn page_github_source_ids(ids: &[&str], offset: usize, limit: usize) -> CatalogP
     all.sort_by(|a, b| a.1.identifier.cmp(&b.1.identifier));
     all.dedup_by(|a, b| a.1.identifier == b.1.identifier);
     let unique_total = all.len();
-    let page: Vec<(HubSourceInfo, SkillMeta)> = all
-        .into_iter()
-        .skip(offset)
-        .take(limit.max(1))
-        .collect();
+    let page: Vec<(HubSourceInfo, SkillMeta)> =
+        all.into_iter().skip(offset).take(limit.max(1)).collect();
     let mut groups: Vec<SearchGroup> = Vec::new();
     for (info, meta) in page {
         if let Some(g) = groups.iter_mut().find(|g| g.source.id == info.id) {
@@ -415,17 +411,16 @@ mod tests {
         let page = catalog_page("openai", 80, 80);
         assert_eq!(page.total, Some(200));
         assert_eq!(page.row_count(), 80);
-        let slice = super::super::browse_github_cache_slice("openai", 80, 80)
-            .expect("direct source slice");
+        let slice =
+            super::super::browse_github_cache_slice("openai", 80, 80).expect("direct source slice");
         assert_eq!(slice.results.len(), 80);
         assert!(super::super::github_cache_complete("openai"));
         assert!(
-            page.groups
-                .iter()
-                .flat_map(|g| g.results.iter())
-                .any(|m| m.identifier.contains("skill-080")
-                    || m.identifier.contains("skill-081")
-                    || m.identifier.contains("skill-100")),
+            page.groups.iter().flat_map(|g| g.results.iter()).any(|m| m
+                .identifier
+                .contains("skill-080")
+                || m.identifier.contains("skill-081")
+                || m.identifier.contains("skill-100")),
             "page 2 should include mid-range skills"
         );
     }
@@ -444,30 +439,32 @@ mod tests {
             "openai",
             &super::super::SourceCache {
                 fetched_at: chrono::Utc::now().timestamp(),
-                entries: (0..50).map(shared).chain((50..100).map(|i| {
-                    super::super::CachedSkillEntry {
+                entries: (0..50)
+                    .map(shared)
+                    .chain((50..100).map(|i| super::super::CachedSkillEntry {
                         name: format!("a-{i}"),
                         relative_path: format!("a-{i}"),
                         identifier: format!("openai-only-{i}"),
                         description: String::new(),
                         tags: vec![],
-                    }
-                })).collect(),
+                    }))
+                    .collect(),
             },
         );
         super::super::write_source_cache(
             "openai-system",
             &super::super::SourceCache {
                 fetched_at: chrono::Utc::now().timestamp(),
-                entries: (0..50).map(shared).chain((100..150).map(|i| {
-                    super::super::CachedSkillEntry {
+                entries: (0..50)
+                    .map(shared)
+                    .chain((100..150).map(|i| super::super::CachedSkillEntry {
                         name: format!("b-{i}"),
                         relative_path: format!("b-{i}"),
                         identifier: format!("system-only-{i}"),
                         description: String::new(),
                         tags: vec![],
-                    }
-                })).collect(),
+                    }))
+                    .collect(),
             },
         );
         let total = catalog_total("openai").expect("total");

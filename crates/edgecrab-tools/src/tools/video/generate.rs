@@ -50,10 +50,11 @@ impl ToolHandler for VideoGenerateTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "video_generate".into(),
-            description: "Submit a text-to-video (or image-to-video) job. Returns job_id immediately; \
+            description:
+                "Submit a text-to-video (or image-to-video) job. Returns job_id immediately; \
                  poll with video_status. Opt-in toolset `video`. Backends: mock (default), \
                  or provider keys when configured (OPENAI_API_KEY / RUNWAY_API_KEY / etc.)."
-                .into(),
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -72,10 +73,11 @@ impl ToolHandler for VideoGenerateTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        let args: GenerateArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "video_generate".into(),
-            message: e.to_string(),
-        })?;
+        let args: GenerateArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: "video_generate".into(),
+                message: e.to_string(),
+            })?;
         if args.prompt.trim().is_empty() {
             return Err(ToolError::InvalidArgs {
                 tool: "video_generate".into(),
@@ -201,10 +203,11 @@ impl ToolHandler for VideoStatusTool {
         args: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        let args: StatusArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "video_status".into(),
-            message: e.to_string(),
-        })?;
+        let args: StatusArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: "video_status".into(),
+                message: e.to_string(),
+            })?;
         let store = job_store().lock().map_err(|_| ToolError::ExecutionFailed {
             tool: "video_status".into(),
             message: "job store lock poisoned".into(),

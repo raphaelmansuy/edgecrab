@@ -179,7 +179,10 @@ fn walk_skill_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Build a synthetic bundle from skill dirs (tests / offline).
 #[allow(dead_code)]
-pub fn bundles_from_skill_dirs(dirs: &[PathBuf], identifier: &str) -> Result<Vec<SkillBundle>, String> {
+pub fn bundles_from_skill_dirs(
+    dirs: &[PathBuf],
+    identifier: &str,
+) -> Result<Vec<SkillBundle>, String> {
     let mut bundles = Vec::new();
     for dir in dirs {
         let mut bundle = build_local_skill_bundle(dir, None)?;

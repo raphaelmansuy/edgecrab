@@ -15,7 +15,10 @@ pub const MAX_INPUT_EXAMPLES_PER_TOOL: usize = 3;
 /// Look up 1–3 concrete argument examples for a tool name (if curated).
 pub fn input_examples_for_tool(name: &str) -> Vec<Value> {
     let examples = curated_examples(name);
-    examples.into_iter().take(MAX_INPUT_EXAMPLES_PER_TOOL).collect()
+    examples
+        .into_iter()
+        .take(MAX_INPUT_EXAMPLES_PER_TOOL)
+        .collect()
 }
 
 /// Build `tool_name → examples` for a set of activated names (skips empty).
@@ -46,10 +49,7 @@ fn curated_examples(name: &str) -> Vec<Value> {
             json!({"url": "http://127.0.0.1:8000/"}),
         ],
         "browser_click" => vec![json!({"ref": "e12"}), json!({"selector": "button.submit"})],
-        "browser_snapshot" => vec![
-            json!({}),
-            json!({"full_page": true}),
-        ],
+        "browser_snapshot" => vec![json!({}), json!({"full_page": true})],
         "browser_type" => vec![json!({"ref": "e5", "text": "search query"})],
         "read_file" => vec![
             json!({"path": "src/lib.rs"}),

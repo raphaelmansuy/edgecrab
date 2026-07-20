@@ -57,9 +57,7 @@ impl App {
                 (edgecrab_core::ApprovalChoice::Always, true) => {
                     "Enabled security.preview permanently (persisted)."
                 }
-                (edgecrab_core::ApprovalChoice::Deny, true) => {
-                    "Denied browser preview access."
-                }
+                (edgecrab_core::ApprovalChoice::Deny, true) => "Denied browser preview access.",
                 (edgecrab_core::ApprovalChoice::Once, false) => "Approved current command once.",
                 (edgecrab_core::ApprovalChoice::Session, false) => {
                     "Approved current command for the rest of this session."
@@ -200,7 +198,10 @@ impl App {
             ])
             .split(area);
 
-        let is_preview = matches!(kind, edgecrab_tools::registry::ApprovalKind::PreviewLoopback);
+        let is_preview = matches!(
+            kind,
+            edgecrab_tools::registry::ApprovalKind::PreviewLoopback
+        );
         let cmd_text = if is_preview {
             if full_command.is_empty() {
                 format!("Allow browser access to {command} for this session?")

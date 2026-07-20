@@ -76,7 +76,9 @@ impl Default for BrowserDiagnosticsReport {
 }
 
 /// Collect browser diagnostics (async: CDP probe + optional HTTP content probes).
-pub async fn collect_browser_diagnostics(input: BrowserDiagnosticsInput) -> BrowserDiagnosticsReport {
+pub async fn collect_browser_diagnostics(
+    input: BrowserDiagnosticsInput,
+) -> BrowserDiagnosticsReport {
     let policy = browser_launch_policy();
     let proxy_url = edgecrab_security::proxy::resolve_proxy_url(None);
     let recording_on = get_recording_override().unwrap_or(false);
@@ -185,12 +187,7 @@ pub async fn collect_browser_diagnostics(input: BrowserDiagnosticsInput) -> Brow
 fn resolve_mode_endpoint() -> (String, String, String, u16) {
     if let Some(ep) = cdp_override_status() {
         let (h, p) = split_host_port(&ep, 9222);
-        return (
-            "live CDP override".into(),
-            format!("{h}:{p}"),
-            h,
-            p,
-        );
+        return ("live CDP override".into(), format!("{h}:{p}"), h, p);
     }
     if let Ok(url) = std::env::var("BROWSER_CDP_URL") {
         let stripped = url
@@ -199,12 +196,7 @@ fn resolve_mode_endpoint() -> (String, String, String, u16) {
             .trim_start_matches("http://")
             .trim_start_matches("https://");
         let (h, p) = split_host_port(stripped.split('/').next().unwrap_or(stripped), 9222);
-        return (
-            "BROWSER_CDP_URL env".into(),
-            format!("{h}:{p}"),
-            h,
-            p,
-        );
+        return ("BROWSER_CDP_URL env".into(), format!("{h}:{p}"), h, p);
     }
     (
         "local headless Chrome/Chromium".into(),
@@ -361,8 +353,6 @@ pub fn format_browser_diagnostics(report: &BrowserDiagnosticsReport) -> String {
         },
         if report.preview_allow_any {
             " · any loopback port"
-        } else if !report.preview_ports.is_empty() {
-            ""
         } else {
             ""
         }
@@ -521,7 +511,10 @@ mod tests {
 
     #[test]
     fn split_host_port_works() {
-        assert_eq!(split_host_port("127.0.0.1:9333", 9222), ("127.0.0.1".into(), 9333));
+        assert_eq!(
+            split_host_port("127.0.0.1:9333", 9222),
+            ("127.0.0.1".into(), 9333)
+        );
         assert_eq!(split_host_port("9222", 1), ("127.0.0.1".into(), 9222));
     }
 

@@ -223,10 +223,10 @@ fn landed_visual_artifact(messages: &[Message]) -> bool {
         {
             return true;
         }
-        if let Some(p) = content
-            .lines()
-            .find_map(|line| line.strip_prefix("path: ").or_else(|| line.strip_prefix("\"path\":")))
-        {
+        if let Some(p) = content.lines().find_map(|line| {
+            line.strip_prefix("path: ")
+                .or_else(|| line.strip_prefix("\"path\":"))
+        }) {
             let cleaned = p.trim().trim_matches(',').trim_matches('"');
             if is_visual_artifact_path(cleaned) {
                 return true;
@@ -247,7 +247,10 @@ fn collect_mutation_paths_from_results(messages: &[Message]) -> Vec<String> {
         if msg.role != Role::Tool {
             continue;
         }
-        if !matches!(msg.name.as_deref(), Some("write_file" | "patch" | "apply_patch")) {
+        if !matches!(
+            msg.name.as_deref(),
+            Some("write_file" | "patch" | "apply_patch")
+        ) {
             continue;
         }
         let text = msg.text_content();
@@ -357,9 +360,9 @@ pub fn verify_targets_footer(class: TaskClass, cwd: Option<&std::path::Path>) ->
             "confirm artifact path exists with non-zero size (ls/stat); optional PDF/JPG export"
                 .into(),
         ),
-        TaskClass::MediaRender => Some(
-            "confirm render output path exists with non-zero size (mp4/webm/mov)".into(),
-        ),
+        TaskClass::MediaRender => {
+            Some("confirm render output path exists with non-zero size (mp4/webm/mov)".into())
+        }
         _ => None,
     }
 }
@@ -424,12 +427,7 @@ pub fn is_verification_tool_for_class(tool_name: &str, class: TaskClass) -> bool
         ),
         TaskClass::MediaRender => matches!(
             tool_name,
-            "write_file"
-                | "patch"
-                | "apply_patch"
-                | "terminal"
-                | "run_process"
-                | "execute_code"
+            "write_file" | "patch" | "apply_patch" | "terminal" | "run_process" | "execute_code"
         ),
         TaskClass::Research | TaskClass::General => is_general_verification_tool(tool_name),
     }
@@ -635,7 +633,10 @@ fn document_path_tokens(text: &str) -> Vec<String> {
     text.split_whitespace()
         .map(|t| {
             t.trim_matches(|c: char| {
-                matches!(c, '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']')
+                matches!(
+                    c,
+                    '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']'
+                )
             })
         })
         .filter(|t| is_document_path(t))
@@ -811,10 +812,8 @@ mod tests {
 
     #[test]
     fn pptx_path_hint_is_document() {
-        let class = TaskClassifier::classify(
-            "build the deck",
-            &["demo/pptx_raphael/Profile.pptx".into()],
-        );
+        let class =
+            TaskClassifier::classify("build the deck", &["demo/pptx_raphael/Profile.pptx".into()]);
         assert_eq!(class, TaskClass::Document);
     }
 
@@ -868,7 +867,10 @@ mod tests {
             "write_file",
             TaskClass::Document
         ));
-        assert!(is_verification_tool_for_class("terminal", TaskClass::Document));
+        assert!(is_verification_tool_for_class(
+            "terminal",
+            TaskClass::Document
+        ));
         assert!(!is_verification_tool_for_class(
             "browser_navigate",
             TaskClass::Document

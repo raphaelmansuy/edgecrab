@@ -25,8 +25,7 @@ impl PeerSkillHome {
         Self::OpenClaw,
     ];
 
-    pub const ALIASES: &'static [&'static str] =
-        &["claude", "codex", "pi", "agents", "openclaw"];
+    pub const ALIASES: &'static [&'static str] = &["claude", "codex", "pi", "agents", "openclaw"];
 
     pub fn parse(alias: &str) -> Option<Self> {
         match alias.trim().to_ascii_lowercase().as_str() {
@@ -121,7 +120,10 @@ fn discover_skill_dirs_inner(_root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with('.') && name != ".curated" && name != ".system" && name != ".experimental"
+        if name.starts_with('.')
+            && name != ".curated"
+            && name != ".system"
+            && name != ".experimental"
         {
             continue;
         }
@@ -164,10 +166,7 @@ pub fn import_skills_from(
             Ok(bundle) => {
                 let name = bundle.name.clone();
                 match install_skill(&bundle, skills_dir, gate) {
-                    Ok(msg) => installed.push(ImportItem {
-                        name,
-                        message: msg,
-                    }),
+                    Ok(msg) => installed.push(ImportItem { name, message: msg }),
                     Err(e) => {
                         if e.contains("already") || e.to_ascii_lowercase().contains("exists") {
                             skipped.push(format!("{name}: {e}"));
@@ -280,15 +279,22 @@ mod tests {
         )
         .unwrap();
 
-        let report = import_skills_from(peer.path().to_str().unwrap(), &skills_dir, InstallGate::default())
-            .unwrap();
+        let report = import_skills_from(
+            peer.path().to_str().unwrap(),
+            &skills_dir,
+            InstallGate::default(),
+        )
+        .unwrap();
         assert_eq!(report.installed.len(), 1);
         assert!(skills_dir.join("peer-skill").join("SKILL.md").is_file());
         // quarantine should be empty or cleaned after success
         let q = home.path().join("skills").join(".hub").join("quarantine");
         if q.is_dir() {
             let leftovers: Vec<_> = std::fs::read_dir(&q).unwrap().flatten().collect();
-            assert!(leftovers.is_empty(), "quarantine should be cleaned after commit");
+            assert!(
+                leftovers.is_empty(),
+                "quarantine should be cleaned after commit"
+            );
         }
     }
 }

@@ -215,9 +215,7 @@ mod tests {
 
         let mut tracker = SubdirectoryHintTracker::new(root);
         let args = serde_json::json!({"path": "backend/main.rs"});
-        let hint = tracker
-            .check_tool_call("read_file", &args)
-            .expect("hint");
+        let hint = tracker.check_tool_call("read_file", &args).expect("hint");
         assert!(hint.contains("Backend rules"));
         assert!(hint.contains("Subdirectory context discovered"));
 

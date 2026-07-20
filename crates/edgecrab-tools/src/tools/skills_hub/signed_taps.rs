@@ -226,10 +226,7 @@ pub fn pin_publisher_key(
 }
 
 /// Enforce TOFU: pinned key must match manifest (or pin on first sight).
-pub fn enforce_tofu(
-    verified: &VerifiedSignedTap,
-    allow_rotation: bool,
-) -> Result<String, String> {
+pub fn enforce_tofu(verified: &VerifiedSignedTap, allow_rotation: bool) -> Result<String, String> {
     let pins = read_pins();
     match pins.pins.get(&verified.publisher) {
         None => pin_publisher_key(&verified.publisher, &verified.public_key_b64, false),
@@ -260,25 +257,23 @@ pub fn load_and_verify_signed_tap_file(path: &Path) -> Result<VerifiedSignedTap,
 }
 
 /// Process `signed:<path>` tap add: verify, TOFU pin, register community→trusted tap stub.
-pub fn add_signed_tap_from_file(
-    path: &Path,
-    allow_rotation: bool,
-) -> Result<String, String> {
+pub fn add_signed_tap_from_file(path: &Path, allow_rotation: bool) -> Result<String, String> {
     let verified = load_and_verify_signed_tap_file(path)?;
     let tofu = enforce_tofu(&verified, allow_rotation)?;
     let name = format!("signed-{}", verified.publisher);
-    super::add_tap(
-        &name,
-        &format!("signed:{}", path.display()),
-        "trusted",
-    );
+    super::add_tap(&name, &format!("signed:{}", path.display()), "trusted");
     Ok(format!(
         "Added signed tap '{name}' for publisher '{}' (key_id={}).\n{tofu}\n\
          Skills in manifest: {}\n\
          Install still verifies content sha256 before commit.",
         verified.publisher,
         verified.key_id,
-        verified.skills.keys().cloned().collect::<Vec<_>>().join(", ")
+        verified
+            .skills
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 

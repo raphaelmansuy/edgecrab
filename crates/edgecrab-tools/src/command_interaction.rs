@@ -82,12 +82,8 @@ fn for_each_command_basename(command: &str, mut f: impl FnMut(&str) -> bool) -> 
             if trimmed.is_empty() {
                 continue;
             }
-            let tokens = shell_words::split(trimmed).unwrap_or_else(|_| {
-                trimmed
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect()
-            });
+            let tokens = shell_words::split(trimmed)
+                .unwrap_or_else(|_| trimmed.split_whitespace().map(str::to_string).collect());
             let mut idx = 0usize;
             while idx < tokens.len() {
                 let token = &tokens[idx];
@@ -600,7 +596,9 @@ mod tests {
             "sleep 4 && screencapture -x ./demo/docx_raphael/word.png"
         ));
         assert!(command_invokes_screencapture("/usr/sbin/screencapture -c"));
-        assert!(!command_invokes_screencapture("echo screencapture is a tool"));
+        assert!(!command_invokes_screencapture(
+            "echo screencapture is a tool"
+        ));
     }
 
     #[test]

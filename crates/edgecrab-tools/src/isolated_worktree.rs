@@ -15,7 +15,10 @@ pub struct IsolatedWorktreeInfo {
 }
 
 /// Create a git worktree under `<repo>/.edgecrab/worktrees/<task_id>/`.
-pub fn setup_isolated_worktree(repo_root: &Path, task_id: &str) -> Result<IsolatedWorktreeInfo, String> {
+pub fn setup_isolated_worktree(
+    repo_root: &Path,
+    task_id: &str,
+) -> Result<IsolatedWorktreeInfo, String> {
     let safe_id: String = task_id
         .chars()
         .map(|c| {

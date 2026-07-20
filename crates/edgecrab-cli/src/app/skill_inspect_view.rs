@@ -109,9 +109,10 @@ impl SkillInspectModel {
             .iter()
             .find(|f| f.path.eq_ignore_ascii_case("SKILL.md") || f.path.ends_with("/SKILL.md"));
         let has_skill_md = skill_md.is_some();
-        let (fm_name, fm_desc, body) = skill_md
-            .map(|f| parse_skill_md(&f.content))
-            .unwrap_or((None, None, String::new()));
+        let (fm_name, fm_desc, body) =
+            skill_md
+                .map(|f| parse_skill_md(&f.content))
+                .unwrap_or((None, None, String::new()));
         let excerpt = excerpt_lines(&body, 36);
         let mut bullets = capability_bullets_from_body(&body);
         bullets.extend(capability_bullets_from_paths(
@@ -345,10 +346,7 @@ pub fn render_inspect_dossier_lines(model: &SkillInspectModel, scroll: u16) -> V
     let warn = Style::default().fg(Color::Rgb(255, 191, 0));
 
     lines.push(Line::from(vec![
-        Span::styled(
-            format!("Inspect · {} ", model.catalog.name),
-            accent,
-        ),
+        Span::styled(format!("Inspect · {} ", model.catalog.name), accent),
         Span::styled(
             format!("{} ", model.catalog.source_label),
             Style::default().fg(Color::Rgb(110, 220, 210)),
@@ -573,14 +571,14 @@ mod tests {
             repo: Some("openai/skills".into()),
             path: Some("skills/.curated/demo".into()),
         };
-        let model = SkillInspectModel::from_catalog_and_preview(
-            catalog,
-            Some(&p),
-            false,
-            None,
-        );
+        let model = SkillInspectModel::from_catalog_and_preview(catalog, Some(&p), false, None);
         assert_eq!(model.frontmatter_name.as_deref(), Some("Demo Skill"));
-        assert!(model.skill_md_excerpt.iter().any(|l| l.contains("Demo Skill")));
+        assert!(
+            model
+                .skill_md_excerpt
+                .iter()
+                .any(|l| l.contains("Demo Skill"))
+        );
         assert!(
             model
                 .capability_bullets
@@ -589,7 +587,11 @@ mod tests {
         );
         assert_eq!(model.verdict.as_deref(), Some("safe"));
         let lines = render_inspect_dossier_lines(&model, 0);
-        assert!(lines.iter().any(|l| l.to_string().contains("WHAT IT CLAIMS")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string().contains("WHAT IT CLAIMS"))
+        );
     }
 
     #[test]

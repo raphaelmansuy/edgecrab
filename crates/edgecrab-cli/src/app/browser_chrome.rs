@@ -60,10 +60,7 @@ impl App {
         } else {
             area
         };
-        frame.render_widget(
-            List::new(items).style(Style::default().bg(bg)),
-            list_area,
-        );
+        frame.render_widget(List::new(items).style(Style::default().bg(bg)), list_area);
         if needs_scrollbar {
             let max_scroll = total.saturating_sub(max_visible.max(1));
             let mut scrollbar_state =

@@ -363,7 +363,10 @@ mod tests {
         let parsed = edgecrab_types::parse_tool_error_payload(&body)
             .expect("deferred soft-fail must be tool_error JSON");
         assert_eq!(parsed.response_type, "tool_error");
-        assert!(parsed.error.contains("vision_analyze") || parsed.tool.as_deref() == Some("vision_analyze"));
+        assert!(
+            parsed.error.contains("vision_analyze")
+                || parsed.tool.as_deref() == Some("vision_analyze")
+        );
         assert!(
             parsed
                 .recovery_feedback
@@ -418,7 +421,11 @@ mod tests {
         let schemas = vec![schema("browser_navigate"), schema("read_file")];
         let set = Arc::new(RwLock::new(MaterializedToolSet::new()));
         let out = materialize_tool_names(
-            &["browser_navigate".into(), "read_file".into(), "missing".into()],
+            &[
+                "browser_navigate".into(),
+                "read_file".into(),
+                "missing".into(),
+            ],
             &schemas,
             &set,
             12,
@@ -498,7 +505,11 @@ mod tests {
         let wire = wire_schemas(&schemas, &mat, true);
         let hot = wire.iter().find(|s| s.name == "read_file").unwrap();
         let deferred = wire.iter().find(|s| s.name == "browser_navigate").unwrap();
-        assert!(hot.parameters["properties"]["q"].get("description").is_some());
+        assert!(
+            hot.parameters["properties"]["q"]
+                .get("description")
+                .is_some()
+        );
         assert!(
             deferred.parameters["properties"]["q"]
                 .get("description")

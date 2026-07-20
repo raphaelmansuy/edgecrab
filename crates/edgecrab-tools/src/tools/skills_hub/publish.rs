@@ -73,7 +73,8 @@ fn publish_github(
         .or_else(|| std::env::var("EDGECRAB_SKILLS_PUBLISH_REPO").ok())
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| {
-            "GitHub publish requires --repo owner/repo (or EDGECRAB_SKILLS_PUBLISH_REPO)".to_string()
+            "GitHub publish requires --repo owner/repo (or EDGECRAB_SKILLS_PUBLISH_REPO)"
+                .to_string()
         })?;
 
     let branch = format!(

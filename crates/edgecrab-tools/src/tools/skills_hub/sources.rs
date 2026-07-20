@@ -493,9 +493,7 @@ async fn search_clawhub_listing(
 
 /// Fill ClawHub listing cache with a large limit (API has no offset).
 pub async fn ensure_clawhub_listing_catalog() -> Result<(), String> {
-    if clawhub_listing_catalog_complete()
-        && clawhub_listing_cache_len().is_some_and(|n| n > 0)
-    {
+    if clawhub_listing_catalog_complete() && clawhub_listing_cache_len().is_some_and(|n| n > 0) {
         return Ok(());
     }
     let client = hub_client()?;
@@ -1597,7 +1595,10 @@ pub async fn fetch_well_known_bundle(
     };
 
     // Prefer index.json file list when available
-    let index_url = format!("{}/.well-known/skills/index.json", base.trim_end_matches('/'));
+    let index_url = format!(
+        "{}/.well-known/skills/index.json",
+        base.trim_end_matches('/')
+    );
     ensure_safe_url(&index_url)?;
     if let Ok(resp) = client.get(&index_url).send().await
         && resp.status().is_success()

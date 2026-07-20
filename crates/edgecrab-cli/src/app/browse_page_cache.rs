@@ -168,8 +168,7 @@ mod tests {
 
     #[test]
     fn footer_loading_while_catalog_ensure_even_if_loaded_equals_hint() {
-        let label =
-            marketplace_browse_range_label_full(59, 19, 78, false, Some(78), true);
+        let label = marketplace_browse_range_label_full(59, 19, 78, false, Some(78), true);
         assert!(label.contains("loading"), "{label}");
         assert!(label.contains("of 78"), "{label}");
     }

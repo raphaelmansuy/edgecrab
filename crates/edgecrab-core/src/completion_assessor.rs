@@ -139,8 +139,7 @@ impl CompletionPolicy for DefaultCompletionPolicy {
         } else if ctx.evidence.visual_complete || ctx.evidence.media_complete {
             // 022 B1: latch done → Completed (ignore sticky ledger).
             let summary = if ctx.final_response.trim().is_empty() {
-                "Completed — request satisfied and verified (evidence latch)."
-                    .to_string()
+                "Completed — request satisfied and verified (evidence latch).".to_string()
             } else {
                 ctx.final_response.trim().to_string()
             };
@@ -369,17 +368,33 @@ fn collect_verification_summary(
         }
     }
 
+    // 025: product oracle (smoketest) counts as VisualUx evidence.
+    if task_class == TaskClass::VisualUx {
+        for msg in messages {
+            if msg.role != Role::Tool {
+                continue;
+            }
+            if !matches!(msg.name.as_deref(), Some("terminal" | "run_process")) {
+                continue;
+            }
+            let content = msg.text_content();
+            if visual_product_oracle_ok(&content) {
+                required = true;
+                evidence.push("terminal: product oracle (smoketest/check) passed".into());
+                break;
+            }
+        }
+        evidence.sort();
+        evidence.dedup();
+    }
+
     if task_class == TaskClass::VisualUx && verification_strict && required && evidence.is_empty() {
-        debt_reason = Some(
-            "Visual/UX task: enable security.preview and verify with browser or screenshot."
-                .to_string(),
-        );
+        debt_reason = Some(visual_ux_debt_reason(messages));
     }
 
     if task_class == TaskClass::Document && required && evidence.is_empty() {
-        debt_reason = Some(
-            "Document task: confirm .pptx/.pdf/.docx exists with non-zero size.".to_string(),
-        );
+        debt_reason =
+            Some("Document task: confirm .pptx/.pdf/.docx exists with non-zero size.".to_string());
     }
 
     VerificationSummary {
@@ -417,10 +432,9 @@ pub fn enrich_verification_with_contract(
         e.to_ascii_lowercase()
             .contains(&contract.verification.trim().to_ascii_lowercase())
     }) {
-        summary.evidence.push(format!(
-            "contract:{}",
-            contract.verification.trim()
-        ));
+        summary
+            .evidence
+            .push(format!("contract:{}", contract.verification.trim()));
         summary.evidence_present = true;
     }
     summary
@@ -428,6 +442,70 @@ pub fn enrich_verification_with_contract(
 
 fn is_mutation_verification_tool(name: &str) -> bool {
     matches!(name, "write_file" | "patch" | "apply_patch")
+}
+
+/// Command-shape fingerprint for VisualUx product oracles (025).
+pub fn visual_product_oracle_command(blob: &str) -> bool {
+    let lower = blob.to_ascii_lowercase();
+    lower.contains("smoketest")
+        || lower.contains("check.sh")
+        || lower.contains("scripts/check")
+        || lower.contains("npm test")
+        || lower.contains("make check")
+}
+
+/// Deterministic VisualUx product oracle (025) — smoketest / check.sh exit 0.
+///
+/// Law: structured terminal exit_code only + exact command fingerprint in body.
+pub fn visual_product_oracle_ok(content: &str) -> bool {
+    let Some(parsed) = edgecrab_tools::parse_terminal_result(content) else {
+        return false;
+    };
+    parsed.exit_code == 0 && visual_product_oracle_command(content)
+}
+
+/// State-conditioned VisualUx debt (025) — never stale “enable security.preview”
+/// after navigate already succeeded.
+pub fn visual_ux_debt_reason(messages: &[Message]) -> String {
+    let mut nav_ok = false;
+    let mut nav_ssrf = false;
+    let mut snapshot_attempted = false;
+    for msg in messages {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        let Some(name) = msg.name.as_deref() else {
+            continue;
+        };
+        let content = msg.text_content();
+        if name == "browser_navigate" {
+            if let Some(err) = parse_tool_error_payload(&content) {
+                let code = err.code.to_ascii_lowercase();
+                if code.contains("ssrf") || code.contains("preview") || code.contains("loopback") {
+                    nav_ssrf = true;
+                }
+            } else if edgecrab_tools::structured_browser_nav_succeeded(&content) == Some(true) {
+                nav_ok = true;
+            }
+        }
+        if matches!(name, "browser_snapshot" | "browser_vision") {
+            snapshot_attempted = true;
+        }
+    }
+    if nav_ssrf && !nav_ok {
+        return "Visual/UX task: enable security.preview (or grant loopback), then browser_navigate + browser_snapshot."
+            .into();
+    }
+    if nav_ok && !snapshot_attempted {
+        return "Visual/UX task: browser_navigate succeeded — run browser_snapshot (or browser_vision) on the latched URL."
+            .into();
+    }
+    if nav_ok {
+        return "Visual/UX task: capture browser_snapshot/browser_vision Ok evidence on the latched URL."
+            .into();
+    }
+    "Visual/UX task: verify with browser_navigate + browser_snapshot (enable security.preview if localhost is blocked)."
+        .into()
 }
 
 /// True when perception tool content is typed evidence (018 P6 first principles).
@@ -579,7 +657,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness,
             verification_strict: false,
-            evidence: Default::default(),        }
+            evidence: Default::default(),
+        }
     }
 
     #[test]
@@ -619,7 +698,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::BudgetExhausted);
@@ -641,7 +721,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Incomplete);
@@ -674,7 +755,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Blocked);
@@ -695,7 +777,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Blocked);
@@ -717,7 +800,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
 
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsUserInput);
@@ -911,7 +995,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
     }
@@ -947,7 +1032,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
         assert!(outcome.user_summary.contains("browser navigation"));
@@ -979,7 +1065,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
         assert!(outcome.user_summary.contains("markdown"));
@@ -1000,7 +1087,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: false,
-            evidence: Default::default(),        });
+            evidence: Default::default(),
+        });
         assert_eq!(outcome.state, CompletionDecision::Failed);
         assert_eq!(outcome.exit_reason, ExitReason::InvalidToolBudget);
         assert!(outcome.user_summary.contains("quick_stock_quote"));
@@ -1056,7 +1144,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness,
             verification_strict: false,
-            evidence: Default::default(),        });
+            evidence: Default::default(),
+        });
         assert_eq!(outcome.state, CompletionDecision::Failed);
         assert_eq!(outcome.exit_reason, ExitReason::InvalidToolBudget);
     }
@@ -1135,7 +1224,8 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
     }
@@ -1194,8 +1284,33 @@ mod tests {
             child_runs_in_flight: 0,
             harness: HarnessSnapshot::default(),
             verification_strict: true,
-            evidence: Default::default(),        };
+            evidence: Default::default(),
+        };
         let outcome = assess_completion(&ctx);
         assert_eq!(outcome.state, CompletionDecision::Completed);
+    }
+
+    #[test]
+    fn bal_025_product_oracle_and_debt_reasons() {
+        assert!(visual_product_oracle_ok(
+            "[terminal_result status=success backend=local cwd=/demo exit_code=0]\nnode smoketest.js\nok\n"
+        ));
+        assert!(!visual_product_oracle_ok(
+            "[terminal_result status=success backend=local cwd=/demo exit_code=0]\nls -la\n"
+        ));
+        let nav = Message::tool_result(
+            "n1",
+            "browser_navigate",
+            &edgecrab_tools::StructuredBrowserResult::navigate_ok(
+                "http://127.0.0.1:8000/",
+                "SimCity",
+            )
+            .to_tool_result_json(),
+        );
+        let debt = visual_ux_debt_reason(&[nav]);
+        assert!(debt.contains("browser_snapshot") || debt.contains("browser_vision"));
+        assert!(!debt.starts_with(
+            "Visual/UX task: enable security.preview and verify with browser or screenshot."
+        ));
     }
 }

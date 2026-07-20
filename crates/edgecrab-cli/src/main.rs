@@ -39,7 +39,6 @@ mod gateway_cmd;
 mod gateway_presentation;
 mod gateway_setup;
 mod grok_auth_tui;
-mod xai_credentials;
 mod honcho_cmd;
 mod image_models;
 mod live_progress;
@@ -88,6 +87,7 @@ mod status_indicator;
 mod status_summaries;
 mod stream_bridge;
 mod stream_dispatch_harness;
+mod stream_presentation;
 mod subagent_tree;
 mod theme;
 mod tool_display;
@@ -106,6 +106,7 @@ mod web_setup_tui;
 mod webhook_cmd;
 mod whatsapp_cmd;
 mod worktree;
+mod xai_credentials;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,10 +115,10 @@ use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use clap::{CommandFactory, Parser};
 use edgecrab_plugins::{discover_plugins, invoke_hermes_cli_command};
+use edgequake_llm::traits::StreamChunk;
 use edgequake_llm::{
     ChatMessage, CompletionOptions, LLMProvider, LLMResponse, ToolChoice, ToolDefinition,
 };
-use edgequake_llm::traits::StreamChunk;
 use futures::stream::BoxStream;
 use shell_words::split as shell_split;
 use tokio_util::sync::CancellationToken;
@@ -320,10 +321,7 @@ impl OAuthRefreshingProvider {
     }
 
     fn clone_inner(&self) -> Arc<dyn LLMProvider> {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn store_inner(&self, provider: Arc<dyn LLMProvider>) {
@@ -1988,8 +1986,8 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
             args,
             rest,
         } => {
-            let auth_kind = mcp_register::McpAuthKind::parse(&auth)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let auth_kind =
+                mcp_register::McpAuthKind::parse(&auth).map_err(|e| anyhow::anyhow!(e))?;
             let req = mcp_register::RegisterMcpRequest::from_cli_parts(
                 name,
                 url,
@@ -2111,7 +2109,9 @@ fn stream_event_ndjson_line(event: &edgecrab_core::StreamEvent) -> Option<String
     let value = match event {
         StreamEvent::Token(text) => serde_json::json!({"kind": "token", "text": text}),
         StreamEvent::Reasoning(text) => serde_json::json!({"kind": "reasoning", "text": text}),
-        StreamEvent::ToolExec { name, .. } => serde_json::json!({"kind": "tool_exec", "name": name}),
+        StreamEvent::ToolExec { name, .. } => {
+            serde_json::json!({"kind": "tool_exec", "name": name})
+        }
         StreamEvent::ToolDone { name, is_error, .. } => {
             serde_json::json!({"kind": "tool_done", "name": name, "is_error": is_error})
         }
@@ -2354,8 +2354,7 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 )
                 .map_err(|e| anyhow::anyhow!(e))?;
                 let skill_name = bundle.name.clone();
-                match edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, gate)
-                {
+                match edgecrab_tools::tools::skills_hub::install_skill(&bundle, &skills_dir, gate) {
                     Ok(message) => {
                         if json {
                             println!(
@@ -2421,12 +2420,14 @@ async fn run_skills(command: SkillsCommand) -> anyhow::Result<()> {
                 yes,
                 ..Default::default()
             };
-            let report = edgecrab_tools::tools::skills_hub::import_skills_from(
-                &spec, &skills_dir, gate,
-            )
-            .map_err(|e| anyhow::anyhow!(e))?;
+            let report =
+                edgecrab_tools::tools::skills_hub::import_skills_from(&spec, &skills_dir, gate)
+                    .map_err(|e| anyhow::anyhow!(e))?;
             if json {
-                println!("{}", serde_json::to_string(&report).unwrap_or_else(|_| report.format()));
+                println!(
+                    "{}",
+                    serde_json::to_string(&report).unwrap_or_else(|_| report.format())
+                );
             } else {
                 println!("{}", report.format());
             }

@@ -52,9 +52,10 @@ impl ContextBudgetBreakdown {
 
     /// Session cumulative cache hit rate: `cache_read / (input-ish + cache)`.
     pub fn cache_hit_rate_pct(&self) -> Option<f64> {
-        let denom = self
-            .last_prompt_tokens
-            .max(self.cache_read_tokens.saturating_add(self.cache_write_tokens));
+        let denom = self.last_prompt_tokens.max(
+            self.cache_read_tokens
+                .saturating_add(self.cache_write_tokens),
+        );
         if denom == 0 || self.cache_read_tokens == 0 {
             return None;
         }

@@ -111,6 +111,12 @@ pub struct HarnessConfig {
     /// Browser tools allowed after Perceive Ok (0 = hard stop thrash).
     #[serde(default = "default_post_perceive_browser_budget")]
     pub post_perceive_browser_budget: u32,
+    /// Max `[system: do not stop yet]` reopens per turn (025 / Hermes verify-on-stop cap).
+    #[serde(default = "default_max_completion_reopens")]
+    pub max_completion_reopens: u32,
+    /// When true, inject mid-budget wrap-up text into the model (L8: default off — Hermes removed this).
+    #[serde(default)]
+    pub inject_budget_pressure: bool,
 }
 
 fn default_verify_on_stop() -> bool {
@@ -133,6 +139,10 @@ fn default_post_perceive_browser_budget() -> u32 {
     0
 }
 
+fn default_max_completion_reopens() -> u32 {
+    2
+}
+
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
@@ -144,6 +154,8 @@ impl Default for HarnessConfig {
             thrash_fingerprint_limit: default_thrash_fingerprint_limit(),
             heal_budget: default_heal_budget(),
             post_perceive_browser_budget: default_post_perceive_browser_budget(),
+            max_completion_reopens: default_max_completion_reopens(),
+            inject_budget_pressure: false,
         }
     }
 }
@@ -2339,7 +2351,8 @@ impl Default for DisplayConfig {
         Self {
             compact: false,
             personality: "default".into(),
-            show_reasoning: false,
+            // Default on so SuperGrok / reasoning models stream thinking into the TUI.
+            show_reasoning: true,
             streaming: true,
             tool_progress: ToolProgressMode::Verbose,
             show_status_bar: true,

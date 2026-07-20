@@ -1905,9 +1905,27 @@ fn mcp_tool_name_looks_readonly(original_name: &str) -> bool {
     let n = original_name.to_ascii_lowercase();
     // Explicit mutating prefixes first
     const MUTATING: &[&str] = &[
-        "create", "update", "delete", "remove", "write", "put", "post", "patch",
-        "set", "send", "execute", "run", "apply", "insert", "drop", "mutate",
-        "upload", "publish", "invoke", "call_service", "trigger",
+        "create",
+        "update",
+        "delete",
+        "remove",
+        "write",
+        "put",
+        "post",
+        "patch",
+        "set",
+        "send",
+        "execute",
+        "run",
+        "apply",
+        "insert",
+        "drop",
+        "mutate",
+        "upload",
+        "publish",
+        "invoke",
+        "call_service",
+        "trigger",
     ];
     for m in MUTATING {
         if n.starts_with(m) || n.contains(&format!("_{m}")) || n.contains(&format!("{m}_")) {
@@ -1915,10 +1933,12 @@ fn mcp_tool_name_looks_readonly(original_name: &str) -> bool {
         }
     }
     const READONLY: &[&str] = &[
-        "list", "get", "read", "search", "find", "fetch", "query", "describe",
-        "show", "status", "info", "view", "lookup", "count", "head", "stat",
+        "list", "get", "read", "search", "find", "fetch", "query", "describe", "show", "status",
+        "info", "view", "lookup", "count", "head", "stat",
     ];
-    READONLY.iter().any(|p| n.starts_with(p) || n.contains(&format!("_{p}")) || n.contains(&format!("{p}_")))
+    READONLY
+        .iter()
+        .any(|p| n.starts_with(p) || n.contains(&format!("_{p}")) || n.contains(&format!("{p}_")))
 }
 
 impl McpDynamicTool {

@@ -337,17 +337,15 @@ pub fn is_browser_esm_artifact(cwd: &Path, rel_path: &str) -> bool {
             || norm.contains("/demo/")
             || norm.starts_with("demo/")
     };
-    if under_demos {
-        if let Ok(body) = std::fs::read_to_string(&full) {
-            let head: String = body.chars().take(512).collect();
-            let trimmed = head.trim_start();
-            if trimmed.starts_with("import ")
-                || trimmed.starts_with("export ")
-                || trimmed.contains("\nimport ")
-                || trimmed.contains("\nexport ")
-            {
-                return true;
-            }
+    if under_demos && let Ok(body) = std::fs::read_to_string(&full) {
+        let head: String = body.chars().take(512).collect();
+        let trimmed = head.trim_start();
+        if trimmed.starts_with("import ")
+            || trimmed.starts_with("export ")
+            || trimmed.contains("\nimport ")
+            || trimmed.contains("\nexport ")
+        {
+            return true;
         }
     }
 

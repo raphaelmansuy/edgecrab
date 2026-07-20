@@ -3,9 +3,8 @@ set -euo pipefail
 BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${PORT:-8080}"
 
-echo "🔍 Checking Pinguin Adventure 3D scaffold..."
+echo "🔍 Checking Pinguin Slide Party scaffold..."
 
-# Static file presence
 for f in index.html styles.css js/game.js js/ui.js; do
   if [[ ! -f "$BASEDIR/$f" ]]; then
     echo "❌ Missing file: $f"
@@ -14,7 +13,6 @@ for f in index.html styles.css js/game.js js/ui.js; do
   echo "✅ $f present"
 done
 
-# Import map existence
 if grep -q 'importmap' "$BASEDIR/index.html"; then
   echo "✅ Import map found"
 else
@@ -22,7 +20,6 @@ else
   exit 1
 fi
 
-# Module script reference
 if grep -q 'js/game.js' "$BASEDIR/index.html"; then
   echo "✅ Game module linked"
 else
@@ -30,7 +27,23 @@ else
   exit 1
 fi
 
-# Start a server and test
+# Core fun systems present
+for needle in "COMBO_WINDOW" "createPenguin" "activatePower" "updateCompass" "belly-slide\|Belly-slide\|slideBoost"; do
+  if grep -qE "$needle" "$BASEDIR/js/game.js"; then
+    echo "✅ Game feature: $needle"
+  else
+    echo "❌ Missing game feature: $needle"
+    exit 1
+  fi
+done
+
+if grep -q 'AudioEngine' "$BASEDIR/js/ui.js" && grep -q 'collect(' "$BASEDIR/js/ui.js"; then
+  echo "✅ Audio SFX helpers present"
+else
+  echo "❌ Audio helpers incomplete"
+  exit 1
+fi
+
 python3 -m http.server "$PORT" --directory "$BASEDIR" &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" >/dev/null 2>&1 || true' EXIT
@@ -45,7 +58,7 @@ if [[ "$HTTP_STATUS" -ne 200 ]]; then
 fi
 echo "✅ Server responds HTTP 200"
 
-for needle in "Pinguin Adventure 3D" "Start Adventure" "Fish" "game-canvas"; do
+for needle in "Pinguin Slide Party" "Start Sliding" "Fish" "game-canvas" "combo-panel"; do
   if curl -s "http://localhost:$PORT/" | grep -q "$needle"; then
     echo "✅ Found in HTML: $needle"
   else
@@ -53,6 +66,13 @@ for needle in "Pinguin Adventure 3D" "Start Adventure" "Fish" "game-canvas"; do
     exit 1
   fi
 done
+
+JS_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/js/game.js")
+if [[ "$JS_STATUS" -ne 200 ]]; then
+  echo "❌ game.js HTTP $JS_STATUS"
+  exit 1
+fi
+echo "✅ game.js serves HTTP 200"
 
 echo ""
 echo "🎮 Open http://localhost:$PORT to play"

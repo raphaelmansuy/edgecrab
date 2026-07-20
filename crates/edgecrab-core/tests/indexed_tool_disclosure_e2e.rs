@@ -11,9 +11,9 @@ use std::sync::{Arc, RwLock};
 use edgecrab_core::AgentBuilder;
 use edgecrab_tools::{
     AUTO_INDEXED_TOOL_COUNT_THRESHOLD, AppConfigRef, MaterializeSchemaStyle, MaterializedToolSet,
-    ToolContext, ToolRegistry, ToolSchemaMode, build_wire_llm_definitions,
-    materialize_tool_names, prefetch_tools_for_user_message, read_materialized_set,
-    resolve_effective_schema_mode, wire_schemas,
+    ToolContext, ToolRegistry, ToolSchemaMode, build_wire_llm_definitions, materialize_tool_names,
+    prefetch_tools_for_user_message, read_materialized_set, resolve_effective_schema_mode,
+    wire_schemas,
 };
 use edgecrab_types::{Platform, ToolSchema};
 use edgequake_llm::providers::MockAgentProvider;
@@ -330,11 +330,7 @@ async fn tool_search_returns_input_examples_for_write_file() {
     let mat = Arc::new(RwLock::new(MaterializedToolSet::new()));
     let ctx = schema_ctx(registry.clone(), mat);
     let out = registry
-        .dispatch(
-            "tool_search",
-            json!({ "tool_names": ["write_file"] }),
-            &ctx,
-        )
+        .dispatch("tool_search", json!({ "tool_names": ["write_file"] }), &ctx)
         .await
         .expect("dispatch");
     let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
@@ -413,13 +409,8 @@ fn prefetch_materializes_before_first_llm_call() {
         hits.iter().any(|n| n.contains("browser")),
         "prefetch should hit browser tools: {hits:?}"
     );
-    let outcome = materialize_tool_names(
-        &hits,
-        &schemas,
-        &mat,
-        12,
-        MaterializeSchemaStyle::Compact,
-    );
+    let outcome =
+        materialize_tool_names(&hits, &schemas, &mat, 12, MaterializeSchemaStyle::Compact);
     assert!(!outcome.activated.is_empty());
     let wire = build_wire_llm_definitions(
         &registry,

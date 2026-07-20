@@ -2,7 +2,7 @@
 
 use super::anthropic::resolve_anthropic_oauth_access_token;
 use super::codex::{DEFAULT_CODEX_BASE_URL, resolve_codex_access_token};
-use super::{is_xai_oauth_alias, XAI_OAUTH_PROVIDER};
+use super::{XAI_OAUTH_PROVIDER, is_xai_oauth_alias};
 
 fn env_nonempty(key: &str) -> bool {
     std::env::var(key)
@@ -23,8 +23,7 @@ fn openai_key_from_env() -> bool {
 /// Covers: `xai`, `grok`, `super-grok`, and OAuth aliases.
 pub fn provider_needs_xai_credentials(provider: &str) -> bool {
     let p = provider.to_ascii_lowercase();
-    matches!(p.as_str(), "xai" | "grok" | "super-grok" | "super_grok")
-        || is_xai_oauth_alias(&p)
+    matches!(p.as_str(), "xai" | "grok" | "super-grok" | "super_grok") || is_xai_oauth_alias(&p)
 }
 
 /// Env flag set when `XAI_API_KEY` was injected from SuperGrok OAuth (not a static key).

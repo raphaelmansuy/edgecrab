@@ -25,6 +25,8 @@ pub struct OutputLine {
     /// Whether [`expandable_body`] is shown instead of the collapsed spans.
     pub expanded: bool,
     pub(crate) collapsed_prebuilt_spans: Option<Vec<Span<'static>>>,
+    /// Truncated / collapsed plain text restored when leaving Expanded (thinking cards).
+    pub(crate) collapsed_text: Option<String>,
     pub(crate) rendered: Option<Vec<Line<'static>>>,
     pub(crate) plain_rendered: Option<Vec<Line<'static>>>,
 }
@@ -48,6 +50,7 @@ impl OutputLine {
             expandable_body: None,
             expanded: false,
             collapsed_prebuilt_spans: None,
+            collapsed_text: None,
             rendered: None,
             plain_rendered: None,
         }
@@ -61,6 +64,7 @@ impl OutputLine {
             expandable_body: None,
             expanded: false,
             collapsed_prebuilt_spans: None,
+            collapsed_text: None,
             rendered: None,
             plain_rendered: None,
         }
@@ -88,6 +92,11 @@ impl OutputLine {
         self.expandable_body = Some(body);
     }
 
+    /// Update Truncated preview while Expanded (live thinking stream).
+    pub(crate) fn set_collapsed_text_preview(&mut self, preview: String) {
+        self.collapsed_text = Some(preview);
+    }
+
     pub fn toggle_expand(&mut self) -> bool {
         let Some(body) = self.expandable_body.clone() else {
             return false;
@@ -95,10 +104,18 @@ impl OutputLine {
         self.expanded = !self.expanded;
         if self.expanded {
             self.collapsed_prebuilt_spans = self.prebuilt_spans.take();
+            if !self.text.is_empty() {
+                self.collapsed_text = Some(std::mem::take(&mut self.text));
+            }
             self.text = body;
             self.prebuilt_spans = None;
         } else {
-            self.text.clear();
+            // Restore Truncated / Collapsed text when present (thinking cards).
+            if let Some(preview) = self.collapsed_text.take() {
+                self.text = preview;
+            } else {
+                self.text.clear();
+            }
             self.prebuilt_spans = self.collapsed_prebuilt_spans.take();
         }
         self.invalidate_render_cache();
@@ -171,8 +188,9 @@ pub fn render_transcript_rich(
                     OutputRole::System => Style::default()
                         .fg(Color::Rgb(140, 140, 150))
                         .add_modifier(Modifier::ITALIC),
+                    // Quiet weight vs answer (Grok bg_blend feel).
                     OutputRole::Reasoning => Style::default()
-                        .fg(Color::Rgb(170, 170, 190))
+                        .fg(Color::Rgb(130, 135, 155))
                         .add_modifier(Modifier::ITALIC | Modifier::DIM),
                     OutputRole::Error => Style::default().fg(Color::Rgb(239, 83, 80)),
                     OutputRole::User => Style::default().fg(Color::Rgb(255, 248, 220)),
@@ -429,7 +447,7 @@ pub fn render_transcript_compact(
             .fg(Color::Rgb(155, 165, 175))
             .add_modifier(Modifier::DIM),
         OutputRole::Reasoning => Style::default()
-            .fg(Color::Rgb(145, 150, 170))
+            .fg(Color::Rgb(130, 135, 155))
             .add_modifier(Modifier::DIM),
         OutputRole::Error => Style::default().fg(Color::Rgb(239, 83, 80)),
         OutputRole::User => Style::default().fg(Color::Rgb(255, 248, 220)),

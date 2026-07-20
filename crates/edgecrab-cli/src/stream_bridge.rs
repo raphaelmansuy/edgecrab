@@ -4,10 +4,39 @@
 
 use std::time::Instant;
 
-use crate::turn_activity::{ActivityTone, TurnActivityState};
+use crate::stream_presentation::{ChromePhaseHint, StreamPresentation};
+use crate::turn_activity::{ActivityTone, ShelfPhase, TurnActivityState};
 
-/// Hermes `THINKING_COT_MAX` — reasoning snippet budget on the shelf.
-pub const THINKING_COT_MAX: usize = 160;
+/// Sync shelf phase from presentation `TurnPhase` (single chrome owner — 024 W1).
+///
+/// Does not override blocking wait phases (approval / clarify).
+pub fn sync_shelf_phase_from_presentation(
+    activity: &mut TurnActivityState,
+    presentation: &StreamPresentation,
+) {
+    if matches!(
+        activity.phase,
+        ShelfPhase::WaitingForApproval | ShelfPhase::WaitingForClarify
+    ) {
+        return;
+    }
+    let generating = activity.generating_tool.is_some();
+    let hint = presentation.chrome_phase_hint(generating);
+    let target = match hint {
+        ChromePhaseHint::Idle => ShelfPhase::Idle,
+        ChromePhaseHint::AwaitingFirstToken => ShelfPhase::AwaitingFirstToken,
+        ChromePhaseHint::Thinking => ShelfPhase::Thinking,
+        ChromePhaseHint::GeneratingTool => ShelfPhase::GeneratingTool,
+        ChromePhaseHint::ToolExec => ShelfPhase::ToolExec,
+        ChromePhaseHint::Streaming => ShelfPhase::Streaming,
+    };
+    if activity.phase != target {
+        activity.set_phase(target);
+    }
+}
+
+/// Hermes `THINKING_COT_MAX` — reasoning **tail** budget on the shelf (024: accumulate full buffer).
+pub const THINKING_COT_MAX: usize = 240;
 
 /// Detect markdown heading landmarks in streaming tokens (status bar section hint).
 pub fn extract_streaming_section(token: &str, current_section: &mut Option<String>) {
@@ -85,8 +114,19 @@ pub fn apply_llm_wait_progress(
     state.on_llm_wait_progress(provider, elapsed_secs, has_tools, ctx);
 }
 
-pub fn apply_reasoning_delta(state: &mut TurnActivityState, text: &str) {
-    state.on_reasoning(text);
+/// Sync shelf thinking peek from presentation (sole buffer — 024 thinking polish).
+///
+/// `delta` is only used for rough token estimate; full CoT lives in `presentation`.
+pub fn apply_reasoning_delta(
+    state: &mut TurnActivityState,
+    presentation: &crate::stream_presentation::StreamPresentation,
+    delta: &str,
+) {
+    let snippet = presentation
+        .shelf_thinking_snippet()
+        .map(|s| truncate_reasoning_snippet(&s))
+        .filter(|s| !s.is_empty());
+    state.sync_thinking_from_presentation(snippet, presentation.shelf_thinking_truncated(), delta);
 }
 
 pub fn apply_activity_notice(state: &mut TurnActivityState, text: String, tone: ActivityTone) {
@@ -135,9 +175,18 @@ pub fn maybe_agents_nudge(state: &mut TurnActivityState, nudged: &mut bool) {
     );
 }
 
-/// Truncate reasoning for shelf display (centralized budget).
+/// Truncate reasoning for shelf display (centralized budget) — **tail**, not prefix.
 pub fn truncate_reasoning_snippet(text: &str) -> String {
-    edgecrab_core::safe_truncate(text.trim(), THINKING_COT_MAX).to_string()
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let count = trimmed.chars().count();
+    if count <= THINKING_COT_MAX {
+        return trimmed.to_string();
+    }
+    let rev: String = trimmed.chars().rev().take(THINKING_COT_MAX).collect();
+    format!("…{}", rev.chars().rev().collect::<String>())
 }
 
 #[cfg(test)]
@@ -251,7 +300,9 @@ mod tests {
     fn reasoning_snippet_respects_cot_max() {
         let long = "x".repeat(300);
         let trimmed = truncate_reasoning_snippet(&long);
-        assert!(trimmed.chars().count() <= THINKING_COT_MAX);
+        // Tail truncate may include a leading ellipsis character.
+        assert!(trimmed.chars().count() <= THINKING_COT_MAX + 1);
+        assert!(trimmed.ends_with('x'));
     }
 
     #[test]

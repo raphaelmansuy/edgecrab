@@ -69,7 +69,8 @@ use crate::display_state::{
     DisplayState, ValueCaptureAction, VoicePresenceState, voice_presence_frame_count,
 };
 use crate::edit_diff::{
-    EditStats, EditVerbGroup, LocalEditSnapshot, capture_local_edit_snapshot, render_edit_diff_card,
+    EditStats, EditVerbGroup, LocalEditSnapshot, build_editing_running_spans,
+    capture_local_edit_snapshot, render_edit_diff_card,
 };
 use crate::fuzzy_selector::{FuzzyItem, FuzzySelector};
 use crate::gateway_browser::{
@@ -111,6 +112,7 @@ use crate::status_bar::{
 use crate::status_chrome::{TerminalGlyphProfile, compact_spinner_frame, format_elapsed_hint};
 use crate::status_summaries::{ActiveSubagentStatus, BackgroundTaskStatus};
 use crate::stream_bridge;
+use crate::stream_presentation::{ActionVerbGroup, ToolCardKind, VerbGroupKind};
 use crate::theme::{SkinConfig, Theme, palette as P};
 use crate::tool_display::{
     DisplayWidths, build_subagent_done_line_width, build_subagent_running_line_width,
@@ -4253,6 +4255,8 @@ pub struct App {
     collapsed_tool_fail: Option<CollapsedToolFail>,
     /// Consecutive successful edit tools merge into one "Edited N files" header.
     edit_verb_group: Option<EditVerbGroup>,
+    /// Consecutive successful read/search tools merge into "Read N files" / "Searched N".
+    action_verb_group: Option<ActionVerbGroup>,
     /// In-flight sub-agent placeholder lines keyed by `task_index`.
     ///
     /// Mirrors `pending_tool_lines` for the delegated-child sub-agent lifecycle:
@@ -4268,6 +4272,8 @@ pub struct App {
     bg_process_lines: std::collections::HashMap<String, BgProcessLine>,
     /// Turn-scoped live activity for the activity shelf.
     turn_activity: TurnActivityState,
+    /// Thinking/tool stream cards (024) — phase + finished thinking for transcript.
+    stream_presentation: crate::stream_presentation::StreamPresentation,
     shelf_coalescer: ShelfCoalescer,
     /// `/tail` overlay for background process output.
     process_tail_panel: ProcessTailPanel,
@@ -4701,13 +4707,23 @@ impl App {
         self.pending_tool_lines.clear();
         self.collapsed_tool_fail = None;
         self.edit_verb_group = None;
+        self.action_verb_group = None;
         self.pending_subagent_lines.clear();
         self.hidden_tool_calls.clear();
         self.seen_tool_signatures.clear();
         self.display_state = DisplayState::Idle;
         self.turn_activity.reset_turn();
+        self.stream_presentation.reset_turn();
         self.agents_nudged_this_turn = false;
         self.clear_clarify_pending();
+    }
+
+    /// Drive shelf phase from presentation TurnPhase (024 single chrome owner).
+    fn sync_presentation_chrome(&mut self) {
+        stream_bridge::sync_shelf_phase_from_presentation(
+            &mut self.turn_activity,
+            &self.stream_presentation,
+        );
     }
 
     fn restore_clarify_input_border(&mut self) {
@@ -5026,6 +5042,66 @@ impl App {
         had_active_request
     }
 
+    /// Close SuperGrok thinking stream into a transcript card (collapsed header + expand body).
+    fn finalize_thinking_stream_card(&mut self) {
+        // Presentation is the sole CoT buffer (DRY).
+        let Some(card) = self.stream_presentation.on_responding_or_tool() else {
+            self.turn_activity.clear_thinking_peek();
+            return;
+        };
+        self.turn_activity.clear_thinking_peek();
+        let label = card.collapsed_label();
+        let text = card.text;
+        if text.trim().is_empty() {
+            return;
+        }
+        // If we were streaming reasoning into a live line, rewrite header and attach body.
+        if let Some(idx) = self.reasoning_line.take()
+            && idx < self.output.len()
+        {
+            let body = if text.len() > 12_000 {
+                format!(
+                    "{}\n…(truncated)",
+                    edgecrab_core::safe_truncate(&text, 12_000)
+                )
+            } else {
+                text.clone()
+            };
+            self.output[idx].text = label;
+            self.output[idx].role = OutputRole::Reasoning;
+            self.output[idx].expanded = false;
+            self.output[idx].collapsed_text = None;
+            self.output[idx].collapsed_prebuilt_spans = None;
+            self.output[idx].prebuilt_spans = None;
+            self.output[idx].attach_expandable_body_always(body);
+            self.output[idx].invalidate_render_cache();
+            self.needs_redraw = true;
+            return;
+        }
+        // show_reasoning off: still leave a collapsed Thought card in history.
+        let mut line = OutputLine::new_text(label, OutputRole::Reasoning);
+        let body = if text.len() > 12_000 {
+            format!(
+                "{}\n…(truncated)",
+                edgecrab_core::safe_truncate(&text, 12_000)
+            )
+        } else {
+            text
+        };
+        line.attach_expandable_body_always(body);
+        if let Some(idx) = self.streaming_line {
+            let insert_idx = idx.min(self.output.len());
+            self.output.insert(insert_idx, line);
+            self.streaming_line = Some(insert_idx + 1);
+        } else {
+            self.output.push(line);
+        }
+        if self.at_bottom {
+            self.scroll_offset = 0;
+        }
+        self.needs_redraw = true;
+    }
+
     fn flush_buffered_assistant_output(&mut self) {
         if self.buffered_assistant_output.is_empty() {
             return;
@@ -5270,11 +5346,13 @@ impl App {
             pending_tool_lines: std::collections::HashMap::new(),
             collapsed_tool_fail: None,
             edit_verb_group: None,
+            action_verb_group: None,
             pending_subagent_lines: std::collections::HashMap::new(),
             hidden_tool_calls: HashSet::new(),
             seen_tool_signatures: HashSet::new(),
             bg_process_lines: std::collections::HashMap::new(),
             turn_activity: TurnActivityState::new(display_preferences.activity_shelf_enabled),
+            stream_presentation: crate::stream_presentation::StreamPresentation::new(),
             shelf_coalescer: ShelfCoalescer::new(),
             process_tail_panel: ProcessTailPanel::default(),
             agents_overlay: AgentsOverlay::default(),
@@ -5618,6 +5696,15 @@ impl App {
                 group.header_line_idx = Some(header_idx - 1);
             }
         }
+        if let Some(group) = self.action_verb_group.as_mut()
+            && let Some(header_idx) = group.header_line_idx
+        {
+            if header_idx == idx {
+                group.header_line_idx = None;
+            } else if header_idx > idx {
+                group.header_line_idx = Some(header_idx - 1);
+            }
+        }
         for pending in self.pending_subagent_lines.values_mut() {
             if pending.line_idx > idx {
                 pending.line_idx -= 1;
@@ -5678,6 +5765,13 @@ impl App {
 
         let path = card.presentation.path_display.clone();
         let stats = card.presentation.stats;
+        self.stream_presentation
+            .record_edit(&path, stats.plus, stats.minus);
+        for extra in &card.presentation.extra_paths {
+            self.stream_presentation.record_edit(extra, 0, 0);
+        }
+        // Successful edit breaks a read/search verb group.
+        self.action_verb_group = None;
 
         // ── Verb group: merge consecutive successful edits ───────────────
         if self.edit_verb_group.is_none() {
@@ -5751,6 +5845,107 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Merge consecutive Read / Search successes into one verb-group header (024 W4).
+    ///
+    /// `reuse_line_idx` is the just-written tool-done line to convert into the
+    /// group header (or remove when merging into a prior header).
+    fn push_read_search_verb_group(
+        &mut self,
+        tool_name: &str,
+        item: &str,
+        is_error: bool,
+        reuse_line_idx: Option<usize>,
+    ) {
+        let Some(kind) = VerbGroupKind::from_tool(tool_name) else {
+            return;
+        };
+        if !matches!(kind, VerbGroupKind::Read | VerbGroupKind::Search) {
+            return;
+        }
+        if is_error {
+            self.action_verb_group = None;
+            return;
+        }
+        // Edits use EditVerbGroup; break that group on read/search.
+        self.edit_verb_group = None;
+
+        let item = if item.trim().is_empty() {
+            tool_name.to_string()
+        } else {
+            item.trim().to_string()
+        };
+
+        let verb_spans = |label: String| -> Vec<ratatui::text::Span<'static>> {
+            use ratatui::style::{Modifier, Style};
+            use ratatui::text::Span;
+            vec![
+                Span::styled(
+                    "  ┊ ".to_string(),
+                    Style::default()
+                        .fg(ratatui::style::Color::Rgb(55, 58, 70))
+                        .add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    "◆ ".to_string(),
+                    Style::default().fg(ratatui::style::Color::Rgb(150, 160, 185)),
+                ),
+                Span::styled(
+                    label,
+                    Style::default().fg(ratatui::style::Color::Rgb(180, 190, 210)),
+                ),
+            ]
+        };
+
+        match self.action_verb_group.as_mut() {
+            Some(group) if group.kind == kind => {
+                group.push_item(&item);
+                let label = group.header_label(false);
+                let body = group.expandable_list();
+                let header_idx = group.header_line_idx;
+                if let Some(idx) = header_idx
+                    && idx < self.output.len()
+                {
+                    self.output[idx].prebuilt_spans = Some(verb_spans(label));
+                    self.output[idx].attach_expandable_body_always(body);
+                    self.output[idx].invalidate_render_cache();
+                }
+                // Drop the duplicate just-written done line when merging.
+                if let Some(idx) = reuse_line_idx
+                    && header_idx.is_some_and(|h| h != idx)
+                {
+                    self.remove_output_line(idx);
+                }
+            }
+            _ => {
+                let mut group = ActionVerbGroup::new(kind, item);
+                let label = group.header_label(false);
+                let body = group.expandable_list();
+                let header_idx =
+                    if let Some(idx) = reuse_line_idx.filter(|i| *i < self.output.len()) {
+                        self.output[idx].prebuilt_spans = Some(verb_spans(label));
+                        self.output[idx].text.clear();
+                        self.output[idx].attach_expandable_body_always(body);
+                        self.output[idx].invalidate_render_cache();
+                        idx
+                    } else {
+                        let idx = self.output.len();
+                        self.push_output_spans(verb_spans(label), OutputRole::Tool);
+                        let last = self.output.len().saturating_sub(1);
+                        if last < self.output.len() {
+                            self.output[last].attach_expandable_body_always(body);
+                        }
+                        idx
+                    };
+                group.header_line_idx = Some(header_idx);
+                self.action_verb_group = Some(group);
+            }
+        }
+        if self.at_bottom {
+            self.scroll_offset = 0;
+        }
+        self.needs_redraw = true;
+    }
+
     /// Drop oldest transcript lines when over Hermes `MAX_HISTORY` (800).
     fn prune_transcript_if_needed(&mut self) {
         use crate::transcript_scroll::{prune_count, shift_line_index};
@@ -5790,6 +5985,16 @@ impl App {
             .and_then(|idx| shift_line_index(idx, removed));
         if let Some(idx) = self.streaming_line {
             self.streaming_line = shift_line_index(idx, removed);
+        }
+        if let Some(group) = self.edit_verb_group.as_mut() {
+            group.header_line_idx = group
+                .header_line_idx
+                .and_then(|idx| shift_line_index(idx, removed));
+        }
+        if let Some(group) = self.action_verb_group.as_mut() {
+            group.header_line_idx = group
+                .header_line_idx
+                .and_then(|idx| shift_line_index(idx, removed));
         }
     }
 
@@ -5938,6 +6143,7 @@ impl App {
         self.pending_tool_lines.clear();
         self.collapsed_tool_fail = None;
         self.edit_verb_group = None;
+        self.action_verb_group = None;
         self.hidden_tool_calls.clear();
         self.seen_tool_signatures.clear();
         // Request a full terminal repaint.  ratatui's diff-based renderer
@@ -5975,6 +6181,8 @@ impl App {
         self.display_state = DisplayState::Idle;
         self.spawn_history.clear();
         self.clear_clarify_pending();
+        self.stream_presentation.clear_session_ledger();
+        self.stream_presentation.reset_turn();
         self.clear_output();
         if show_banner {
             let model = self.model_name.clone();
@@ -7472,10 +7680,8 @@ impl App {
     /// Fully leave the Skills Marketplace (cancel in-flight browse/search).
     /// Used by mouse dismiss; Esc keeps layered Back via [`apply_marketplace_action`].
     fn dismiss_skills_marketplace(&mut self) {
-        self.remote_skill_browser.next_request_id = self
-            .remote_skill_browser
-            .next_request_id
-            .saturating_add(1);
+        self.remote_skill_browser.next_request_id =
+            self.remote_skill_browser.next_request_id.saturating_add(1);
         self.remote_skill_browser.clear_loading();
         self.remote_skill_browser.abort_catalog_ensure();
         self.remote_skill_browser.search_due_at = None;
@@ -7497,15 +7703,16 @@ impl App {
     }
 
     /// Geometry for remote SearchRemote / Inspect mouse hit-testing.
-    fn skills_marketplace_remote_hit_rects(
-        &self,
-        area: Rect,
-    ) -> (Rect, Rect, Rect, Rect) {
+    fn skills_marketplace_remote_hit_rects(&self, area: Rect) -> (Rect, Rect, Rect, Rect) {
         let inspecting = matches!(
             self.skills_marketplace_mode,
             skills_marketplace::MarketplaceMode::Inspect { .. }
         );
-        let footer_h = if self.skills_marketplace_help { 4u16 } else { 1 };
+        let footer_h = if self.skills_marketplace_help {
+            4u16
+        } else {
+            1
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -7549,7 +7756,8 @@ impl App {
             MarketplaceModeKind::ConfirmSafe => {
                 match skills_marketplace::confirm_safe_button_hit(area, column, row) {
                     Some(true) => {
-                        let _ = self.apply_marketplace_action(MarketplaceAction::ConfirmSafeInstall);
+                        let _ =
+                            self.apply_marketplace_action(MarketplaceAction::ConfirmSafeInstall);
                         (true, true)
                     }
                     Some(false) => {
@@ -7597,14 +7805,12 @@ impl App {
                 (true, false)
             }
             MarketplaceModeKind::SearchRemote | MarketplaceModeKind::Inspect => {
-                let (header, list, detail, footer) =
-                    self.skills_marketplace_remote_hit_rects(area);
+                let (header, list, detail, footer) = self.skills_marketplace_remote_hit_rects(area);
                 if skills_marketplace::rect_contains_cell(list, column, row) {
                     let viewport = list.height.max(1) as usize;
                     let selected = self.remote_skill_browser.selector.selected;
                     let total = self.remote_skill_browser.selector.filtered.len();
-                    let (scroll_start, _) =
-                        Self::browser_virtual_window(selected, total, viewport);
+                    let (scroll_start, _) = Self::browser_virtual_window(selected, total, viewport);
                     let row_offset = row.saturating_sub(list.y) as usize;
                     let idx = scroll_start + row_offset;
                     if idx < total {
@@ -7683,7 +7889,9 @@ impl App {
         self.remote_skill_browser.abort_catalog_ensure();
         self.remote_skill_browser.abort_inflight_search();
         self.remote_skill_browser.source_filter = filter.map(str::to_string);
-        self.remote_skill_browser.browse_page_cache.reset_for_browse();
+        self.remote_skill_browser
+            .browse_page_cache
+            .reset_for_browse();
         // Allow rebrowse even if prior empty-query load is still marked loading.
         self.remote_skill_browser.loading_query = None;
         self.schedule_remote_skill_search(true);
@@ -7691,7 +7899,8 @@ impl App {
     }
 
     fn open_skills_import_from_picker(&mut self) {
-        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::ImportFrom { selected: 0 };
+        self.skills_marketplace_mode =
+            skills_marketplace::MarketplaceMode::ImportFrom { selected: 0 };
         self.needs_redraw = true;
     }
 
@@ -7706,8 +7915,7 @@ impl App {
             .iter()
             .position(|p| (*p).eq_ignore_ascii_case(cur))
             .unwrap_or(0);
-        self.skills_marketplace_mode =
-            skills_marketplace::MarketplaceMode::SourcePick { selected };
+        self.skills_marketplace_mode = skills_marketplace::MarketplaceMode::SourcePick { selected };
         self.needs_redraw = true;
     }
 
@@ -7756,10 +7964,7 @@ impl App {
 
     /// Single apply path for marketplace keymap side effects (019 C5 SOLID).
     /// Returns true when the action was handled (caller should `return` from key dispatch).
-    fn apply_marketplace_action(
-        &mut self,
-        action: skills_marketplace::MarketplaceAction,
-    ) -> bool {
+    fn apply_marketplace_action(&mut self, action: skills_marketplace::MarketplaceAction) -> bool {
         use skills_marketplace::{IMPORT_FROM_PEERS, MarketplaceAction, MarketplaceMode};
         match action {
             MarketplaceAction::Noop => false,
@@ -7799,8 +8004,7 @@ impl App {
                 true
             }
             MarketplaceAction::SourcePickMoveUp => {
-                if let MarketplaceMode::SourcePick { selected } =
-                    &mut self.skills_marketplace_mode
+                if let MarketplaceMode::SourcePick { selected } = &mut self.skills_marketplace_mode
                 {
                     *selected = selected.saturating_sub(1);
                     self.needs_redraw = true;
@@ -7808,8 +8012,7 @@ impl App {
                 true
             }
             MarketplaceAction::SourcePickMoveDown => {
-                if let MarketplaceMode::SourcePick { selected } =
-                    &mut self.skills_marketplace_mode
+                if let MarketplaceMode::SourcePick { selected } = &mut self.skills_marketplace_mode
                 {
                     let max = skills_marketplace::marketplace_provider_filters()
                         .len()
@@ -7913,9 +8116,12 @@ impl App {
                 if let MarketplaceMode::ConfirmSafe { identifier, .. } =
                     self.skills_marketplace_mode.clone()
                 {
-                    let entry = self.remote_skill_browser.selector.current().cloned().filter(
-                        |e| e.identifier == identifier,
-                    );
+                    let entry = self
+                        .remote_skill_browser
+                        .selector
+                        .current()
+                        .cloned()
+                        .filter(|e| e.identifier == identifier);
                     if let Some(entry) = entry {
                         let gate = self
                             .remote_skill_guard
@@ -7991,8 +8197,7 @@ impl App {
             stage: skills_marketplace::InstallStage::Fetch,
         };
         self.skills_install_stage_started = Some(Instant::now());
-        self.remote_skill_browser.action_in_flight =
-            Some(format!("import-from {peer}"));
+        self.remote_skill_browser.action_in_flight = Some(format!("import-from {peer}"));
         self.needs_redraw = true;
         self.rt_handle.spawn(async move {
             let _ = tx.send(AgentResponse::RemoteSkillInstallProgress {
@@ -8076,8 +8281,7 @@ impl App {
         let query = self.remote_skill_browser.current_query();
         self.remote_skill_browser.search_due_at = None;
         let source_filter = self.remote_skill_browser.source_filter.clone();
-        let load_key =
-            Self::remote_skill_search_load_key(&query, source_filter.as_deref());
+        let load_key = Self::remote_skill_search_load_key(&query, source_filter.as_deref());
         if self.remote_skill_browser.loading_query.as_deref() == Some(load_key.as_str()) {
             return;
         }
@@ -8093,7 +8297,9 @@ impl App {
         self.remote_skill_browser.loading_spinner_frame = 0;
         self.remote_skill_browser.browse_partials_seen = 0;
         if query.is_empty() {
-            self.remote_skill_browser.browse_page_cache.reset_for_browse();
+            self.remote_skill_browser
+                .browse_page_cache
+                .reset_for_browse();
             // Retain prior rows (or empty → skeleton). Never blank-wipe mid-fetch.
             // First partial for this request_id replaces; later partials merge.
             self.remote_skill_browser.notices.clear();
@@ -8107,9 +8313,7 @@ impl App {
             50
         };
         let limit = edgecrab_tools::tools::skills_hub::marketplace_result_limit(
-            filter_key,
-            requested,
-            browse,
+            filter_key, requested, browse,
         );
         let tx = self.response_tx.clone();
         let join = self.rt_handle.spawn(async move {
@@ -8322,12 +8526,19 @@ impl App {
         };
         let (entries, notices) = Self::build_remote_skill_entries(&report);
         let first_paint = self.remote_skill_browser.browse_partials_seen == 0;
-        self.remote_skill_browser.browse_partials_seen =
-            self.remote_skill_browser.browse_partials_seen.saturating_add(1);
+        self.remote_skill_browser.browse_partials_seen = self
+            .remote_skill_browser
+            .browse_partials_seen
+            .saturating_add(1);
         if first_paint {
             // Drop retained prior-source rows on first live paint of this request.
             for notice in notices {
-                if !self.remote_skill_browser.notices.iter().any(|n| n == &notice) {
+                if !self
+                    .remote_skill_browser
+                    .notices
+                    .iter()
+                    .any(|n| n == &notice)
+                {
                     self.remote_skill_browser.notices.push(notice);
                 }
             }
@@ -8344,8 +8555,11 @@ impl App {
             self.merge_remote_skill_entries(entries, notices, query.trim().is_empty());
         }
         let loaded = self.remote_skill_browser.selector.items.len();
-        self.remote_skill_browser.browse_page_cache.fetch_cursor =
-            self.remote_skill_browser.browse_page_cache.fetch_cursor.max(loaded);
+        self.remote_skill_browser.browse_page_cache.fetch_cursor = self
+            .remote_skill_browser
+            .browse_page_cache
+            .fetch_cursor
+            .max(loaded);
         // Debounce guard preview during progressive stream (~250ms).
         self.schedule_remote_skill_guard_preview_debounced();
         self.needs_redraw = true;
@@ -8377,7 +8591,12 @@ impl App {
         } else {
             // No partials arrived — replace retained prior rows with the final report.
             for notice in notices {
-                if !self.remote_skill_browser.notices.iter().any(|n| n == &notice) {
+                if !self
+                    .remote_skill_browser
+                    .notices
+                    .iter()
+                    .any(|n| n == &notice)
+                {
                     self.remote_skill_browser.notices.push(notice);
                 }
             }
@@ -8439,7 +8658,12 @@ impl App {
             return;
         }
         for notice in notices {
-            if !self.remote_skill_browser.notices.iter().any(|n| n == &notice) {
+            if !self
+                .remote_skill_browser
+                .notices
+                .iter()
+                .any(|n| n == &notice)
+            {
                 self.remote_skill_browser.notices.push(notice);
             }
         }
@@ -8476,7 +8700,11 @@ impl App {
         if items.len() <= cap {
             return;
         }
-        let selected = self.remote_skill_browser.selector.selected.min(items.len() - 1);
+        let selected = self
+            .remote_skill_browser
+            .selector
+            .selected
+            .min(items.len() - 1);
         let radius = page.saturating_mul(3);
         let start = selected.saturating_sub(radius);
         let end = (selected + radius + 1).min(items.len());
@@ -10445,8 +10673,8 @@ impl App {
                     .last_left_click
                     .map(|t| now.duration_since(t).as_millis() <= 400)
                     .unwrap_or(false);
-                let (marketplace_consumed, suppress_capture_toggle) = self
-                    .handle_skills_marketplace_mouse(event.column, event.row, is_double);
+                let (marketplace_consumed, suppress_capture_toggle) =
+                    self.handle_skills_marketplace_mouse(event.column, event.row, is_double);
                 if !marketplace_consumed {
                     self.completion.active = false;
                     self.model_selector.active = false;
@@ -10591,6 +10819,7 @@ impl App {
             started: Instant::now(),
         };
         self.turn_activity.reset_turn();
+        self.stream_presentation.reset_turn();
         self.turn_activity.set_phase(ShelfPhase::AwaitingFirstToken);
         self.agents_nudged_this_turn = false;
         self.shelf_coalescer.force_paint(Instant::now());
@@ -11645,8 +11874,10 @@ impl App {
             animated = true;
         }
         if self.remote_mcp_browser.inflight_request_id.is_some() {
-            self.remote_mcp_browser.loading_spinner_frame =
-                self.remote_mcp_browser.loading_spinner_frame.wrapping_add(1);
+            self.remote_mcp_browser.loading_spinner_frame = self
+                .remote_mcp_browser
+                .loading_spinner_frame
+                .wrapping_add(1);
             animated = true;
         }
         // SuperGrok OAuth exchange — live elapsed + drain completion off busy.
@@ -13808,11 +14039,7 @@ impl App {
         lines.push(String::new());
         lines.push("For full diagnostics run: edgecrab doctor".into());
 
-        self.open_report_overlay(
-            "Doctor",
-            "In-session diagnostics",
-            lines.join("\n"),
-        );
+        self.open_report_overlay("Doctor", "In-session diagnostics", lines.join("\n"));
     }
 
     fn handle_show_cost(&mut self) {
@@ -15193,8 +15420,7 @@ impl App {
                 "show" => (agent.goal_show().await, None),
                 "draft" => match agent.goal_draft(&draft_args).await {
                     Ok(msg) => {
-                        let (goal_text, _) =
-                            edgecrab_types::parse_goal_with_contract(&draft_args);
+                        let (goal_text, _) = edgecrab_types::parse_goal_with_contract(&draft_args);
                         // Kickoff from drafted goal text after set (goal_draft calls goal_set).
                         let state_goal = agent
                             .goal_state()
@@ -17173,6 +17399,15 @@ impl App {
         tool_name: &str,
         args_json: &str,
     ) -> bool {
+        let kind = ToolCardKind::classify(tool_name);
+        // 024 W2/W3: execute / edit / read / search get durable transcript cards
+        // even when the activity shelf owns the live phase strip.
+        if kind.prefers_live_transcript_card() {
+            if self.tool_progress_mode == ToolProgressMode::Off {
+                return false;
+            }
+            return self.should_render_tool_call(tool_name, args_json);
+        }
         if self.turn_activity.enabled {
             return false;
         }
@@ -19156,7 +19391,8 @@ impl App {
                     match crate::auth_cmd::open_grok_authorize_url(&url) {
                         Ok(()) => true,
                         Err(e) => {
-                            self.grok_auth.set_start_result(url.clone(), path.clone(), false);
+                            self.grok_auth
+                                .set_start_result(url.clone(), path.clone(), false);
                             self.grok_auth.set_error(format!(
                                 "Could not open browser: {e}. Press o to retry, or open the URL shown below."
                             ));
@@ -19262,19 +19498,15 @@ impl App {
                             },
                         ),
                     }));
-                    let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(
-                        format!(
-                            "SuperGrok OAuth token applied to live agent ({model}). Ready to chat."
-                        ),
-                    )));
+                    let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(format!(
+                        "SuperGrok OAuth token applied to live agent ({model}). Ready to chat."
+                    ))));
                 }
                 Err(err) => {
-                    let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(
-                        format!(
-                            "SuperGrok login saved, but applying credentials failed: {err}\n\
+                    let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::SystemMsg(format!(
+                        "SuperGrok login saved, but applying credentials failed: {err}\n\
                              Run /model {model} or restart EdgeCrab."
-                        ),
-                    )));
+                    ))));
                 }
             }
         });
@@ -19318,12 +19550,9 @@ impl App {
         let join = self.rt_handle.spawn(async move {
             const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
             let outcome = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
-                let msg = crate::auth_cmd::grok_auth_finish_for_ui_with_pending(
-                    code,
-                    pending_path,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+                let msg = crate::auth_cmd::grok_auth_finish_for_ui_with_pending(code, pending_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 // Inject bearer into process env BEFORE notifying TUI so Done is ready to chat.
                 if let Err(e) = crate::xai_credentials::prepare_xai_credentials_with_preference(
                     false,
@@ -19350,10 +19579,12 @@ impl App {
             } else {
                 None
             };
-            let _ = tx.send(AgentResponse::BgOp(BackgroundOpResult::GrokAuthFinishDone {
-                result,
-                restore_code: restore,
-            }));
+            let _ = tx.send(AgentResponse::BgOp(
+                BackgroundOpResult::GrokAuthFinishDone {
+                    result,
+                    restore_code: restore,
+                },
+            ));
         });
         self.grok_auth.begin_finish_busy(join.abort_handle());
     }
@@ -19417,9 +19648,7 @@ impl App {
                     .grok_auth
                     .pending_path
                     .as_ref()
-                    .map(|p| {
-                        edgecrab_proxy::peek_xai_pending_session(Some(p.as_path())).is_some()
-                    })
+                    .map(|p| edgecrab_proxy::peek_xai_pending_session(Some(p.as_path())).is_some())
                     .unwrap_or_else(crate::auth_cmd::grok_has_valid_pending_session);
 
                 if !pending_ok {
@@ -19453,9 +19682,8 @@ impl App {
                     Err(e) => {
                         let msg = e.to_string();
                         if crate::auth_cmd::is_grok_pending_expired_error(&msg) {
-                            self.grok_auth.set_error(format!(
-                                "{msg}\nPress Enter to restart sign-in."
-                            ));
+                            self.grok_auth
+                                .set_error(format!("{msg}\nPress Enter to restart sign-in."));
                         } else {
                             self.grok_auth.set_error(format!(
                                 "{msg}\nTip: press p to load clipboard, or Enter for the paste prompt."
@@ -21015,13 +21243,15 @@ impl App {
                 cfg.apply_security_runtime();
             }
             let report = self.rt_handle.block_on(async {
-                edgecrab_tools::collect_browser_diagnostics(edgecrab_tools::BrowserDiagnosticsInput {
-                    session_id,
-                    preview_enabled,
-                    preview_allow_any,
-                    preview_ports,
-                    max_port_probes: 6,
-                })
+                edgecrab_tools::collect_browser_diagnostics(
+                    edgecrab_tools::BrowserDiagnosticsInput {
+                        session_id,
+                        preview_enabled,
+                        preview_allow_any,
+                        preview_ports,
+                        max_port_probes: 6,
+                    },
+                )
                 .await
             });
             let mut lines = edgecrab_tools::format_browser_diagnostics(&report);
@@ -24143,23 +24373,24 @@ kind = "skill"
         let mut app = App::new();
         app.open_remote_skill_selector(None);
         app.remote_skill_browser.clear_loading();
-        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
-            name: "prior".into(),
-            identifier: "openai/skills/prior".into(),
-            description: "kept while rebrowsing".into(),
-            source_label: "Unified Index".into(),
-            origin: "local".into(),
-            trust_level: "official".into(),
-            tags: vec![],
-            search_text: "prior".into(),
-            installed_name: None,
-            action: RemoteSkillAction::Install,
-            url: None,
-            repo: None,
-            path: None,
-        }]);
-        app.remote_skill_browser.browse_snapshot =
-            app.remote_skill_browser.selector.items.clone();
+        app.remote_skill_browser
+            .selector
+            .set_items(vec![RemoteSkillEntry {
+                name: "prior".into(),
+                identifier: "openai/skills/prior".into(),
+                description: "kept while rebrowsing".into(),
+                source_label: "Unified Index".into(),
+                origin: "local".into(),
+                trust_level: "official".into(),
+                tags: vec![],
+                search_text: "prior".into(),
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                url: None,
+                repo: None,
+                path: None,
+            }]);
+        app.remote_skill_browser.browse_snapshot = app.remote_skill_browser.selector.items.clone();
         app.remote_skill_browser.browse_snapshot_filter = None;
 
         app.schedule_remote_skill_search(true);
@@ -24189,10 +24420,12 @@ kind = "skill"
             std::env::set_var("EDGECRAB_HOME", dir.path());
         }
         let skills_dir = dir.path().join("skills");
-        std::fs::create_dir_all(skills_dir.join("nested").join("deep-skill"))
-            .expect("nested");
+        std::fs::create_dir_all(skills_dir.join("nested").join("deep-skill")).expect("nested");
         std::fs::write(
-            skills_dir.join("nested").join("deep-skill").join("SKILL.md"),
+            skills_dir
+                .join("nested")
+                .join("deep-skill")
+                .join("SKILL.md"),
             "# deep",
         )
         .expect("skill");
@@ -24385,16 +24618,19 @@ kind = "skill"
         app.remote_skill_browser.browse_page_cache.fetch_cursor = 80;
 
         // First page already loaded in the selector.
-        let page1 = edgecrab_tools::tools::skills_hub::browse_skills_sh_cache_slice(0, 80)
-            .expect("page1");
-        let (entries, _) = App::build_remote_skill_entries(
-            &edgecrab_tools::tools::skills_hub::SearchReport {
+        let page1 =
+            edgecrab_tools::tools::skills_hub::browse_skills_sh_cache_slice(0, 80).expect("page1");
+        let (entries, _) =
+            App::build_remote_skill_entries(&edgecrab_tools::tools::skills_hub::SearchReport {
                 groups: vec![page1],
-            },
-        );
+            });
         app.remote_skill_browser.selector.set_items(entries);
-        app.remote_skill_browser.selector.selected =
-            app.remote_skill_browser.selector.items.len().saturating_sub(1);
+        app.remote_skill_browser.selector.selected = app
+            .remote_skill_browser
+            .selector
+            .items
+            .len()
+            .saturating_sub(1);
 
         let before = app.remote_skill_browser.selector.items.len();
         assert_eq!(before, 80);
@@ -24429,21 +24665,23 @@ kind = "skill"
         app.remote_skill_browser.browse_page_cache.stream_complete = true;
         app.remote_skill_browser.browse_page_cache.page_size = 80;
         app.remote_skill_browser.browse_page_cache.fetch_cursor = 100;
-        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
-            name: "last".into(),
-            identifier: "skills.sh:owner/repo/skill-099".into(),
-            description: "last".into(),
-            source_label: "skills.sh".into(),
-            origin: "https://skills.sh".into(),
-            trust_level: "community".into(),
-            tags: vec![],
-            search_text: "last".into(),
-            installed_name: None,
-            action: RemoteSkillAction::Install,
-            url: None,
-            repo: None,
-            path: None,
-        }]);
+        app.remote_skill_browser
+            .selector
+            .set_items(vec![RemoteSkillEntry {
+                name: "last".into(),
+                identifier: "skills.sh:owner/repo/skill-099".into(),
+                description: "last".into(),
+                source_label: "skills.sh".into(),
+                origin: "https://skills.sh".into(),
+                trust_level: "community".into(),
+                tags: vec![],
+                search_text: "last".into(),
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                url: None,
+                repo: None,
+                path: None,
+            }]);
         app.remote_skill_browser.selector.selected = 0;
 
         app.maybe_extend_browse_cache();
@@ -24475,21 +24713,23 @@ kind = "skill"
         app.remote_skill_browser.browse_page_cache.stream_complete = true;
         app.remote_skill_browser.browse_page_cache.page_size = 80;
         app.remote_skill_browser.browse_page_cache.fetch_cursor = 78;
-        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
-            name: "last".into(),
-            identifier: "skills.sh:owner/repo/skill-077".into(),
-            description: "last".into(),
-            source_label: "skills.sh".into(),
-            origin: "https://skills.sh".into(),
-            trust_level: "community".into(),
-            tags: vec![],
-            search_text: "last".into(),
-            installed_name: None,
-            action: RemoteSkillAction::Install,
-            url: None,
-            repo: None,
-            path: None,
-        }]);
+        app.remote_skill_browser
+            .selector
+            .set_items(vec![RemoteSkillEntry {
+                name: "last".into(),
+                identifier: "skills.sh:owner/repo/skill-077".into(),
+                description: "last".into(),
+                source_label: "skills.sh".into(),
+                origin: "https://skills.sh".into(),
+                trust_level: "community".into(),
+                tags: vec![],
+                search_text: "last".into(),
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                url: None,
+                repo: None,
+                path: None,
+            }]);
         app.remote_skill_browser.selector.selected = 0;
 
         app.maybe_extend_browse_cache();
@@ -24550,14 +24790,17 @@ kind = "skill"
 
         let page1 = edgecrab_tools::tools::skills_hub::browse_github_cache_slice("openai", 0, 80)
             .expect("page1");
-        let (entries, _) = App::build_remote_skill_entries(
-            &edgecrab_tools::tools::skills_hub::SearchReport {
+        let (entries, _) =
+            App::build_remote_skill_entries(&edgecrab_tools::tools::skills_hub::SearchReport {
                 groups: vec![page1],
-            },
-        );
+            });
         app.remote_skill_browser.selector.set_items(entries);
-        app.remote_skill_browser.selector.selected =
-            app.remote_skill_browser.selector.items.len().saturating_sub(1);
+        app.remote_skill_browser.selector.selected = app
+            .remote_skill_browser
+            .selector
+            .items
+            .len()
+            .saturating_sub(1);
 
         let before = app.remote_skill_browser.selector.items.len();
         assert_eq!(before, 80);
@@ -24593,18 +24836,21 @@ kind = "skill"
         app.remote_skill_browser.browse_page_cache.page_size = 80;
         app.remote_skill_browser.browse_page_cache.fetch_cursor = 0;
 
-        let page1 = edgecrab_tools::tools::skills_hub::browse_skills_sh_cache_slice(0, 80)
-            .expect("page1");
-        let (entries, _) = App::build_remote_skill_entries(
-            &edgecrab_tools::tools::skills_hub::SearchReport {
+        let page1 =
+            edgecrab_tools::tools::skills_hub::browse_skills_sh_cache_slice(0, 80).expect("page1");
+        let (entries, _) =
+            App::build_remote_skill_entries(&edgecrab_tools::tools::skills_hub::SearchReport {
                 groups: vec![page1],
-            },
-        );
+            });
         app.remote_skill_browser.selector.set_items(entries);
         // Pretend cursor is still at 0 (would re-fetch dups) — extend must skip ahead.
         app.remote_skill_browser.browse_page_cache.fetch_cursor = 0;
-        app.remote_skill_browser.selector.selected =
-            app.remote_skill_browser.selector.items.len().saturating_sub(1);
+        app.remote_skill_browser.selector.selected = app
+            .remote_skill_browser
+            .selector
+            .items
+            .len()
+            .saturating_sub(1);
 
         let before = app.remote_skill_browser.selector.items.len();
         app.maybe_extend_browse_cache();
@@ -24737,7 +24983,10 @@ kind = "skill"
         let area = Rect::new(0, 0, 100, 30);
         let (_h, list, _d, _f) = app.skills_marketplace_remote_hit_rects(area);
         let click_row = list.y.saturating_add(1);
-        assert!(app.handle_skills_marketplace_mouse(list.x + 2, click_row, false).0);
+        assert!(
+            app.handle_skills_marketplace_mouse(list.x + 2, click_row, false)
+                .0
+        );
         assert!(app.remote_skill_browser.selector.active);
         assert_eq!(app.remote_skill_browser.selector.selected, 1);
         assert_eq!(
@@ -24755,9 +25004,7 @@ kind = "skill"
         app.remote_skill_browser.loading_query = Some("openai::*browse*".into());
         app.remote_skill_browser.source_filter = Some("openai".into());
         let prev_id = app.remote_skill_browser.next_request_id;
-        assert!(app.apply_marketplace_action(
-            skills_marketplace::MarketplaceAction::JumpSource(0)
-        ));
+        assert!(app.apply_marketplace_action(skills_marketplace::MarketplaceAction::JumpSource(0)));
         assert_eq!(
             app.remote_skill_browser.source_filter.as_deref(),
             None,
@@ -24862,21 +25109,23 @@ kind = "skill"
     async fn search_remote_lowercase_letters_type_into_query_not_install() {
         let mut app = App::new();
         app.open_remote_skill_selector(None);
-        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
-            source_label: "skills.sh".into(),
-            trust_level: "community".into(),
-            name: "seo".into(),
-            identifier: "skills.sh:owner/repo/seo".into(),
-            description: "seo skill".into(),
-            origin: "https://skills.sh".into(),
-            tags: vec![],
-            installed_name: None,
-            action: RemoteSkillAction::Install,
-            search_text: "seo".into(),
-            url: None,
-            repo: None,
-            path: None,
-        }]);
+        app.remote_skill_browser
+            .selector
+            .set_items(vec![RemoteSkillEntry {
+                source_label: "skills.sh".into(),
+                trust_level: "community".into(),
+                name: "seo".into(),
+                identifier: "skills.sh:owner/repo/seo".into(),
+                description: "seo skill".into(),
+                origin: "https://skills.sh".into(),
+                tags: vec![],
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                search_text: "seo".into(),
+                url: None,
+                repo: None,
+                path: None,
+            }]);
         app.remote_skill_browser.selector.selected = 0;
         app.remote_skill_browser.search_due_at = None;
 
@@ -24928,21 +25177,23 @@ kind = "skill"
     async fn inspect_mode_lowercase_a_does_not_mutate_query() {
         let mut app = App::new();
         app.open_remote_skill_selector(None);
-        app.remote_skill_browser.selector.set_items(vec![RemoteSkillEntry {
-            source_label: "OpenAI".into(),
-            trust_level: "trusted".into(),
-            name: "demo".into(),
-            identifier: "openai/skills/demo".into(),
-            description: "demo".into(),
-            origin: "https://github.com/openai/skills".into(),
-            tags: vec![],
-            installed_name: None,
-            action: RemoteSkillAction::Install,
-            search_text: "demo".into(),
-            url: None,
-            repo: Some("openai/skills".into()),
-            path: Some("skills/.curated/demo".into()),
-        }]);
+        app.remote_skill_browser
+            .selector
+            .set_items(vec![RemoteSkillEntry {
+                source_label: "OpenAI".into(),
+                trust_level: "trusted".into(),
+                name: "demo".into(),
+                identifier: "openai/skills/demo".into(),
+                description: "demo".into(),
+                origin: "https://github.com/openai/skills".into(),
+                tags: vec![],
+                installed_name: None,
+                action: RemoteSkillAction::Install,
+                search_text: "demo".into(),
+                url: None,
+                repo: Some("openai/skills".into()),
+                path: Some("skills/.curated/demo".into()),
+            }]);
         app.remote_skill_browser.selector.query = "se".into();
         app.remote_skill_browser.selector.update_filter();
         app.skills_marketplace_mode = skills_marketplace::MarketplaceMode::Inspect {

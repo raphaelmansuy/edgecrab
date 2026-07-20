@@ -249,8 +249,8 @@ impl App {
         use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
         // Centered modal — keeps OAuth focused and avoids full-bleed noise.
-        let popup_w = area.width.saturating_sub(6).max(52).min(100);
-        let popup_h = area.height.saturating_sub(2).max(20).min(32);
+        let popup_w = area.width.saturating_sub(6).clamp(52, 100);
+        let popup_h = area.height.saturating_sub(2).clamp(20, 32);
         let popup = popup_rect(area, popup_w, popup_h);
         frame.render_widget(Clear, area);
         // Dim the rest of the TUI so the modal owns attention.
@@ -272,10 +272,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("  🪪  ", Style::default().fg(accent)),
-                Span::styled(
-                    self.grok_auth.subtitle(),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(self.grok_auth.subtitle(), Style::default().fg(Color::White)),
             ]))
             .block(
                 Block::default()

@@ -135,6 +135,12 @@ pub fn open_state_db(path: &Path) -> anyhow::Result<Arc<SessionDb>> {
     }
     let db = SessionDb::open(path)
         .with_context(|| format!("failed to open state db {}", path.display()))?;
+    // 025: reap zombie sessions left open after process kill (2h idle).
+    match db.close_stale_open_sessions(2.0 * 3600.0) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "closed stale open sessions (abandoned)"),
+        Err(e) => tracing::warn!(error = %e, "failed to close stale open sessions"),
+    }
     Ok(Arc::new(db))
 }
 

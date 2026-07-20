@@ -324,9 +324,7 @@ fn next_steps(cfg: &McpServerConfig, name: &str) -> (Vec<String>, bool) {
         steps.push(format!(
             "Run `edgecrab mcp login {name}` (or `/mcp login {name}`) to complete OAuth."
         ));
-        steps.push(format!(
-            "Then `edgecrab mcp test {name}` to list tools."
-        ));
+        steps.push(format!("Then `edgecrab mcp test {name}` to list tools."));
     } else if cfg.url.is_some() && cfg.bearer_token.is_none() {
         steps.push(format!(
             "If the server needs a token: `edgecrab mcp-token set {name} <token>` or re-add with --auth bearer --token …"
@@ -387,7 +385,9 @@ pub fn register_mcp_server(
 /// Tokens after the server name are flags (`--url`, `--auth`, …) or legacy CMD ARGS.
 pub fn parse_mcp_add_tokens(tokens: &[String]) -> Result<RegisterMcpRequest, String> {
     if tokens.is_empty() {
-        return Err("Usage: /mcp add <name> --url <endpoint> | --command <cmd> | <cmd> [args…]".into());
+        return Err(
+            "Usage: /mcp add <name> --url <endpoint> | --command <cmd> | <cmd> [args…]".into(),
+        );
     }
     let name = tokens[0].clone();
     let mut url = None;
@@ -480,12 +480,10 @@ pub fn parse_mcp_add_tokens(tokens: &[String]) -> Result<RegisterMcpRequest, Str
             }
             "--device-authorization-url" => {
                 i += 1;
-                device_authorization_url = Some(
-                    tokens
-                        .get(i)
-                        .cloned()
-                        .ok_or_else(|| "--device-authorization-url requires a value".to_string())?,
-                );
+                device_authorization_url =
+                    Some(tokens.get(i).cloned().ok_or_else(|| {
+                        "--device-authorization-url requires a value".to_string()
+                    })?);
             }
             "--authorization-url" => {
                 i += 1;
@@ -549,12 +547,10 @@ pub fn parse_mcp_add_tokens(tokens: &[String]) -> Result<RegisterMcpRequest, Str
 
 /// Format a human summary for CLI/TUI.
 pub fn format_register_summary(result: &RegisterMcpResult) -> String {
-    let mut lines = vec![
-        format!(
-            "Configured MCP server '{}' ({}, auth={})",
-            result.name, result.transport_summary, result.auth_summary
-        ),
-    ];
+    let mut lines = vec![format!(
+        "Configured MCP server '{}' ({}, auth={})",
+        result.name, result.transport_summary, result.auth_summary
+    )];
     if result.requires_login() {
         lines.push("  status: oauth login required".into());
     }

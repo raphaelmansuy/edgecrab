@@ -228,19 +228,21 @@ impl HarnessTurnAdvisory {
             .get("command")
             .and_then(|c| c.as_str())
             .unwrap_or("python3 -m http.server 8000 --directory .");
-        Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
-            &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
-                action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
-                code: "loopback_port_shopping_block",
-                message: format!(
-                    "Blocked localhost browser_navigate — no session HTTP server is recorded. \
+        Some(
+            edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
+                &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
+                    action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
+                    code: "loopback_port_shopping_block",
+                    message: format!(
+                        "Blocked localhost browser_navigate — no session HTTP server is recorded. \
                      Do not try other ports. Call terminal with `{command}`, then \
                      browser_navigate http://127.0.0.1:8000/ once."
-                ),
-                tool_name: tool_name.to_string(),
-                count: self.browser_nav_failures,
-            },
-        ))
+                    ),
+                    tool_name: tool_name.to_string(),
+                    count: self.browser_nav_failures,
+                },
+            ),
+        )
     }
 
     /// Block execute_code / tool_search loops after repeated browser_navigate failures on visual tasks.
@@ -284,21 +286,23 @@ impl HarnessTurnAdvisory {
         if self.browser_nav_success || self.browser_nav_failures < 3 {
             return None;
         }
-        Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
-            &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
-                action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
-                code: "browser_nav_loop_block",
-                message: format!(
-                    "Blocked repeated browser_navigate — {}. \
+        Some(
+            edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
+                &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
+                    action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
+                    code: "browser_nav_loop_block",
+                    message: format!(
+                        "Blocked repeated browser_navigate — {}. \
                      Do not thrash alternate ports. If HTTP error page: one heal re-serve of the \
                      demo directory on the latched port, then browser_snapshot. \
                      If SSRF: enable security.preview. If CDP: check Chrome headless is running.",
-                    self.browser_nav_fail_hint()
-                ),
-                tool_name: tool_name.to_string(),
-                count: self.browser_nav_failures,
-            },
-        ))
+                        self.browser_nav_fail_hint()
+                    ),
+                    tool_name: tool_name.to_string(),
+                    count: self.browser_nav_failures,
+                },
+            ),
+        )
     }
 
     pub fn act_tool_count_in_window(&self) -> usize {

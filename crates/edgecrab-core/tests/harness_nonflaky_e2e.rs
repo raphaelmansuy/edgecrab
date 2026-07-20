@@ -5,13 +5,13 @@
 use edgecrab_core::completion_assessor::{
     CompletionContext, assess_completion, visual_perception_evidence_ok,
 };
-use edgecrab_core::evidence_latch::{EvidenceLatchConfig, EvidenceState};
+use edgecrab_core::config::HarnessConfig;
+use edgecrab_core::evidence_latch::{EvidenceAssessSnapshot, EvidenceLatchConfig, EvidenceState};
 use edgecrab_core::task_class::{
     TaskClass, TaskClassifier, classify_from_messages, media_artifact_evidence_present,
 };
 use edgecrab_core::turn_dispatch::{TurnDispatchTrackers, TurnDispatchTrackersView};
 use edgecrab_core::turn_dispatch_policy::pre_dispatch_decision;
-use edgecrab_core::config::HarnessConfig;
 use edgecrab_tools::{
     ContentClass, HarnessAdvisorySignals, HarnessBuildInput, MutationTurnState,
     StructuredBrowserResult, build_harness_snapshot, is_browser_esm_artifact,
@@ -186,7 +186,8 @@ fn nf_e2_happy_path_snapshot_is_visual_evidence() {
         child_runs_in_flight: 0,
         harness,
         verification_strict: true,
-            evidence: Default::default(),    });
+        evidence: Default::default(),
+    });
     assert!(
         outcome.verification.evidence_present,
         "snapshot should count as evidence: {:?}",
@@ -197,10 +198,7 @@ fn nf_e2_happy_path_snapshot_is_visual_evidence() {
 #[test]
 fn nf_e3_media_render_class_and_file_evidence() {
     let msg = "create a video (use Hyperframe), 15 seconds in demos/raphael_video";
-    assert_eq!(
-        TaskClassifier::classify(msg, &[]),
-        TaskClass::MediaRender
-    );
+    assert_eq!(TaskClassifier::classify(msg, &[]), TaskClass::MediaRender);
     let messages = vec![
         Message::user(msg),
         Message::tool_result(
@@ -233,7 +231,8 @@ fn nf_e3_media_render_class_and_file_evidence() {
         child_runs_in_flight: 0,
         harness,
         verification_strict: false,
-            evidence: Default::default(),    });
+        evidence: Default::default(),
+    });
     assert!(
         outcome.verification.evidence_present,
         "media file should count as evidence: {:?}",
@@ -287,7 +286,11 @@ fn nf_e6_chess_deadlock_heal_then_done() {
     assert!(!evidence.blocks_preview_serve(8000, std::path::Path::new("demos/chess")));
 
     let err = StructuredBrowserResult::navigate_ok("http://127.0.0.1:8000/", "Error response");
-    evidence.note_perceive("browser_navigate", "http://127.0.0.1:8000/", err.content_class);
+    evidence.note_perceive(
+        "browser_navigate",
+        "http://127.0.0.1:8000/",
+        err.content_class,
+    );
     assert_eq!(evidence.phase, EvidencePhase::Heal);
     assert!(!evidence.blocks_preview_serve(8000, std::path::Path::new("demos/chess")));
 
@@ -336,7 +339,11 @@ fn nf_e6_chess_deadlock_heal_then_done() {
         "heading 3D Chess canvas Turn White",
         Some(6),
     );
-    evidence.note_perceive("browser_snapshot", "http://127.0.0.1:8000/", ok.content_class);
+    evidence.note_perceive(
+        "browser_snapshot",
+        "http://127.0.0.1:8000/",
+        ok.content_class,
+    );
     assert!(evidence.visual_evidence_complete());
     assert_eq!(evidence.phase, EvidencePhase::LatchedDone);
 
@@ -346,13 +353,7 @@ fn nf_e6_chess_deadlock_heal_then_done() {
         tool_guardrail: &trackers.tool_guardrail,
         evidence: &trackers.evidence,
     };
-    let post = pre_dispatch_decision(
-        &view,
-        &messages,
-        "browser_get_images",
-        r#"{}"#,
-        "",
-    );
+    let post = pre_dispatch_decision(&view, &messages, "browser_get_images", r#"{}"#, "");
     assert!(post.is_some(), "post-perceive browser thrash must block");
 
     let snap = trackers.evidence.assess_snapshot();
@@ -380,11 +381,9 @@ fn nf_e6_chess_deadlock_heal_then_done() {
         evidence: snap,
     });
     assert_eq!(outcome.state, CompletionDecision::Completed);
-    assert!(!edgecrab_core::turn_epilogue::should_reopen_loop_with_evidence(
-        &outcome,
-        &messages,
-        snap,
-    ));
+    assert!(
+        !edgecrab_core::turn_epilogue::should_reopen_loop_with_evidence(&outcome, &messages, snap,)
+    );
     let _ = ExitReason::ModelReturnedFinalText;
 }
 
@@ -430,9 +429,145 @@ fn nf_e7_escalated_no_reopen() {
         evidence: snap,
     });
     assert_eq!(outcome.state, CompletionDecision::Failed);
-    assert!(!edgecrab_core::turn_epilogue::should_reopen_loop_with_evidence(
-        &outcome,
-        &messages,
-        snap,
-    ));
+    assert!(
+        !edgecrab_core::turn_epilogue::should_reopen_loop_with_evidence(&outcome, &messages, snap,)
+    );
+}
+
+/// Golden 025 / session 50d96e9d: pre-built demo + Ok snapshot → no reopen.
+#[test]
+fn nf_e8_prebuilt_demo_snapshot_stops_reopen() {
+    use edgecrab_types::CompletionDecision;
+
+    let dir = TempDir::new().expect("temp");
+    fs::write(
+        dir.path().join("index.html"),
+        "<!DOCTYPE html><title>SimCity</title>",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join("js")).unwrap();
+    fs::write(dir.path().join("js/game.js"), "export const ok = true;\n").unwrap();
+
+    let mut trackers = TurnDispatchTrackers::with_harness(3, &HarnessConfig::default());
+    let index_path = dir.path().join("index.html");
+    let index_s = index_path.to_string_lossy();
+    // Resume path: read existing file (no write this turn).
+    trackers.record_tool_outcome(
+        "read_file",
+        &format!(r#"{{"path":"{index_s}"}}"#),
+        &format!(r#"{{"ok":true,"path":"{index_s}"}}"#),
+        false,
+    );
+    assert!(
+        trackers.evidence.artifact,
+        "read of existing demo must seed Artifact"
+    );
+
+    trackers.evidence.note_preview_candidate(
+        dir.path().to_path_buf(),
+        8000,
+        "http://127.0.0.1:8000/".into(),
+        None,
+        Some(200),
+    );
+    let snap_json = StructuredBrowserResult::snapshot_ok(
+        "http://127.0.0.1:8000/",
+        "SimCity Builder HUD buttons",
+        Some(12),
+    )
+    .to_tool_result_json();
+    trackers.record_tool_outcome("browser_snapshot", r#"{}"#, &snap_json, false);
+
+    let snap = trackers.evidence.assess_snapshot();
+    assert!(
+        snap.visual_complete,
+        "prebuilt + snapshot Ok ⇒ visual_complete"
+    );
+
+    let messages = vec![
+        Message::user("Create a sim city game in ./demos/simcity"),
+        Message::assistant("Already built and verified."),
+    ];
+    let harness_snap = build_harness_snapshot(HarnessBuildInput {
+        messages: &messages,
+        mutation_turn: &MutationTurnState::new(),
+        cwd: dir.path(),
+        post_mutation_oracles: false,
+        advisory: HarnessAdvisorySignals::default(),
+        unanswered_tool_calls: 0,
+    });
+    let outcome = assess_completion(&CompletionContext {
+        final_response: "SimCity already built & verified",
+        messages: &messages,
+        interrupted: false,
+        budget_exhausted: false,
+        invalid_tool_budget_exhausted: false,
+        pending_approval: false,
+        pending_clarification: false,
+        active_todos: 0,
+        blocked_todos: 0,
+        child_runs_in_flight: 0,
+        harness: harness_snap,
+        verification_strict: true,
+        evidence: snap,
+    });
+    assert_eq!(outcome.state, CompletionDecision::Completed);
+    let gate = edgecrab_core::completion_reopen::CompletionReopenGate::new(2);
+    assert_eq!(
+        edgecrab_core::completion_reopen::decide_completion_reopen(
+            &outcome, &messages, snap, &gate
+        ),
+        edgecrab_core::completion_reopen::ReopenDecision::DoNotReopen
+    );
+}
+
+/// Golden 025: reopen cap ends thrash instead of infinite do-not-stop-yet.
+#[test]
+fn nf_e9_reopen_cap_ends_turn() {
+    use edgecrab_types::{CompletionDecision, ExitReason, VerificationSummary};
+
+    let mut outcome = edgecrab_types::RunOutcome::new(
+        CompletionDecision::NeedsVerification,
+        ExitReason::VerificationPending,
+        "needs browser",
+    );
+    outcome.verification = VerificationSummary {
+        required: true,
+        evidence_present: false,
+        debt_reason: Some(edgecrab_core::completion_assessor::visual_ux_debt_reason(
+            &[],
+        )),
+        evidence: vec![],
+        contract_required: false,
+        contract_satisfied: false,
+    };
+    let nav_json = StructuredBrowserResult::navigate_ok("http://127.0.0.1:8000/", "SimCity")
+        .to_tool_result_json();
+    let nav_msg = Message::tool_result("n1", "browser_navigate", &nav_json);
+    let debt = edgecrab_core::completion_assessor::visual_ux_debt_reason(&[nav_msg]);
+    assert!(
+        debt.contains("browser_snapshot") || debt.contains("browser_vision"),
+        "debt after nav Ok must ask for snapshot, got: {debt}"
+    );
+    assert!(
+        !debt.starts_with("Visual/UX task: enable security.preview and verify"),
+        "stale enable-preview debt forbidden after nav Ok"
+    );
+
+    let gate = edgecrab_core::completion_reopen::CompletionReopenGate {
+        max_reopens: 2,
+        reopens_used: 2,
+    };
+    assert_eq!(
+        edgecrab_core::completion_reopen::decide_completion_reopen(
+            &outcome,
+            &[],
+            EvidenceAssessSnapshot::default(),
+            &gate
+        ),
+        edgecrab_core::completion_reopen::ReopenDecision::CapReached
+    );
+    let capped = edgecrab_core::completion_reopen::reopen_cap_outcome("done-ish", &outcome);
+    assert_eq!(capped.exit_reason, ExitReason::GuardrailHalt);
+    assert!(!edgecrab_core::turn_epilogue::should_reopen_loop(&capped));
 }

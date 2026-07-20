@@ -302,11 +302,8 @@ impl ToolHandler for TerminalTool {
             effective_command
         };
 
-        let final_command = apply_os_sandbox_to_command(
-            ctx,
-            &final_command,
-            std::path::Path::new(&cwd),
-        );
+        let final_command =
+            apply_os_sandbox_to_command(ctx, &final_command, std::path::Path::new(&cwd));
 
         // Execute via backend with up to 3 retries on transient infrastructure
         // errors. This matches the existing exponential-backoff retry logic: wait
@@ -433,9 +430,8 @@ impl ToolHandler for TerminalTool {
                             .into(),
                     });
                 };
-                let serve_dir = crate::recovery_catalog::infer_preview_serve_directory_from_text(
-                    &args.command,
-                );
+                let serve_dir =
+                    crate::recovery_catalog::infer_preview_serve_directory_from_text(&args.command);
                 return Err(crate::recovery_catalog::terminal_port_in_use(
                     &args.command,
                     port,
@@ -487,11 +483,7 @@ fn apply_os_sandbox_to_command(ctx: &ToolContext, command: &str, cwd: &std::path
     }
 }
 
-fn apply_os_sandbox_if_local(
-    ctx: &ToolContext,
-    command: &str,
-    workdir: Option<&str>,
-) -> String {
+fn apply_os_sandbox_if_local(ctx: &ToolContext, command: &str, workdir: Option<&str>) -> String {
     let cwd = resolve_workdir(ctx, workdir);
     apply_os_sandbox_to_command(ctx, command, std::path::Path::new(&cwd))
 }

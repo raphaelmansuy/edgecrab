@@ -129,10 +129,7 @@ async fn lifecycle_hook_emit_runs_discovered_script() {
         "expected turn_before script discovered (count={})",
         reg.script_count()
     );
-    reg.emit(
-        LifecycleEvent::TurnBefore,
-        serde_json::json!({"turn": 1}),
-    );
+    reg.emit(LifecycleEvent::TurnBefore, serde_json::json!({"turn": 1}));
     // Fire-and-forget spawn — poll until marker appears.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {

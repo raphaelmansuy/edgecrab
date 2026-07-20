@@ -45,7 +45,10 @@ impl ToolSchemaMode {
 /// Resolve `Auto` from enabled tool count; other modes pass through.
 ///
 /// Never returns `Auto`. Threshold: [`AUTO_INDEXED_TOOL_COUNT_THRESHOLD`].
-pub fn resolve_effective_schema_mode(mode: ToolSchemaMode, enabled_tool_count: usize) -> ToolSchemaMode {
+pub fn resolve_effective_schema_mode(
+    mode: ToolSchemaMode,
+    enabled_tool_count: usize,
+) -> ToolSchemaMode {
     match mode {
         ToolSchemaMode::Auto => {
             if enabled_tool_count <= AUTO_INDEXED_TOOL_COUNT_THRESHOLD {
@@ -128,9 +131,11 @@ pub fn prepare_schemas_for_mode(schemas: &[ToolSchema], mode: ToolSchemaMode) ->
     match mode {
         ToolSchemaMode::Full => schemas.to_vec(),
         ToolSchemaMode::Compact => schemas.iter().map(compact_tool_schema).collect(),
-        ToolSchemaMode::Indexed => {
-            crate::tool_schema_index::wire_schemas(schemas, &std::collections::HashSet::new(), false)
-        }
+        ToolSchemaMode::Indexed => crate::tool_schema_index::wire_schemas(
+            schemas,
+            &std::collections::HashSet::new(),
+            false,
+        ),
         ToolSchemaMode::Auto => unreachable!("resolve_effective_schema_mode never returns Auto"),
     }
 }

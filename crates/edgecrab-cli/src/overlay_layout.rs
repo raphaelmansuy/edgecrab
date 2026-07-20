@@ -60,11 +60,7 @@ pub fn browser_scroll_start(selected: usize, max_visible: usize) -> usize {
 ///
 /// Returns `(scroll_start, visible_count)` so only a viewport-sized slice is
 /// materialized as widgets while the selection stays on-screen.
-pub fn browser_virtual_window(
-    selected: usize,
-    total: usize,
-    max_visible: usize,
-) -> (usize, usize) {
+pub fn browser_virtual_window(selected: usize, total: usize, max_visible: usize) -> (usize, usize) {
     let max_visible = max_visible.max(1);
     if total == 0 {
         return (0, 0);

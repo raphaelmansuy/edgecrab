@@ -534,7 +534,10 @@ mod tests {
         assert_eq!(ModelCatalog::catalog_provider_id("gemini"), "google");
         assert_eq!(ModelCatalog::catalog_provider_id("claude"), "anthropic");
         assert_eq!(ModelCatalog::catalog_provider_id("grok"), "xai");
-        assert_eq!(ModelCatalog::catalog_provider_id("super_grok"), "super-grok");
+        assert_eq!(
+            ModelCatalog::catalog_provider_id("super_grok"),
+            "super-grok"
+        );
         assert_eq!(ModelCatalog::catalog_provider_id("supergrok"), "super-grok");
         assert_eq!(ModelCatalog::catalog_provider_id("xai-oauth"), "super-grok");
     }

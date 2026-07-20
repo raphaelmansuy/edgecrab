@@ -973,7 +973,11 @@ pub fn diff_bundled_skill(name: &str) -> BundledSkillDiffResult {
             name: snapshot.name.clone(),
             found: true,
             modified: false,
-            message: format!("No local copy of '{}' found at {}.", snapshot.name, dest.display()),
+            message: format!(
+                "No local copy of '{}' found at {}.",
+                snapshot.name,
+                dest.display()
+            ),
             diffs: Vec::new(),
         };
     }
@@ -1049,7 +1053,11 @@ pub fn diff_bundled_skill(name: &str) -> BundledSkillDiffResult {
         found: true,
         modified,
         message: if modified {
-            format!("'{}' differs from stock ({} file(s)).", snapshot.name, diffs.len())
+            format!(
+                "'{}' differs from stock ({} file(s)).",
+                snapshot.name,
+                diffs.len()
+            )
         } else {
             format!("'{}' matches the stock bundled copy.", snapshot.name)
         },

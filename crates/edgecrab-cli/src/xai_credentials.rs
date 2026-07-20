@@ -8,7 +8,7 @@
 //! - `xai/*` prefers static `XAI_API_KEY` when set (console key path).
 //! - Missing credentials always produce a one-shot CTA (`/login grok`).
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use edgecrab_core::oauth::{
     EDGECRAB_XAI_AUTH_MODE_ENV, EDGECRAB_XAI_AUTH_MODE_KEY, EDGECRAB_XAI_AUTH_MODE_OAUTH,
     xai_auth_mode_label,
@@ -60,9 +60,8 @@ pub async fn prepare_xai_credentials_with_preference(
 
     // SuperGrok path: prefer live OAuth tokens over a leftover static key so
     // selecting super-grok/* always rides the subscription when signed in.
-    let prefer_oauth_now = matches!(preference, XaiAuthPreference::PreferOauth)
-        && oauth_ready
-        && !force_refresh;
+    let prefer_oauth_now =
+        matches!(preference, XaiAuthPreference::PreferOauth) && oauth_ready && !force_refresh;
 
     if !force_refresh && !prefer_oauth_now && env_key.is_some() {
         if std::env::var(EDGECRAB_XAI_AUTH_MODE_ENV).is_err() {
@@ -219,10 +218,8 @@ pub fn super_grok_login_success_agent_hint(pending_model: Option<&str>) -> Strin
         Some(m) if !m.trim().is_empty() => {
             format!("SuperGrok signed in. Switching to {m}…")
         }
-        _ => {
-            "SuperGrok signed in. Use /model super-grok/grok-4.5 (or pick SuperGrok in /model)."
-                .into()
-        }
+        _ => "SuperGrok signed in. Use /model super-grok/grok-4.5 (or pick SuperGrok in /model)."
+            .into(),
     }
 }
 

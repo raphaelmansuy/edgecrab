@@ -220,6 +220,35 @@ pub struct EditDiffCard {
     pub presentation: EditPresentation,
 }
 
+/// Running card while an edit tool executes (before hunks are available).
+pub fn build_editing_running_spans(path: &str) -> Vec<Span<'static>> {
+    let display = if path.trim().is_empty() {
+        "…".to_string()
+    } else {
+        path.to_string()
+    };
+    vec![
+        Span::styled("  ┊ ".to_string(), chrome::gutter()),
+        Span::styled("✎ ".to_string(), chrome::action()),
+        Span::styled("Editing ".to_string(), chrome::header_label()),
+        Span::styled(display, chrome::path()),
+        Span::styled("…".to_string(), chrome::header_label()),
+    ]
+}
+
+#[cfg(test)]
+mod editing_running_tests {
+    use super::*;
+
+    #[test]
+    fn editing_running_spans_include_path() {
+        let spans = build_editing_running_spans("src/app.rs");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Editing"));
+        assert!(text.contains("src/app.rs"));
+    }
+}
+
 /// Accumulator for consecutive successful edit tools (verb group).
 #[derive(Debug, Clone, Default)]
 pub struct EditVerbGroup {
@@ -315,8 +344,7 @@ pub fn render_edit_diff_lines(
     is_error: bool,
     snapshot: Option<&LocalEditSnapshot>,
 ) -> Option<Vec<Vec<Span<'static>>>> {
-    render_edit_diff_card(tool_name, args_json, is_error, snapshot)
-        .map(|card| card.collapsed_lines)
+    render_edit_diff_card(tool_name, args_json, is_error, snapshot).map(|card| card.collapsed_lines)
 }
 
 /// Format stats for tool_display / shelf captions (DRY with presentation).
@@ -340,14 +368,10 @@ pub fn count_patch_line_stats(patch_text: &str) -> EditStats {
             minus += 1;
         }
     }
-    let files = extract_apply_patch_paths(patch_text).len().max(
-        if plus + minus > 0 { 1 } else { 0 },
-    );
-    EditStats {
-        plus,
-        minus,
-        files,
-    }
+    let files = extract_apply_patch_paths(patch_text)
+        .len()
+        .max(if plus + minus > 0 { 1 } else { 0 });
+    EditStats { plus, minus, files }
 }
 
 // ── Snapshot capture ─────────────────────────────────────────────────────────
@@ -749,7 +773,10 @@ fn trim_to_context_hunks(lines: &[DiffLine], radius: usize) -> Vec<DiffLine> {
         let skipped = j - i;
         if skipped > 0 && !out.is_empty() && j < lines.len() {
             out.push(DiffLine {
-                text: format!("… {skipped} unchanged line{}", if skipped == 1 { "" } else { "s" }),
+                text: format!(
+                    "… {skipped} unchanged line{}",
+                    if skipped == 1 { "" } else { "s" }
+                ),
                 old_line: None,
                 new_line: None,
                 kind: DiffLineKind::Equal, // painted specially via text prefix
@@ -801,7 +828,12 @@ fn paint_collapsed(
     let mut out = Vec::new();
     out.push(full_lines[0].clone());
     let content_budget = MAX_COLLAPSED_LINES;
-    let rest: Vec<_> = full_lines.iter().skip(1).take(content_budget).cloned().collect();
+    let rest: Vec<_> = full_lines
+        .iter()
+        .skip(1)
+        .take(content_budget)
+        .cloned()
+        .collect();
     let omitted = full_lines.len().saturating_sub(1 + rest.len());
     out.extend(rest);
     if omitted > 0 || presentation.truncated {
@@ -965,11 +997,7 @@ fn paint_more_line(omitted: usize, presentation: &EditPresentation) -> Vec<Span<
 fn spans_to_plain(lines: &[Vec<Span<'static>>]) -> String {
     lines
         .iter()
-        .map(|line| {
-            line.iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
+        .map(|line| line.iter().map(|s| s.content.as_ref()).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1145,8 +1173,7 @@ mod tests {
 
         // Insert lines must carry a non-default (green) style somewhere.
         let has_insert_style = card.collapsed_lines.iter().flatten().any(|span| {
-            span.style.fg
-                == Some(Color::Rgb(180, 245, 195))
+            span.style.fg == Some(Color::Rgb(180, 245, 195))
                 || span.style.fg == Some(Color::Rgb(90, 210, 130))
                 || span.style.bg == Some(Color::Rgb(18, 48, 32))
         });

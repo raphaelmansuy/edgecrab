@@ -1831,12 +1831,7 @@ impl ToolHandler for SkillManageTool {
             other
                 if !matches!(
                     other,
-                    "create"
-                        | "edit"
-                        | "patch"
-                        | "delete"
-                        | "write_skill_file"
-                        | "remove_file"
+                    "create" | "edit" | "patch" | "delete" | "write_skill_file" | "remove_file"
                 ) =>
             {
                 return Err(ToolError::InvalidArgs {

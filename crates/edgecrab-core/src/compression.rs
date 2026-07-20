@@ -746,7 +746,11 @@ pub async fn compress_with_llm_counted(
     // Phase 2: determine compression boundaries.
     // Head: system + first exchange on first compaction; system-only afterward.
     let head_idx = if protect_first == 0 {
-        usize::from(pruned.first().is_some_and(|m| m.role == edgecrab_types::Role::System))
+        usize::from(
+            pruned
+                .first()
+                .is_some_and(|m| m.role == edgecrab_types::Role::System),
+        )
     } else {
         protect_first
     };
@@ -846,7 +850,11 @@ pub fn compress_structural_only_counted(
     };
     let pruned = prune_tool_outputs_with_options(messages, spill_ctx, &prune_options);
     let head_idx = if protect_first == 0 {
-        usize::from(pruned.first().is_some_and(|m| m.role == edgecrab_types::Role::System))
+        usize::from(
+            pruned
+                .first()
+                .is_some_and(|m| m.role == edgecrab_types::Role::System),
+        )
     } else {
         protect_first
     };
@@ -2744,7 +2752,9 @@ mod tests {
     #[test]
     fn session_hygiene_skips_short_or_disabled() {
         assert!(!should_run_session_hygiene(3, 200_000, 128_000, true, 5000));
-        assert!(!should_run_session_hygiene(10, 200_000, 128_000, false, 5000));
+        assert!(!should_run_session_hygiene(
+            10, 200_000, 128_000, false, 5000
+        ));
         assert!(!should_run_session_hygiene(10, 50_000, 128_000, true, 5000));
     }
 
@@ -2754,7 +2764,13 @@ mod tests {
         let at_85 = (ctx as f32 * GATEWAY_HYGIENE_THRESHOLD) as usize;
         assert!(should_run_session_hygiene(10, at_85, ctx, true, 5000));
         assert!(should_run_session_hygiene(5000, 100, ctx, true, 5000));
-        assert!(!should_run_session_hygiene(4999, at_85 - 1, ctx, true, 5000));
+        assert!(!should_run_session_hygiene(
+            4999,
+            at_85 - 1,
+            ctx,
+            true,
+            5000
+        ));
     }
 
     #[test]
@@ -2788,9 +2804,13 @@ mod tests {
     #[test]
     fn defer_preflight_and_anti_thrash_gates() {
         let mut state = CompressionRuntimeState::default();
-        assert!(!should_defer_preflight_to_real_usage(&state, 100_000, 50_000));
+        assert!(!should_defer_preflight_to_real_usage(
+            &state, 100_000, 50_000
+        ));
         state.awaiting_real_usage_after_compression = true;
-        assert!(should_defer_preflight_to_real_usage(&state, 100_000, 50_000));
+        assert!(should_defer_preflight_to_real_usage(
+            &state, 100_000, 50_000
+        ));
 
         state = CompressionRuntimeState::default();
         state.last_real_prompt_tokens = 40_000;
@@ -2798,7 +2818,9 @@ mod tests {
         // Rough is over threshold but growth from baseline is within 5%/4K tolerance.
         assert!(should_defer_preflight_to_real_usage(&state, 94_000, 80_000));
         // Large growth past tolerance → do not defer.
-        assert!(!should_defer_preflight_to_real_usage(&state, 120_000, 80_000));
+        assert!(!should_defer_preflight_to_real_usage(
+            &state, 120_000, 80_000
+        ));
 
         state.ineffective_compression_count = 2;
         assert!(automatic_compression_blocked(&state));

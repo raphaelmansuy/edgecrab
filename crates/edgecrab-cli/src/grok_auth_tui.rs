@@ -198,9 +198,9 @@ impl GrokAuthTui {
                 .unwrap_or(0);
             let msg = match self.screen {
                 GrokAuthScreen::Start => format!("  Starting secure sign-in… ({elapsed}s)"),
-                GrokAuthScreen::Finish => format!(
-                    "  Exchanging code for tokens… ({elapsed}s)  ·  Esc cancels"
-                ),
+                GrokAuthScreen::Finish => {
+                    format!("  Exchanging code for tokens… ({elapsed}s)  ·  Esc cancels")
+                }
                 GrokAuthScreen::Done => "  …".into(),
             };
             lines.push(Line::from(Span::styled(
@@ -306,7 +306,7 @@ impl GrokAuthTui {
                 if Self::is_submit_key(&key) || key.code == KeyCode::Esc {
                     return GrokAuthAction::Close;
                 }
-                return GrokAuthAction::None;
+                GrokAuthAction::None
             }
             GrokAuthScreen::Start => {
                 if key.code == KeyCode::Esc {
@@ -318,7 +318,7 @@ impl GrokAuthTui {
                 if matches!(key.code, KeyCode::Char('o' | 'O')) && self.authorize_url.is_some() {
                     return GrokAuthAction::OpenBrowser;
                 }
-                return GrokAuthAction::None;
+                GrokAuthAction::None
             }
             GrokAuthScreen::Finish => {
                 if Self::is_submit_key(&key) {
@@ -334,11 +334,11 @@ impl GrokAuthTui {
                 {
                     return GrokAuthAction::None;
                 }
-                return match key.code {
+                match key.code {
                     KeyCode::Char('p' | 'P') => GrokAuthAction::LoadClipboard,
                     KeyCode::Char('o' | 'O') => GrokAuthAction::OpenBrowser,
                     _ => GrokAuthAction::None,
-                };
+                }
             }
         }
     }
@@ -354,10 +354,7 @@ fn progress_rail(screen: GrokAuthScreen) -> Vec<Line<'static>> {
     };
     let step = |done: bool, active: bool, label: &str| -> Span<'static> {
         let (mark, style) = if done && !active {
-            (
-                "✓",
-                Style::default().fg(Color::Rgb(140, 220, 160)),
-            )
+            ("✓", Style::default().fg(Color::Rgb(140, 220, 160)))
         } else if active {
             (
                 "●",
@@ -434,7 +431,10 @@ fn finish_body(
     if browser_opened {
         chips.push(chip("browser opened", Color::Rgb(140, 220, 160)));
     } else {
-        chips.push(chip("press o if browser did not open", Color::Rgb(255, 200, 120)));
+        chips.push(chip(
+            "press o if browser did not open",
+            Color::Rgb(255, 200, 120),
+        ));
     }
     if pending_code.is_some() {
         chips.push(chip("code ready", Color::Rgb(140, 220, 160)));
@@ -457,11 +457,15 @@ fn finish_body(
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from("  1. Copy the authorization code from the x.ai page."));
+    lines.push(Line::from(
+        "  1. Copy the authorization code from the x.ai page.",
+    ));
     lines.push(Line::from(
         "  2. Press p to load clipboard  —  or  Enter to paste at a terminal prompt.",
     ));
-    lines.push(Line::from("  3. Enter again to exchange the code (if already loaded)."));
+    lines.push(Line::from(
+        "  3. Enter again to exchange the code (if already loaded).",
+    ));
     lines.push(Line::from(""));
 
     if let Some(code) = pending_code {
@@ -620,7 +624,11 @@ mod tests {
     #[test]
     fn progress_rail_marks_finish_step() {
         let lines = progress_rail(GrokAuthScreen::Finish);
-        let s = lines[0].spans.iter().map(|sp| sp.content.as_ref()).collect::<String>();
+        let s = lines[0]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect::<String>();
         assert!(s.contains("Paste code"), "{s}");
         assert!(s.contains("Open x.ai"), "{s}");
     }
@@ -629,9 +637,8 @@ mod tests {
     fn body_finish_shows_host_not_only_raw_blob() {
         let mut t = GrokAuthTui::new();
         t.screen = GrokAuthScreen::Finish;
-        t.authorize_url = Some(
-            "https://accounts.x.ai/oauth2/authorize?response_type=code&client_id=test".into(),
-        );
+        t.authorize_url =
+            Some("https://accounts.x.ai/oauth2/authorize?response_type=code&client_id=test".into());
         t.browser_opened = true;
         let body = t.body_lines(80);
         let joined: String = body
@@ -640,7 +647,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("accounts.x.ai"), "{joined}");
-        assert!(joined.contains("browser opened") || joined.contains("[browser"), "{joined}");
+        assert!(
+            joined.contains("browser opened") || joined.contains("[browser"),
+            "{joined}"
+        );
     }
 
     #[test]

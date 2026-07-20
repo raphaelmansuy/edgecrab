@@ -49,9 +49,7 @@ impl ProcessTailPanel {
 
     /// Open/update the foreground Focus Tool live overlay (spec 020).
     pub fn set_foreground_live(&mut self, tool_name: &str, preview: &str, body: &str) {
-        let at_bottom = self.foreground_live
-            && self.active
-            && self.scroll_offset == 0;
+        let at_bottom = self.foreground_live && self.active && self.scroll_offset == 0;
         let trimmed = truncate_tail_body(body, TAIL_PANEL_MAX_CHARS);
         self.active = true;
         self.foreground_live = true;

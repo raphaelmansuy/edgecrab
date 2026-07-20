@@ -145,10 +145,7 @@ async fn execute_replace_patch(args: ReplaceArgs, ctx: &ToolContext) -> Result<S
             let preview = crate::safe_truncate(&content, PREVIEW_LIMIT);
             let truncated = preview.len() < content.len();
             return Err(crate::recovery_catalog::patch_content_mismatch(
-                &args.path,
-                &msg,
-                preview,
-                truncated,
+                &args.path, &msg, preview, truncated,
             ));
         }
     };

@@ -39,6 +39,10 @@ pub struct ShelfRenderParams<'a> {
     pub spinner_frame: usize,
     pub animate: bool,
     pub verbose_tools: bool,
+    /// Session edit ledger caption (`files N  +X −Y`), when present.
+    pub edit_ledger_caption: Option<&'a str>,
+    /// Truncated last-N-lines thinking body from StreamPresentation (multi-line peek).
+    pub thinking_truncated: Option<&'a str>,
 }
 
 /// Resolved shelf colors from theme (avoids repeating color args).
@@ -117,13 +121,23 @@ pub fn render_activity_shelf(frame: &mut Frame, area: Rect, params: &ShelfRender
         append_subagent_lines(&mut lines, state, details, &palette);
         let show_thinking = !tools_section_has_evidence(state, details)
             || (details.section_render(ShelfSection::Thinking) == SectionRender::Full
-                && !matches!(state.phase, ShelfPhase::ToolExec | ShelfPhase::GeneratingTool));
+                && !matches!(
+                    state.phase,
+                    ShelfPhase::ToolExec | ShelfPhase::GeneratingTool
+                ));
         if show_thinking {
-            append_thinking_lines(&mut lines, state, details, spin, &palette);
+            append_thinking_lines(
+                &mut lines,
+                state,
+                details,
+                spin,
+                &palette,
+                params.thinking_truncated,
+            );
         }
         append_activity_lines(&mut lines, state, details, &palette);
         if (lines.len() as u16) < MAX_SHELF_LINES {
-            append_tokens_footer(&mut lines, state, &palette);
+            append_tokens_footer(&mut lines, state, &palette, params.edit_ledger_caption);
         }
         // Hard cap — prefer keeping tool evidence (already first).
         if lines.len() > MAX_SHELF_LINES as usize {
@@ -163,7 +177,10 @@ fn count_section_lines(
     n += tool_line_count(state, details, verbose_tools);
     n += subagent_line_count(state, details);
     let skip_thinking = tools_section_has_evidence(state, details)
-        && matches!(state.phase, ShelfPhase::ToolExec | ShelfPhase::GeneratingTool);
+        && matches!(
+            state.phase,
+            ShelfPhase::ToolExec | ShelfPhase::GeneratingTool
+        );
     if !skip_thinking {
         n += thinking_line_count(state, details);
     }
@@ -193,18 +210,52 @@ fn thinking_render_mode(state: &TurnActivityState, details: &ShelfDetailsState) 
     let has_snippet = state
         .reasoning_snippet
         .as_ref()
-        .is_some_and(|s| !s.trim().is_empty());
+        .is_some_and(|s| !s.trim().is_empty())
+        || state
+            .reasoning_truncated
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
     details.effective_thinking_render(has_snippet)
 }
 
+fn thinking_body_lines(truncated: Option<&str>) -> Vec<&str> {
+    truncated
+        .unwrap_or("")
+        .lines()
+        .filter(|l| !l.trim().is_empty() && *l != "…")
+        .collect()
+}
+
 fn thinking_line_count(state: &TurnActivityState, details: &ShelfDetailsState) -> u16 {
-    if thinking_content(state, details).is_none() {
+    if thinking_suppressed_by_tools(state, details) {
         return 0;
     }
     match thinking_render_mode(state, details) {
         SectionRender::Skip => 0,
-        SectionRender::Summary | SectionRender::Full => 1,
+        SectionRender::Summary => {
+            if state.reasoning_snippet.is_some() || state.reasoning_truncated.is_some() {
+                1
+            } else {
+                0
+            }
+        }
+        SectionRender::Full => {
+            let body = thinking_body_lines(state.reasoning_truncated.as_deref());
+            if body.is_empty() {
+                u16::from(state.reasoning_snippet.is_some())
+            } else {
+                // Header + body lines, leave room for tokens footer.
+                (1 + body.len() as u16).min(MAX_SHELF_LINES.saturating_sub(1))
+            }
+        }
     }
+}
+
+fn thinking_suppressed_by_tools(state: &TurnActivityState, details: &ShelfDetailsState) -> bool {
+    if state.generating_tool.is_some() || state.tools.values().any(|t| !t.finished) {
+        return details.section_render(ShelfSection::Tools) != SectionRender::Skip;
+    }
+    false
 }
 
 fn activity_line_count(state: &TurnActivityState, details: &ShelfDetailsState) -> u16 {
@@ -314,12 +365,25 @@ fn append_quiet_mode_backstop(
     }
 }
 
-fn append_tokens_footer(lines: &mut Vec<Line>, state: &TurnActivityState, palette: &ShelfPalette) {
-    let Some(total) = format_tokens_total(state.thinking_token_est, state.tool_token_acc) else {
+fn append_tokens_footer(
+    lines: &mut Vec<Line>,
+    state: &TurnActivityState,
+    palette: &ShelfPalette,
+    edit_ledger_caption: Option<&str>,
+) {
+    let tokens = format_tokens_total(state.thinking_token_est, state.tool_token_acc);
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(total) = tokens {
+        parts.push(total);
+    }
+    if let Some(ledger) = edit_ledger_caption.filter(|s| !s.is_empty()) {
+        parts.push(ledger.to_string());
+    }
+    if parts.is_empty() {
         return;
-    };
+    }
     lines.push(Line::from(vec![Span::styled(
-        format!("  {total}"),
+        format!("  {}", parts.join("  ·  ")),
         Style::default()
             .fg(palette.dim)
             .add_modifier(Modifier::DIM | Modifier::ITALIC),
@@ -332,17 +396,25 @@ fn append_thinking_lines(
     details: &ShelfDetailsState,
     spin: &str,
     palette: &ShelfPalette,
+    thinking_truncated: Option<&str>,
 ) {
-    let Some(content) = thinking_content(state, details) else {
+    if thinking_suppressed_by_tools(state, details) {
         return;
-    };
-    match thinking_render_mode(state, details) {
+    }
+    let trunc = thinking_truncated.or(state.reasoning_truncated.as_deref());
+    let body = thinking_body_lines(trunc);
+    let mode = thinking_render_mode(state, details);
+    match mode {
         SectionRender::Skip => {}
         SectionRender::Summary => {
+            let peek = body
+                .last()
+                .copied()
+                .unwrap_or_else(|| state.reasoning_snippet.as_deref().unwrap_or("thinking…"));
             let mut spans = vec![
                 Span::styled(section_chevron(false), Style::default().fg(palette.dim)),
                 Span::styled(
-                    safe_truncate(&content, 56).to_string(),
+                    format!("thinking · {}", safe_truncate(peek, 56)),
                     Style::default()
                         .fg(palette.dim)
                         .add_modifier(Modifier::ITALIC),
@@ -357,22 +429,59 @@ fn append_thinking_lines(
             lines.push(Line::from(spans));
         }
         SectionRender::Full => {
-            let mut spans = vec![
+            if body.is_empty() {
+                // Fallback single-line peek when truncated body not ready.
+                let Some(content) = thinking_content(state, details) else {
+                    return;
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{spin} "), Style::default().fg(palette.accent)),
+                    Span::styled(
+                        content,
+                        Style::default()
+                            .fg(palette.dim)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+                return;
+            }
+            let mut header = vec![
                 Span::styled(format!("{spin} "), Style::default().fg(palette.accent)),
                 Span::styled(
-                    content,
+                    "Thinking…".to_string(),
                     Style::default()
                         .fg(palette.dim)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ];
             if let Some(label) = format_tokens_label(state.thinking_token_est) {
-                spans.push(Span::styled(
+                header.push(Span::styled(
                     format!("  {label}"),
                     Style::default().fg(palette.dim).add_modifier(Modifier::DIM),
                 ));
             }
-            lines.push(Line::from(spans));
+            lines.push(Line::from(header));
+            let budget = (MAX_SHELF_LINES as usize)
+                .saturating_sub(lines.len())
+                .saturating_sub(1); // leave room for tokens footer
+            let start = body.len().saturating_sub(budget);
+            if start > 0 {
+                lines.push(Line::from(Span::styled(
+                    "  …".to_string(),
+                    Style::default().fg(palette.dim).add_modifier(Modifier::DIM),
+                )));
+            }
+            for line in &body[start..] {
+                if lines.len() as u16 >= MAX_SHELF_LINES.saturating_sub(1) {
+                    break;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", safe_truncate(line, 96)),
+                    Style::default()
+                        .fg(palette.dim)
+                        .add_modifier(Modifier::ITALIC | Modifier::DIM),
+                )));
+            }
         }
     }
 }
@@ -437,12 +546,8 @@ fn append_activity_lines(
             continue;
         }
         let style = match notice.tone {
-            ActivityTone::Info => Style::default()
-                .fg(palette.dim)
-                .add_modifier(Modifier::DIM),
-            ActivityTone::Warn => Style::default()
-                .fg(palette.dim)
-                .add_modifier(Modifier::DIM),
+            ActivityTone::Info => Style::default().fg(palette.dim).add_modifier(Modifier::DIM),
+            ActivityTone::Warn => Style::default().fg(palette.dim).add_modifier(Modifier::DIM),
             ActivityTone::Error => Style::default().fg(palette.hot),
         };
         let prefix = match render {
@@ -482,15 +587,9 @@ fn visible_notices<'a>(
     // Filter expired here so render stays correct even between expire ticks.
     let now = std::time::Instant::now();
     match details.section_render(ShelfSection::Activity) {
-        SectionRender::Skip => Box::new(
-            state
-                .activity_feed
-                .iter()
-                .rev()
-                .filter(move |n| {
-                    !n.is_expired(now) && matches!(n.tone, ActivityTone::Warn | ActivityTone::Error)
-                }),
-        ),
+        SectionRender::Skip => Box::new(state.activity_feed.iter().rev().filter(move |n| {
+            !n.is_expired(now) && matches!(n.tone, ActivityTone::Warn | ActivityTone::Error)
+        })),
         SectionRender::Summary => Box::new(
             state
                 .activity_feed
@@ -582,9 +681,7 @@ fn append_tool_lines(
             }
             let cap = shelf_tool_row_cap(SectionRender::Full);
             let total_active = active.len();
-            let primary_id = state
-                .primary_focus_tool()
-                .map(|t| t.tool_call_id.as_str());
+            let primary_id = state.primary_focus_tool().map(|t| t.tool_call_id.as_str());
             let shown: Vec<_> = active.into_iter().take(cap).collect();
             let active_count = shown.len();
             for (i, tool) in shown.into_iter().enumerate() {
@@ -929,6 +1026,57 @@ mod tests {
     }
 
     #[test]
+    fn thinking_multiline_counts_body_lines() {
+        let mut state = TurnActivityState::new(true);
+        let details = ShelfDetailsState::default();
+        state.sync_thinking_from_presentation(
+            Some("…tail".into()),
+            Some("line1\nline2\nline3\nline4".into()),
+            "line4",
+        );
+        let n = thinking_line_count(&state, &details);
+        assert!(
+            n >= 4,
+            "expected header + body lines while Thinking, got {n}"
+        );
+    }
+
+    #[test]
+    fn thinking_suppressed_while_tool_runs() {
+        let mut state = TurnActivityState::new(true);
+        let details = ShelfDetailsState::default();
+        state.sync_thinking_from_presentation(
+            Some("plan".into()),
+            Some("plan the edit".into()),
+            "plan",
+        );
+        state.on_tool_exec(
+            "t1".into(),
+            "terminal".into(),
+            "{}".into(),
+            "cargo test".into(),
+            1,
+        );
+        assert_eq!(thinking_line_count(&state, &details), 0);
+        let mut lines = Vec::new();
+        append_thinking_lines(
+            &mut lines,
+            &state,
+            &details,
+            "⠋",
+            &ShelfPalette {
+                accent: Color::Yellow,
+                dim: Color::DarkGray,
+                warn: Color::Yellow,
+                hot: Color::Red,
+                border: Color::DarkGray,
+            },
+            Some("plan the edit"),
+        );
+        assert!(lines.is_empty(), "tool focus must suppress CoT peek");
+    }
+
+    #[test]
     fn tools_expanded_shows_more_than_three_parallel_rows() {
         let mut state = TurnActivityState::new(true);
         let mut details = ShelfDetailsState::default();
@@ -1035,7 +1183,9 @@ mod tests {
     #[test]
     fn secondary_activity_notices_detected() {
         assert!(is_secondary_activity_notice("still cooking… — terminal"));
-        assert!(is_secondary_activity_notice("vscode-copilot: iter 17 streaming"));
+        assert!(is_secondary_activity_notice(
+            "vscode-copilot: iter 17 streaming"
+        ));
         assert!(!is_secondary_activity_notice("gateway exited"));
     }
 

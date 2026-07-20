@@ -59,10 +59,7 @@ pub fn probe_loopback_http_port(port: u16) -> bool {
         return false;
     }
     let timeout = Duration::from_millis(200);
-    let candidates = [
-        format!("127.0.0.1:{port}"),
-        format!("[::1]:{port}"),
-    ];
+    let candidates = [format!("127.0.0.1:{port}"), format!("[::1]:{port}")];
     for cand in candidates {
         if let Ok(addrs) = cand.to_socket_addrs() {
             for addr in addrs {
@@ -113,10 +110,7 @@ pub fn port_from_loopback_url(url: &str) -> Option<u16> {
         .strip_prefix("http://127.0.0.1:")
         .or_else(|| lower.strip_prefix("http://localhost:"))
         .or_else(|| lower.strip_prefix("http://[::1]:"))?;
-    let port_str: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let port_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     port_str.parse().ok().filter(|p| *p > 0)
 }
 
@@ -451,7 +445,10 @@ fn append_spawn_hint_text(command: &str, body: &str) -> String {
         return body.to_string();
     };
     let url = format!("http://127.0.0.1:{port}/");
-    if body.contains("bind_ready") || body.contains("bind-ready") || body.contains(&format!("ready — preview at {url}")) {
+    if body.contains("bind_ready")
+        || body.contains("bind-ready")
+        || body.contains(&format!("ready — preview at {url}"))
+    {
         return body.to_string();
     }
     format!(
@@ -557,7 +554,10 @@ mod tests {
         );
         // Port 1 will not bind — bind_ready false still present.
         assert!(out.contains("bind_ready"), "got: {out}");
-        assert!(out.contains("\"port\":1") || out.contains("\"port\": 1"), "got: {out}");
+        assert!(
+            out.contains("\"port\":1") || out.contains("\"port\": 1"),
+            "got: {out}"
+        );
         clear_pending_preview(sid, 1);
     }
 

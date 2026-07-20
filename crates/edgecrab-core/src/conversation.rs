@@ -55,7 +55,7 @@ use edgecrab_types::{
     AgentError, Content, Cost, Message, Role, ToolError, ToolErrorResponse, Trajectory, Usage,
 };
 use edgequake_llm::traits::CacheControl;
-use edgequake_llm::{LLMProvider, CachePromptConfig};
+use edgequake_llm::{CachePromptConfig, LLMProvider};
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
@@ -215,13 +215,12 @@ fn build_tool_context(
         Some(d) => (d.depth, Some(d.agent_id.clone()), d.parent_id.clone()),
         None => (0, None, None),
     };
-    let on_skills_changed: Option<Arc<dyn Fn() + Send + Sync>> =
-        skills_zone_dirty.map(|flag| {
-            Arc::new(move || {
-                crate::prompt_builder::invalidate_skills_cache();
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }) as Arc<dyn Fn() + Send + Sync>
-        });
+    let on_skills_changed: Option<Arc<dyn Fn() + Send + Sync>> = skills_zone_dirty.map(|flag| {
+        Arc::new(move || {
+            crate::prompt_builder::invalidate_skills_cache();
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }) as Arc<dyn Fn() + Send + Sync>
+    });
     ToolContext {
         task_id: uuid::Uuid::new_v4().to_string(),
         cwd: cwd.to_path_buf(),
@@ -340,7 +339,8 @@ struct DispatchContext {
     kanban_task_id: Option<String>,
     materialized_tools: Option<Arc<std::sync::RwLock<edgecrab_tools::MaterializedToolSet>>>,
     /// Progressive AGENTS.md discovery for subdirectories (Hermes parity).
-    subdirectory_hints: Option<Arc<tokio::sync::Mutex<crate::subdirectory_hints::SubdirectoryHintTracker>>>,
+    subdirectory_hints:
+        Option<Arc<tokio::sync::Mutex<crate::subdirectory_hints::SubdirectoryHintTracker>>>,
     /// Shared dirty flag for skills-zone invalidation from tool callbacks.
     skills_zone_dirty: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -449,7 +449,9 @@ impl Agent {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
 
-        let materialized_tools = Arc::new(std::sync::RwLock::new(edgecrab_tools::MaterializedToolSet::new()));
+        let materialized_tools = Arc::new(std::sync::RwLock::new(
+            edgecrab_tools::MaterializedToolSet::new(),
+        ));
         let subdirectory_hints = if config.skip_context_files {
             None
         } else {
@@ -533,9 +535,8 @@ impl Agent {
                 let schemas = registry.get_definitions(enabled_filter, disabled_filter, &ctx);
                 let names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
                 let materialized = read_materialized_set(Some(&materialized_tools));
-                let hot_full = crate::local_provider_policy::is_local_inference_provider(
-                    provider.name(),
-                );
+                let hot_full =
+                    crate::local_provider_policy::is_local_inference_provider(provider.name());
                 let wire = build_wire_llm_definitions(
                     registry,
                     &ctx,
@@ -567,10 +568,8 @@ impl Agent {
                     let capped = &engine_schemas[..engine_schemas
                         .len()
                         .min(crate::context_engine::MAX_ENGINE_TOOLS)];
-                    active_tool_defs.extend(to_llm_definitions_with_mode(
-                        capped,
-                        effective_schema_mode,
-                    ));
+                    active_tool_defs
+                        .extend(to_llm_definitions_with_mode(capped, effective_schema_mode));
                     capped.iter().map(|s| s.name.clone()).collect()
                 } else {
                     std::collections::HashSet::new()
@@ -660,19 +659,18 @@ impl Agent {
                     edgecrab_tools::describe_execution_filesystem(&app_config_ref, &cwd)
                         .render_prompt_block()
                 });
-                let wire_for_prompt = if effective_schema_mode
-                    == edgecrab_tools::ToolSchemaMode::Indexed
-                {
-                    let mut wire: Vec<String> = edgecrab_tools::INDEXED_HOT_TOOLS
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect();
-                    wire.push(edgecrab_tools::TOOL_SEARCH_NAME.to_string());
-                    wire.extend(read_materialized_set(Some(&materialized_tools)));
-                    Some(wire)
-                } else {
-                    None
-                };
+                let wire_for_prompt =
+                    if effective_schema_mode == edgecrab_tools::ToolSchemaMode::Indexed {
+                        let mut wire: Vec<String> = edgecrab_tools::INDEXED_HOT_TOOLS
+                            .iter()
+                            .map(|s| (*s).to_string())
+                            .collect();
+                        wire.push(edgecrab_tools::TOOL_SEARCH_NAME.to_string());
+                        wire.extend(read_materialized_set(Some(&materialized_tools)));
+                        Some(wire)
+                    } else {
+                        None
+                    };
                 let blocks = PromptBuilder::new(config.platform)
                     .skip_context_files(config.skip_context_files)
                     .execution_environment_guidance(execution_guidance)
@@ -721,8 +719,7 @@ impl Agent {
                             }
                         }
                     }
-                    let index =
-                        edgecrab_tools::format_deferred_index(deferred.len(), &categories);
+                    let index = edgecrab_tools::format_deferred_index(deferred.len(), &categories);
                     if !index.is_empty() {
                         if !dynamic.is_empty() {
                             dynamic.push_str("\n\n");
@@ -899,7 +896,8 @@ impl Agent {
         };
         let route = resolve_turn_route(&expansion.expanded, &config.model_config, &smart_routing);
         if route.is_primary {
-            session.smart_routing_strong_turns = session.smart_routing_strong_turns.saturating_add(1);
+            session.smart_routing_strong_turns =
+                session.smart_routing_strong_turns.saturating_add(1);
         } else {
             session.smart_routing_cheap_turns = session.smart_routing_cheap_turns.saturating_add(1);
         }
@@ -1291,13 +1289,19 @@ impl Agent {
         let mut tool_errors_acc: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
         let turn = crate::turn_prologue::TurnPrologueState::begin(&config.harness);
         let mut trackers = turn.trackers;
+        let mut completion_reopen_gate = crate::completion_reopen::CompletionReopenGate::new(
+            config.harness.max_completion_reopens,
+        );
         let capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let spill_seq = Arc::new(crate::tool_result_spill::SpillSequence::new());
         let mut pressure_warned = turn.pressure_warned;
         let mut compression_llm_failures = turn.compression_llm_failures;
         let mut prologue_opening_rough_tokens = turn.opening_rough_tokens;
+        // Assigned on first compression preflight path; initial false is never read.
+        #[allow(unused_assignments)]
         let mut prologue_preflight_evaluated = false;
+        #[allow(unused_assignments)]
         let mut prologue_preflight_ran = false;
         const MAX_COMPRESSION_LLM_FAILURES: u32 = 3;
 
@@ -1477,10 +1481,10 @@ impl Agent {
             // Hermes few-but-huge preflight gate (turn_prologue / turn_context parity).
             let protect_first = crate::compression::effective_protect_first_n(
                 session.compression_runtime.compression_count,
-                session
-                    .messages
-                    .iter()
-                    .any(|m| m.text_content().contains(crate::compression::SUMMARY_PREFIX)),
+                session.messages.iter().any(|m| {
+                    m.text_content()
+                        .contains(crate::compression::SUMMARY_PREFIX)
+                }),
             );
             let protect_last = compression_params.protect_last_n;
             // Hermes few-but-huge OR count gate (observability + tests).
@@ -1503,9 +1507,8 @@ impl Agent {
                     "deferring rough-estimate preflight compression to real usage"
                 );
             }
-            let blocked = crate::compression::automatic_compression_blocked(
-                &session.compression_runtime,
-            );
+            let blocked =
+                crate::compression::automatic_compression_blocked(&session.compression_runtime);
             match check_compression_status_for_estimate(
                 estimated_prompt_tokens,
                 &compression_params,
@@ -2216,11 +2219,9 @@ impl Agent {
                     &session.messages,
                     &active_tool_defs,
                 );
-                let threshold_now = CompressionParams::from_model_config(
-                    &config.model,
-                    &config.compression,
-                )
-                .threshold_tokens();
+                let threshold_now =
+                    CompressionParams::from_model_config(&config.model, &config.compression)
+                        .threshold_tokens();
                 crate::compression::update_compression_from_response(
                     &mut session.compression_runtime,
                     session.last_prompt_tokens,
@@ -2469,8 +2470,8 @@ impl Agent {
                         .goal_store
                         .active(&conversation_session_id)
                         .unwrap_or_default();
-                    let goal_contract = (!goal_state.contract.is_empty())
-                        .then_some(&goal_state.contract);
+                    let goal_contract =
+                        (!goal_state.contract.is_empty()).then_some(&goal_state.contract);
                     let provisional_outcome = crate::turn_epilogue::assess_turn_outcome(
                         crate::turn_epilogue::TurnAssessParams {
                             final_response: &text,
@@ -2501,29 +2502,49 @@ impl Agent {
                         },
                     );
 
-                    if crate::turn_epilogue::should_reopen_loop_with_evidence(
+                    match crate::completion_reopen::decide_completion_reopen(
                         &provisional_outcome,
                         &session.messages,
                         trackers.evidence.assess_snapshot(),
+                        &completion_reopen_gate,
                     ) {
-                        tracing::info!(
-                            state = provisional_outcome.state.as_str(),
-                            active_tasks = todo.active,
-                            blocked_tasks = todo.blocked,
-                            pending_approvals =
-                                run_progress.pending_approvals.load(Ordering::Relaxed),
-                            pending_clarifications =
-                                run_progress.pending_clarifications.load(Ordering::Relaxed),
-                            child_runs = run_progress.child_runs_in_flight.load(Ordering::Relaxed),
-                            "model returned final text before the harness considered the task complete; continuing the loop"
-                        );
-                        session.messages.push(Message::user(
-                            &crate::turn_epilogue::completion_follow_up_message(
-                                &provisional_outcome,
-                            ),
-                        ));
-                        self.publish_session_state(&session).await;
-                        continue;
+                        crate::completion_reopen::ReopenDecision::Reopen => {
+                            completion_reopen_gate.reopens_used =
+                                completion_reopen_gate.reopens_used.saturating_add(1);
+                            tracing::info!(
+                                state = provisional_outcome.state.as_str(),
+                                reopen = completion_reopen_gate.reopens_used,
+                                max_reopens = completion_reopen_gate.max_reopens,
+                                active_tasks = todo.active,
+                                blocked_tasks = todo.blocked,
+                                pending_approvals =
+                                    run_progress.pending_approvals.load(Ordering::Relaxed),
+                                pending_clarifications =
+                                    run_progress.pending_clarifications.load(Ordering::Relaxed),
+                                child_runs =
+                                    run_progress.child_runs_in_flight.load(Ordering::Relaxed),
+                                "model returned final text before the harness considered the task complete; continuing the loop"
+                            );
+                            session.messages.push(Message::user(
+                                &crate::turn_epilogue::completion_follow_up_message(
+                                    &provisional_outcome,
+                                ),
+                            ));
+                            self.publish_session_state(&session).await;
+                            continue;
+                        }
+                        crate::completion_reopen::ReopenDecision::CapReached => {
+                            tracing::warn!(
+                                state = provisional_outcome.state.as_str(),
+                                max_reopens = completion_reopen_gate.max_reopens,
+                                "completion reopen cap reached — ending turn (025)"
+                            );
+                            final_response = text;
+                            // Terminal: escalate so final assess cannot reopen into thrash.
+                            trackers.evidence.escalate("reopen_cap");
+                            break;
+                        }
+                        crate::completion_reopen::ReopenDecision::DoNotReopen => {}
                     }
 
                     // ── Shadow Judge veto ────────────────────────────────────
@@ -2656,9 +2677,7 @@ impl Agent {
                     if trackers.evidence.visual_evidence_complete()
                         || trackers.evidence.media_evidence_complete()
                     {
-                        tracing::info!(
-                            "visual/media evidence latch complete — ending turn"
-                        );
+                        tracing::info!("visual/media evidence latch complete — ending turn");
                         final_response = session
                             .messages
                             .iter()
@@ -2666,13 +2685,8 @@ impl Agent {
                             .find(|m| m.role == Role::Assistant)
                             .map(|m| m.text_content())
                             .filter(|t| !t.trim().is_empty())
-                            .unwrap_or_else(|| {
-                                "Visual evidence latched — task verified.".into()
-                            });
-                        emit_activity(
-                            event_tx,
-                            "✓ Evidence latch complete — ending turn (Done).",
-                        );
+                            .unwrap_or_else(|| "Visual evidence latched — task verified.".into());
+                        emit_activity(event_tx, "✓ Evidence latch complete — ending turn (Done).");
                         self.publish_session_state(&session).await;
                         break;
                     }
@@ -2690,13 +2704,8 @@ impl Agent {
                             .find(|m| m.role == Role::Assistant)
                             .map(|m| m.text_content())
                             .filter(|t| !t.trim().is_empty())
-                            .unwrap_or_else(|| {
-                                trackers.evidence.allowed_action_message()
-                            });
-                        emit_activity(
-                            event_tx,
-                            "⏹ Verification escalated — ending turn.",
-                        );
+                            .unwrap_or_else(|| trackers.evidence.allowed_action_message());
+                        emit_activity(event_tx, "⏹ Verification escalated — ending turn.");
                         self.publish_session_state(&session).await;
                         break;
                     }
@@ -2735,9 +2744,11 @@ impl Agent {
                     }
 
                     // Tool results have been appended to session.messages.
-                    // Inject budget pressure warning if approaching iteration limit.
-                    if let Some(warning) =
-                        get_budget_warning(session.api_call_count, config.max_iterations)
+                    // L8 / 025: mid-budget model injects are opt-in (default off).
+                    // Hermes removed them — models quit early under wrap-up pressure.
+                    if config.harness.inject_budget_pressure
+                        && let Some(warning) =
+                            get_budget_warning(session.api_call_count, config.max_iterations)
                     {
                         inject_budget_warning(&mut session.messages, &warning);
                     }
@@ -2898,8 +2909,8 @@ impl Agent {
             .goal_store
             .active(&conversation_session_id)
             .unwrap_or_default();
-        let final_goal_contract = (!final_goal_state.contract.is_empty())
-            .then_some(&final_goal_state.contract);
+        let final_goal_contract =
+            (!final_goal_state.contract.is_empty()).then_some(&final_goal_state.contract);
         let mut run_outcome =
             crate::turn_epilogue::assess_turn_outcome(crate::turn_epilogue::TurnAssessParams {
                 final_response: &final_response,
@@ -3004,10 +3015,25 @@ impl Agent {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
+            // 025: preserve mid-turn checkpoint started_at / title / parent — never
+            // overwrite started_at with end time (zombie-forensics skew).
+            let existing = db.get_session(&session_id).ok().flatten();
             let (source, routing_key) = match &config.origin_chat {
                 Some(origin) => (origin.platform.clone(), Some(origin.chat_id.clone())),
-                None => ("cli".to_string(), None),
+                None => (
+                    existing
+                        .as_ref()
+                        .map(|s| s.source.clone())
+                        .unwrap_or_else(|| "cli".to_string()),
+                    existing.as_ref().and_then(|s| s.user_id.clone()),
+                ),
             };
+            let started_at = existing.as_ref().map(|s| s.started_at).unwrap_or(now);
+            let title = existing
+                .as_ref()
+                .and_then(|s| s.title.clone())
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or(title);
 
             let record = edgecrab_state::SessionRecord {
                 id: session_id.clone(),
@@ -3017,8 +3043,8 @@ impl Agent {
                 system_prompt: session.cached_system_prompt.clone(),
                 stable_system_prompt: session.cached_stable_prompt.clone(),
                 semi_stable_system_prompt: session.cached_semi_stable_prompt.clone(),
-                parent_session_id: None,
-                started_at: now,
+                parent_session_id: existing.as_ref().and_then(|s| s.parent_session_id.clone()),
+                started_at,
                 ended_at: Some(now),
                 end_reason: Some(run_outcome.exit_reason.as_str().to_string()),
                 message_count: session.messages.len() as i64,
@@ -3948,10 +3974,7 @@ fn append_tool_result_to_session(
     let delimit = edgecrab_security::tool_output_delimiters_enabled();
     let (body, scan) =
         edgecrab_security::prepare_tool_result_body(tool_call_id, tool_result, delimit);
-    if !matches!(
-        scan.verdict,
-        edgecrab_security::ThreatVerdict::Allow
-    ) {
+    if !matches!(scan.verdict, edgecrab_security::ThreatVerdict::Allow) {
         let kinds: Vec<&str> = scan.findings.iter().map(|f| f.pattern_id).collect();
         tracing::warn!(
             tool = tool_name,
@@ -4147,10 +4170,8 @@ async fn process_response(
             dctx.registry.as_ref().map(|r| r.as_ref()),
             &eligible,
         );
-        let parallel_cap = crate::tool_batch::parallel_max_workers(
-            None,
-            batch_plan.parallel.len().max(1),
-        );
+        let parallel_cap =
+            crate::tool_batch::parallel_max_workers(None, batch_plan.parallel.len().max(1));
         let parallel_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel_cap));
         if batch_plan.has_parallel() {
             tracing::debug!(
@@ -4192,19 +4213,8 @@ async fn process_response(
                     0,
                     true,
                 );
-                append_tool_result_to_session(
-                    session,
-                    dctx,
-                    &planned.id,
-                    &planned.name,
-                    &blocked,
-                );
-                trackers.record_tool_outcome(
-                    &planned.name,
-                    &planned.arguments,
-                    &blocked,
-                    true,
-                );
+                append_tool_result_to_session(session, dctx, &planned.id, &planned.name, &blocked);
+                trackers.record_tool_outcome(&planned.name, &planned.arguments, &blocked, true);
                 trackers
                     .dedup
                     .record(&planned.name, &planned.arguments, &blocked);
@@ -4929,21 +4939,15 @@ async fn dispatch_single_tool_impl(
     }
 
     // Hermes subdirectory AGENTS.md hints — append to tool result (cache-safe).
-    if !tool_failed
-        && let Some(tracker) = dctx.subdirectory_hints.as_ref()
-    {
+    if !tool_failed && let Some(tracker) = dctx.subdirectory_hints.as_ref() {
         let mut guard = tracker.lock().await;
         if let Some(hint) = guard.check_tool_call(name, &args_for_mutation) {
             result.push_str(&hint);
         }
     }
 
-    dctx.mutation_turn.record_tool_outcome(
-        name,
-        &args_for_mutation,
-        &result,
-        tool_failed,
-    );
+    dctx.mutation_turn
+        .record_tool_outcome(name, &args_for_mutation, &result, tool_failed);
 
     // Emit tool:post hook event
     crate::lifecycle_hooks::emit_global(
@@ -5030,7 +5034,8 @@ async fn dispatch_single_tool_impl(
         && dctx.app_config_ref.tool_schema_mode == ToolSchemaMode::Indexed
         && let Some(mat) = dctx.materialized_tools.as_ref()
     {
-        let targets = edgecrab_tools::recovery_catalog::tools_to_materialize_from_error_json(&result);
+        let targets =
+            edgecrab_tools::recovery_catalog::tools_to_materialize_from_error_json(&result);
         if !targets.is_empty() {
             let schemas = reg.get_definitions(None, None, &ctx);
             let outcome = edgecrab_tools::materialize_tool_names(
@@ -5304,10 +5309,7 @@ fn checkpoint_session_messages_mid_turn(dctx: &DispatchContext, session: &mut Se
         .unwrap_or_default()
         .as_secs_f64();
     stamp_unset_message_timestamps(&mut session.messages, now);
-    let existing = db
-        .get_session(&dctx.conversation_session_id)
-        .ok()
-        .flatten();
+    let existing = db.get_session(&dctx.conversation_session_id).ok().flatten();
     let (source, user_id) = match &dctx.origin_chat {
         Some(origin) => (origin.platform.clone(), Some(origin.chat_id.clone())),
         None => (
@@ -5318,11 +5320,12 @@ fn checkpoint_session_messages_mid_turn(dctx: &DispatchContext, session: &mut Se
             existing.as_ref().and_then(|s| s.user_id.clone()),
         ),
     };
-    let title = existing
-        .as_ref()
-        .and_then(|s| s.title.clone())
-        .or_else(|| {
-            session.messages.iter().find(|m| m.role == Role::User).map(|m| {
+    let title = existing.as_ref().and_then(|s| s.title.clone()).or_else(|| {
+        session
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User)
+            .map(|m| {
                 let t = m.text_content();
                 if t.len() > 80 {
                     format!("{}…", crate::safe_truncate(&t, 80))
@@ -5330,7 +5333,7 @@ fn checkpoint_session_messages_mid_turn(dctx: &DispatchContext, session: &mut Se
                     t
                 }
             })
-        });
+    });
     let record = edgecrab_state::SessionRecord {
         id: dctx.conversation_session_id.clone(),
         source,
@@ -7061,8 +7064,7 @@ def register(ctx):
     fn build_chat_messages_blocks_with_cache_config_does_not_double_mark_system() {
         let msgs = vec![Message::user("hi")];
         let resolved = test_resolved_cache(true);
-        let out =
-            build_chat_messages_blocks("STABLE", "", "DYNAMIC", &msgs, Some(&resolved), true);
+        let out = build_chat_messages_blocks("STABLE", "", "DYNAMIC", &msgs, Some(&resolved), true);
         // stable[0] already has cache_control set by us, not apply_cache_control
         assert!(out[0].cache_control.is_some());
         // dynamic[1] must NOT get cache_control even with cache config active

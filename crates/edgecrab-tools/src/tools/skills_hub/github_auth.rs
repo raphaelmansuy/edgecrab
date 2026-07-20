@@ -32,11 +32,7 @@ fn gh_cli_token() -> Option<String> {
         return None;
     }
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
+    if token.is_empty() { None } else { Some(token) }
 }
 
 /// Mint an installation token when App installation id is configured.

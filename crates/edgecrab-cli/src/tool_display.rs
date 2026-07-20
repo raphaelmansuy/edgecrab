@@ -2959,7 +2959,10 @@ mod tests {
         let stat = build_verbose_content_stat("apply_patch", &args).expect("stat");
         // Must not treat +++ / --- file headers as +/− counts.
         assert!(stat.contains("+2"), "expected +2 content adds, got: {stat}");
-        assert!(stat.contains("−1") || stat.contains("-1"), "expected −1, got: {stat}");
+        assert!(
+            stat.contains("−1") || stat.contains("-1"),
+            "expected −1, got: {stat}"
+        );
         assert!(stat.contains("file"), "got: {stat}");
     }
 
@@ -3705,11 +3708,7 @@ mod tests {
             r#"{"url":"http://127.0.0.1:8001/"}"#,
             Some(err),
         );
-        let ok_path = tool_failure_fingerprint(
-            "browser_navigate",
-            args,
-            Some(r#"{"ok":true}"#),
-        );
+        let ok_path = tool_failure_fingerprint("browser_navigate", args, Some(r#"{"ok":true}"#));
         assert_eq!(a, b, "identical fails must share fingerprint");
         assert_ne!(a, other_port, "different args must not collapse");
         assert_ne!(

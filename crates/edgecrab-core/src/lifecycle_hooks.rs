@@ -148,10 +148,7 @@ impl LifecycleHookRegistry {
     }
 
     pub fn scripts_for(&self, event: LifecycleEvent) -> Vec<&LifecycleHookScript> {
-        self.scripts
-            .iter()
-            .filter(|s| s.event == event)
-            .collect()
+        self.scripts.iter().filter(|s| s.event == event).collect()
     }
 
     /// Fire-and-forget: spawn matching scripts with JSON context on stdin.
@@ -194,8 +191,7 @@ impl LifecycleHookRegistry {
                     c.arg(&path);
                     c
                 };
-                cmd
-                    .stdin(std::process::Stdio::piped())
+                cmd.stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
                 match cmd.spawn() {

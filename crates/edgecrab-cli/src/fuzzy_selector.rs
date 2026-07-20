@@ -195,7 +195,9 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
             return;
         }
         let last = self.filtered.len().saturating_sub(1) as isize;
-        let next = (self.selected as isize).saturating_add(delta).clamp(0, last);
+        let next = (self.selected as isize)
+            .saturating_add(delta)
+            .clamp(0, last);
         self.selected = next as usize;
     }
 
@@ -309,7 +311,8 @@ mod tests {
         let items: Vec<TestItem> = (0..500)
             .map(|i| {
                 // Leak short-lived labels into 'static for the test fixture.
-                let primary = Box::leak(format!("skills.sh:owner/repo/skill-{i:03}").into_boxed_str());
+                let primary =
+                    Box::leak(format!("skills.sh:owner/repo/skill-{i:03}").into_boxed_str());
                 TestItem {
                     primary,
                     secondary: "↑ installs",

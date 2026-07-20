@@ -365,10 +365,8 @@ pub fn preview_loopback_host_port(url: &str) -> Option<(String, u16)> {
     }
     let host = parsed.host_str()?;
     let host_l = host.to_ascii_lowercase();
-    let is_loopback = host_l == "localhost"
-        || host_l == "127.0.0.1"
-        || host_l == "::1"
-        || host_l == "[::1]";
+    let is_loopback =
+        host_l == "localhost" || host_l == "127.0.0.1" || host_l == "::1" || host_l == "[::1]";
     if !is_loopback {
         return None;
     }
@@ -449,8 +447,8 @@ pub fn browser_navigate_blocked_with_session(
              (do not guess localhost ports)."
         )
     };
-    let mut builder = recovery_guidance()
-        .message("Browser navigation blocked — use HTTP preview, not file://");
+    let mut builder =
+        recovery_guidance().message("Browser navigation blocked — use HTTP preview, not file://");
     // Grantable SSRF denials: ask the user Once/Session/Always (spec 021).
     if reason.contains("SSRF")
         && let Some((host, port)) = preview_loopback_host_port(url)
@@ -853,8 +851,8 @@ pub fn memory_external_drift(filename: &str, drift_backup: &str) -> ToolError {
 /// Used to auto-materialize those tools onto the Indexed wire so SwitchTool /
 /// CallToolFirst targets are callable without a lucky `tool_search` (game001).
 pub fn tools_to_materialize_from_error_json(result: &str) -> Vec<String> {
-    use edgecrab_types::{RecoveryAction, parse_tool_error_payload};
     use crate::tool_schema_index::TOOL_SEARCH_NAME;
+    use edgecrab_types::{RecoveryAction, parse_tool_error_payload};
 
     let Some(payload) = parse_tool_error_payload(result) else {
         return Vec::new();
@@ -1021,7 +1019,9 @@ mod tests {
         assert!(blob.contains("needs_user_preference"));
         assert!(blob.contains("clarify"));
         assert!(blob.contains("do_not"));
-        assert!(!blob.contains("silent nvm use / fnm use without asking") || blob.contains("do_not"));
+        assert!(
+            !blob.contains("silent nvm use / fnm use without asking") || blob.contains("do_not")
+        );
     }
 
     #[test]
@@ -1184,7 +1184,10 @@ mod tests {
         ];
         let err = unknown_tool("quick_stock_quote", None, "quick stock quote", &sample);
         let recovery = err.to_llm_payload().recovery_feedback.expect("recovery");
-        assert_eq!(recovery.suggestions[0].action, RecoveryAction::CallToolFirst);
+        assert_eq!(
+            recovery.suggestions[0].action,
+            RecoveryAction::CallToolFirst
+        );
         let blob = serde_json::to_string(&recovery.suggestions[0].parameters).expect("json");
         assert!(blob.contains("tool_search"));
         assert!(blob.contains("quick stock quote") || blob.contains("query"));
@@ -1199,7 +1202,9 @@ mod tests {
         crate::dev_server::mark_pending_preview("sess-wait-bind", 8000, "proc-9");
         let err = browser_navigate_wait_bind("http://127.0.0.1:8000/", 8000, "proc-9");
         let body = err.to_llm_response();
-        assert!(body.contains("wait_bind") || body.contains("bind_ready") || body.contains("proc-9"));
+        assert!(
+            body.contains("wait_bind") || body.contains("bind_ready") || body.contains("proc-9")
+        );
         let parsed = edgecrab_types::parse_tool_error_payload(&body).expect("tool_error");
         assert!(
             parsed
@@ -1207,10 +1212,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|r| r.suggestions.iter().any(|s| {
                     s.action == RecoveryAction::CallToolFirst
-                        && s.parameters
-                            .get("wait_bind")
-                            .and_then(|v| v.as_bool())
-                            == Some(true)
+                        && s.parameters.get("wait_bind").and_then(|v| v.as_bool()) == Some(true)
                 })),
             "expected wait_bind CallToolFirst: {body}"
         );

@@ -207,6 +207,12 @@ export class AudioEngine {
     });
   }
 
+  rainbow() {
+    [660, 880, 1320, 1760].forEach((f, i) => {
+      setTimeout(() => this.beep(f, 0.22, 'sine', 0.08, f * 1.4), i * 90);
+    });
+  }
+
   lose() {
     this.beep(300, 0.2, 'sawtooth', 0.05, 120);
     setTimeout(() => this.beep(180, 0.28, 'triangle', 0.05, 80), 160);

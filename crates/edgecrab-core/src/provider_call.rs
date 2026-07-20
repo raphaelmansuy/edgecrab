@@ -38,10 +38,7 @@ fn stream_first_byte_timeout(
     // Copilot (and xAI SuperGrok/Grok reasoning) can open SSE quickly then spend
     // a long time prefill+reasoning before the first tool/content delta.
     // A tight 20s first-byte budget feels like a hang and forces non-stream fallback.
-    if transport_connected
-        && has_tools
-        && matches!(provider_name, "vscode-copilot" | "xai")
-    {
+    if transport_connected && has_tools && matches!(provider_name, "vscode-copilot" | "xai") {
         STREAM_POST_CONNECT_FIRST_BYTE_TIMEOUT
     } else if has_tools && provider_name == "xai" {
         // Pre-connect budget for xAI with tools: still generous (reasoning models).

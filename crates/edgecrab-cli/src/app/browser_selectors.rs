@@ -852,8 +852,7 @@ impl App {
             &self.skill_selector.query,
             BrowserChrome {
                 title: "Skills · Installed",
-                placeholder:
-                    "Filter installed · / or S → marketplace · M import-from · ? help",
+                placeholder: "Filter installed · / or S → marketplace · M import-from · ? help",
                 icon: "📚",
                 icon_color: accent,
                 border_color: warn,
@@ -865,8 +864,7 @@ impl App {
         let filtered = &self.skill_selector.filtered;
         let selected = self.skill_selector.selected;
         let total = filtered.len();
-        let (scroll_start, visible) =
-            Self::browser_virtual_window(selected, total, max_visible);
+        let (scroll_start, visible) = Self::browser_virtual_window(selected, total, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             let empty = if self.skill_selector.items.is_empty() {
@@ -1011,8 +1009,7 @@ impl App {
                     query: &self.skill_selector.query,
                     header: BrowserChrome {
                         title: "Skills · Installed",
-                        placeholder:
-                            "Filter installed · / or S → marketplace · M import-from",
+                        placeholder: "Filter installed · / or S → marketplace · M import-from",
                         icon: "📚",
                         icon_color: accent,
                         border_color: warn,
@@ -1097,11 +1094,14 @@ impl App {
             self.skills_marketplace_mode,
             super::skills_marketplace::MarketplaceMode::Inspect { .. }
         );
-        let browsing =
-            query.is_empty() && self.remote_skill_browser.inflight_request_id.is_some();
+        let browsing = query.is_empty() && self.remote_skill_browser.inflight_request_id.is_some();
         let searching = self.remote_skill_browser.inflight_request_id.is_some();
         // Expanded `?` help needs a multi-line footer (collapsed stays 1 row).
-        let footer_h = if self.skills_marketplace_help { 4u16 } else { 1 };
+        let footer_h = if self.skills_marketplace_help {
+            4u16
+        } else {
+            1
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1190,8 +1190,7 @@ impl App {
         } else {
             list_area.width
         };
-        let (scroll_start, visible) =
-            Self::browser_virtual_window(selected, total, max_visible);
+        let (scroll_start, visible) = Self::browser_virtual_window(selected, total, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             let mut empty_lines: Vec<ListItem> = Vec::new();
@@ -1220,7 +1219,10 @@ impl App {
             } else if !browser.notices.is_empty() && query.is_empty() {
                 let notice = browser.notices[0].as_str();
                 empty_lines.push(ListItem::new(Line::from(Span::styled(
-                    format!("  {}", unicode_trunc(notice, list_inner_width.saturating_sub(2) as usize)),
+                    format!(
+                        "  {}",
+                        unicode_trunc(notice, list_inner_width.saturating_sub(2) as usize)
+                    ),
                     Style::default().fg(Color::Rgb(255, 191, 0)),
                 ))));
                 if let Some(cta) = super::skill_inspect_view::marketplace_notice_cta(notice) {
@@ -1364,35 +1366,32 @@ impl App {
         };
 
         if let Some((inspect_id, preview_scroll)) = inspect_scroll.as_ref() {
-            if let Some(entry) = browser.selector.current().filter(|e| e.identifier == *inspect_id)
+            if let Some(entry) = browser
+                .selector
+                .current()
+                .filter(|e| e.identifier == *inspect_id)
             {
-                let loading = self.remote_skill_guard.inflight.as_deref()
-                    == Some(entry.identifier.as_str());
-                let preview = self
-                    .remote_skill_guard
-                    .preview
-                    .as_ref()
-                    .filter(|_| {
-                        self.remote_skill_guard.for_identifier.as_deref()
-                            == Some(entry.identifier.as_str())
-                    });
-                let error = self
-                    .remote_skill_guard
-                    .error
-                    .as_deref()
-                    .filter(|_| {
-                        self.remote_skill_guard.for_identifier.as_deref()
-                            == Some(entry.identifier.as_str())
-                            || loading
-                    });
+                let loading =
+                    self.remote_skill_guard.inflight.as_deref() == Some(entry.identifier.as_str());
+                let preview = self.remote_skill_guard.preview.as_ref().filter(|_| {
+                    self.remote_skill_guard.for_identifier.as_deref()
+                        == Some(entry.identifier.as_str())
+                });
+                let error = self.remote_skill_guard.error.as_deref().filter(|_| {
+                    self.remote_skill_guard.for_identifier.as_deref()
+                        == Some(entry.identifier.as_str())
+                        || loading
+                });
                 let model = super::skill_inspect_view::SkillInspectModel::from_catalog_and_preview(
                     entry.to_inspect_catalog(),
                     preview,
                     loading,
                     error,
                 );
-                detail_lines =
-                    super::skill_inspect_view::render_inspect_dossier_lines(&model, *preview_scroll);
+                detail_lines = super::skill_inspect_view::render_inspect_dossier_lines(
+                    &model,
+                    *preview_scroll,
+                );
             } else if let Some(entry) = browser.selector.current() {
                 // Selection drifted; show catalog dossier for current row.
                 let model = super::skill_inspect_view::SkillInspectModel::from_catalog_and_preview(
@@ -1401,12 +1400,16 @@ impl App {
                     false,
                     Some("Selection changed — press Enter again to inspect."),
                 );
-                detail_lines =
-                    super::skill_inspect_view::render_inspect_dossier_lines(&model, *preview_scroll);
+                detail_lines = super::skill_inspect_view::render_inspect_dossier_lines(
+                    &model,
+                    *preview_scroll,
+                );
             }
         } else if let Some(entry) = browser.selector.current() {
             let status_line = match entry.action {
-                RemoteSkillAction::Install => "Default action: install (Enter inspect first)".to_string(),
+                RemoteSkillAction::Install => {
+                    "Default action: install (Enter inspect first)".to_string()
+                }
                 RemoteSkillAction::Update => format!(
                     "Default action: update ({})",
                     entry.installed_name.as_deref().unwrap_or(&entry.name)
@@ -1472,11 +1475,8 @@ impl App {
             self.append_remote_skill_guard_detail(&mut detail_lines);
         } else if query.is_empty() {
             if browser.inflight_request_id.is_some() {
-                let status = browser.loading_status_line(
-                    true,
-                    &filter_label,
-                    self.terminal_glyph_profile,
-                );
+                let status =
+                    browser.loading_status_line(true, &filter_label, self.terminal_glyph_profile);
                 detail_lines.push(Line::from(Span::styled(
                     status,
                     Style::default()
@@ -1514,11 +1514,8 @@ impl App {
                 }
             }
         } else if browser.inflight_request_id.is_some() {
-            let status = browser.loading_status_line(
-                false,
-                &filter_label,
-                self.terminal_glyph_profile,
-            );
+            let status =
+                browser.loading_status_line(false, &filter_label, self.terminal_glyph_profile);
             detail_lines.push(Line::from(Span::styled(
                 status,
                 Style::default()
@@ -1632,10 +1629,7 @@ impl App {
                 .browse_page_cache
                 .catalog_ensure_inflight
                 || (!self.browse_catalog_complete()
-                    && self
-                        .remote_skill_browser
-                        .browse_page_cache
-                        .stream_complete));
+                    && self.remote_skill_browser.browse_page_cache.stream_complete));
         let range = if catalog_loading {
             super::browse_page_cache::marketplace_browse_range_label_full(
                 scroll_start,
@@ -1751,8 +1745,7 @@ impl App {
         let filtered = &browser.selector.filtered;
         let selected = browser.selector.selected;
         let total = filtered.len();
-        let (scroll_start, visible) =
-            Self::browser_virtual_window(selected, total, max_visible);
+        let (scroll_start, visible) = Self::browser_virtual_window(selected, total, max_visible);
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             let empty_text = if query.is_empty() {

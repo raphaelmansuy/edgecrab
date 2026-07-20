@@ -1310,12 +1310,7 @@ pub fn to_llm_definitions_with_mode(
     schemas: &[ToolSchema],
     mode: crate::schema_mode::ToolSchemaMode,
 ) -> Vec<edgequake_llm::ToolDefinition> {
-    to_llm_definitions_with_materialized(
-        schemas,
-        mode,
-        &std::collections::HashSet::new(),
-        false,
-    )
+    to_llm_definitions_with_materialized(schemas, mode, &std::collections::HashSet::new(), false)
 }
 
 /// Convert schemas for the LLM wire, honoring indexed materialization state.
@@ -1448,15 +1443,13 @@ fn skill_manage_required_fields(args_json: Option<&str>) -> Option<Vec<String>> 
     let action = args_json
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|v| {
-            v.get("action")
-                .and_then(Value::as_str)
-                .map(|s| {
-                    if s == "write_file" {
-                        "write_skill_file".to_string()
-                    } else {
-                        s.to_string()
-                    }
-                })
+            v.get("action").and_then(Value::as_str).map(|s| {
+                if s == "write_file" {
+                    "write_skill_file".to_string()
+                } else {
+                    s.to_string()
+                }
+            })
         })
         .unwrap_or_default();
     let mut fields = vec!["action".into(), "name".into()];
@@ -1491,18 +1484,14 @@ fn skill_manage_usage_hint(args_json: Option<&str>) -> Option<String> {
              For workspace files use the write_file tool (path + content)."
                 .into()
         }
-        "patch" => {
-            "skill_manage patch requires action, name, old_string, and new_string.".into()
-        }
+        "patch" => "skill_manage patch requires action, name, old_string, and new_string.".into(),
         "write_skill_file" => {
             "skill_manage write_skill_file requires action, name, file_path, and file_content \
              (paths under references/, templates/, scripts/, or assets/). \
              For workspace files use the write_file tool (path + content)."
                 .into()
         }
-        "remove_file" => {
-            "skill_manage remove_file requires action, name, and file_path.".into()
-        }
+        "remove_file" => "skill_manage remove_file requires action, name, and file_path.".into(),
         "delete" => "skill_manage delete requires action and name.".into(),
         _ => return None,
     })
@@ -2154,7 +2143,11 @@ mod tests {
         assert!(resp.usage_hint.unwrap().contains("path"));
         let recovery = resp.recovery_feedback.expect("SetParameter recovery");
         let blob = serde_json::to_string(&recovery).expect("json");
-        assert!(blob.contains("SET_PARAMETER") || blob.contains("SetParameter") || blob.contains("required"));
+        assert!(
+            blob.contains("SET_PARAMETER")
+                || blob.contains("SetParameter")
+                || blob.contains("required")
+        );
         assert!(!blob.contains("tool_search"));
     }
 

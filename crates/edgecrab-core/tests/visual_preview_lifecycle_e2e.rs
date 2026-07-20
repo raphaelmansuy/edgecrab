@@ -12,12 +12,12 @@ use edgecrab_tools::recovery_catalog::{
     browser_navigate_blocked, infer_preview_serve_directory_from_text,
     preview_serve_then_navigate_recipe, tools_to_materialize_from_error_json,
 };
-use edgecrab_types::{Message, RecoveryAction};
 use edgecrab_tools::{
-    MaterializeSchemaStyle, MaterializedToolSet, ToolContext, ToolRegistry, ToolSchemaMode,
-    build_wire_llm_definitions, materialize_tool_names, read_materialized_set, AppConfigRef,
+    AppConfigRef, MaterializeSchemaStyle, MaterializedToolSet, ToolContext, ToolRegistry,
+    ToolSchemaMode, build_wire_llm_definitions, materialize_tool_names, read_materialized_set,
 };
 use edgecrab_types::Platform;
+use edgecrab_types::{Message, RecoveryAction};
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -34,7 +34,8 @@ fn game002_preview_server_exempt_from_visual_storm() {
         edgecrab_core::task_class::classify_from_messages(&messages),
         TaskClass::VisualUx
     );
-    let serve_args = r#"{"command":"python3 -m http.server 8000 --directory demo/game002","background":true}"#;
+    let serve_args =
+        r#"{"command":"python3 -m http.server 8000 --directory demo/game002","background":true}"#;
     assert!(
         visual_storm_block_result_with_args(&adv, &messages, "terminal", serve_args).is_none(),
         "preview-server start must remain callable after create writes"
@@ -48,9 +49,8 @@ fn game002_preview_server_exempt_from_visual_storm() {
 
 #[test]
 fn game002_empty_ports_recovery_is_exact_serve_recipe() {
-    let dir = infer_preview_serve_directory_from_text(
-        "Write a complete html5 game in ./demo/game002",
-    );
+    let dir =
+        infer_preview_serve_directory_from_text("Write a complete html5 game in ./demo/game002");
     assert_eq!(dir, "demo/game002");
     let recipe = preview_serve_then_navigate_recipe(&dir);
     assert_eq!(recipe["tool"], "terminal");
@@ -144,9 +144,7 @@ fn game002_visual_ux_materializes_browser_verify_tools() {
         task_id: "t".into(),
         cwd: std::env::temp_dir(),
         session_id: "s".into(),
-        user_task: Some(
-            "Write a complete html5 game in ./demo/game002 and verify visually".into(),
-        ),
+        user_task: Some("Write a complete html5 game in ./demo/game002 and verify visually".into()),
         cancel: CancellationToken::new(),
         config: AppConfigRef {
             tool_schema_mode: ToolSchemaMode::Indexed,

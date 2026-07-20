@@ -61,15 +61,16 @@ pub use hub_slash::{
     format_bundled_diff_result, handle_skills_hub_slash, hub_slash_mutates_skills,
     is_remote_skill_identifier, parse_inspect_operand,
 };
+pub use import_from::{
+    ImportReport, PeerSkillHome, import_skills_from, peer_external_dir_presets, resolve_import_root,
+};
 pub use index::{
     INDEX_TTL_SECS, browse_unified_index_slice, format_index_status, index_age_secs,
     index_file_exists, unified_index_len,
 };
-pub use import_from::{
-    ImportReport, PeerSkillHome, import_skills_from, peer_external_dir_presets, resolve_import_root,
-};
 /// TUI/CLI import-from peer alias list (DRY with [`PeerSkillHome::ALIASES`]).
 pub const IMPORT_FROM_PEERS: &[&str] = PeerSkillHome::ALIASES;
+pub use catalog::{is_provider_filter, provider_filter_repos};
 pub use install_preview::{
     BundleFilePreview, InstallScanPreview, ScanFindingPreview, format_preview_text_report,
     inspect_identifier_scan, preview_install_scan, preview_installed_skill, preview_skill_scan,
@@ -78,11 +79,9 @@ pub use install_stages::{
     InstallStage, InstallStageReport, format_stages_human, format_stages_json,
 };
 pub use local_bundle::build_local_skill_bundle;
-pub use catalog::{is_provider_filter, provider_filter_repos};
 pub use normalize::normalize_identifier;
 pub use npm_pack::{install_npm_identifier, parse_npm_spec};
 pub use publish::{PublishTarget, publish_skill};
-pub use snapshot::{export_hub_snapshot, import_hub_snapshot};
 pub use router::{SkillSourceRouter, classify_source_id};
 pub use signed_taps::{
     SIGNED_TAP_SCHEMA, SignedSkillEntry, SignedTapManifest, VerifiedSignedTap,
@@ -90,6 +89,7 @@ pub use signed_taps::{
     key_id_from_public_key_b64, load_and_verify_signed_tap_file, pin_publisher_key, sign_manifest,
     verify_signed_manifest,
 };
+pub use snapshot::{export_hub_snapshot, import_hub_snapshot};
 pub use source_trait::{ALL_SOURCE_IDS, SkillSource, source_id_catalog_lines};
 pub use sources::{federation_endpoints, set_config_federation_hubs};
 pub use web_hub::{WEB_HUB_ROUTES, format_web_hub_status};
@@ -108,7 +108,9 @@ pub async fn fetch_well_known_bundle_for_test(
 }
 
 pub(crate) const SOURCE_TIMEOUT_SECS: u64 = 12;
-use catalog::{CatalogKind as SourceKind, HubCatalogEntry as SourceDefinition, curated_search_entries};
+use catalog::{
+    CatalogKind as SourceKind, HubCatalogEntry as SourceDefinition, curated_search_entries,
+};
 
 // ─── Paths ─────────────────────────────────────────────────────
 
@@ -662,7 +664,14 @@ pub async fn search_hub(
     limit_per_source: usize,
     configured_hub_url: Option<&str>,
 ) -> SearchReport {
-    search_hub_progressive(query, source_filter, limit_per_source, configured_hub_url, |_| {}).await
+    search_hub_progressive(
+        query,
+        source_filter,
+        limit_per_source,
+        configured_hub_url,
+        |_| {},
+    )
+    .await
 }
 
 /// Progressive marketplace search/browse for TUI first-paint.
@@ -988,14 +997,22 @@ fn filter_search_report_by_provider(report: &mut SearchReport, filter: &str) {
                 || (filter.eq_ignore_ascii_case("openai")
                     && meta.identifier.to_ascii_lowercase().starts_with("openai"))
                 || (filter.eq_ignore_ascii_case("anthropic")
-                    && meta.identifier.to_ascii_lowercase().starts_with("anthropics:"))
+                    && meta
+                        .identifier
+                        .to_ascii_lowercase()
+                        .starts_with("anthropics:"))
                 || (filter.eq_ignore_ascii_case("huggingface")
-                    && meta.identifier.to_ascii_lowercase().starts_with("huggingface:"))
+                    && meta
+                        .identifier
+                        .to_ascii_lowercase()
+                        .starts_with("huggingface:"))
                 || (filter.eq_ignore_ascii_case("nvidia")
                     && meta.identifier.to_ascii_lowercase().starts_with("nvidia:"))
         });
     }
-    report.groups.retain(|g| !g.results.is_empty() || g.notice.is_some());
+    report
+        .groups
+        .retain(|g| !g.results.is_empty() || g.notice.is_some());
 }
 
 /// Refresh the unified index from the public remote catalog.
@@ -1435,7 +1452,8 @@ async fn browse_skills_sh_sitemap(
 ///
 /// Seed-only browse cache is never treated as a complete catalog.
 pub async fn ensure_skills_sh_sitemap_catalog() -> Result<(), String> {
-    if skills_sh_sitemap_catalog_complete() && skills_sh_sitemap_cache_len().is_some_and(|n| n > 0) {
+    if skills_sh_sitemap_catalog_complete() && skills_sh_sitemap_cache_len().is_some_and(|n| n > 0)
+    {
         return Ok(());
     }
     let client = hub_client_catalog()?;
@@ -1467,10 +1485,7 @@ async fn fetch_skills_sh_sitemap_text(
         .await
         .map_err(|e| format!("skills.sh sitemap fetch failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "skills.sh sitemap returned HTTP {}",
-            resp.status()
-        ));
+        return Err(format!("skills.sh sitemap returned HTTP {}", resp.status()));
     }
     let bytes = resp
         .bytes()
@@ -1708,9 +1723,8 @@ async fn browse_skills_sh_seed_fallback(
                 )),
             ));
         }
-        let err = last_err.unwrap_or_else(|| {
-            "skills.sh browse returned no skills (network or API error)".into()
-        });
+        let err = last_err
+            .unwrap_or_else(|| "skills.sh browse returned no skills (network or API error)".into());
         if skills_sh_is_rate_limited(&err) {
             return Err(
                 "skills.sh rate-limited (max ~30 req/min). Wait a minute, then press r to retry."
@@ -1762,8 +1776,7 @@ async fn search_voltagent_awesome_source(
     summary: HubSourceInfo,
 ) -> SearchGroup {
     let fetch = async {
-        if let Some(cache) =
-            sources::read_registry_cache::<Vec<SkillMeta>>(VOLTAGENT_AWESOME_CACHE)
+        if let Some(cache) = sources::read_registry_cache::<Vec<SkillMeta>>(VOLTAGENT_AWESOME_CACHE)
             && sources::cache_fresh(cache.fetched_at)
             && !cache.items.is_empty()
         {
@@ -1849,11 +1862,7 @@ fn harvest_awesome_list_skill_metas(
                 .next()
                 .unwrap_or(candidate.as_str())
                 .to_string();
-            let repo = candidate
-                .split('/')
-                .take(2)
-                .collect::<Vec<_>>()
-                .join("/");
+            let repo = candidate.split('/').take(2).collect::<Vec<_>>().join("/");
             let path_tail = candidate.split('/').skip(2).collect::<Vec<_>>().join("/");
             let path = if path_tail.is_empty() {
                 None
@@ -2291,7 +2300,8 @@ pub fn install_skill(
                     .get("SKILL.md")
                     .map(|s| s.as_bytes())
                     .unwrap_or(b"");
-                if let Err(e) = signed_taps::assert_content_hash(&verified, &bundle.name, skill_md) {
+                if let Err(e) = signed_taps::assert_content_hash(&verified, &bundle.name, skill_md)
+                {
                     let _ = std::fs::remove_dir_all(&q_skill_dir);
                     return Err(e);
                 }
@@ -2681,7 +2691,11 @@ fn flatten_browse_results(report: &SearchReport) -> Vec<SkillMeta> {
         trust_rank(&b.trust_level)
             .cmp(&trust_rank(&a.trust_level))
             .then_with(|| (a.source != "official").cmp(&(b.source != "official")))
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
     });
     items
 }
@@ -3580,14 +3594,11 @@ pub(crate) async fn search_skills_sh_registry(
                 .get("id")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            let installs = item
-                .get("installs")
-                .and_then(|v| v.as_u64())
-                .or_else(|| {
-                    item.get("installs")
-                        .and_then(|v| v.as_i64())
-                        .map(|n| n.max(0) as u64)
-                });
+            let installs = item.get("installs").and_then(|v| v.as_u64()).or_else(|| {
+                item.get("installs")
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n.max(0) as u64)
+            });
             let api_desc = item
                 .get("description")
                 .and_then(|d| d.as_str())
@@ -4293,7 +4304,10 @@ mod tests {
             "skills/.system",
             "trusted",
         );
-        assert_eq!(meta.identifier, "openai/skills/skills/.system/skill-installer");
+        assert_eq!(
+            meta.identifier,
+            "openai/skills/skills/.system/skill-installer"
+        );
         assert!(looks_like_github_identifier(&meta.identifier));
         assert_eq!(
             parse_github_identifier(&meta.identifier),
@@ -4683,10 +4697,7 @@ mod tests {
         assert!(gz.starts_with(&[0x1f, 0x8b]));
         let decoded = decode_skills_sh_sitemap_bytes(&gz).expect("gzip decode");
         assert!(decoded.contains("skill-a"));
-        assert_eq!(
-            decode_skills_sh_sitemap_bytes(xml.as_bytes()).unwrap(),
-            xml
-        );
+        assert_eq!(decode_skills_sh_sitemap_bytes(xml.as_bytes()).unwrap(), xml);
     }
 
     #[test]
@@ -4716,8 +4727,7 @@ mod tests {
         let page2 = browse_skills_sh_cache_slice(page, page).expect("page 2 slice");
         assert_eq!(page2.results.len(), page);
         assert_ne!(
-            page2.results[0].identifier,
-            all[0].identifier,
+            page2.results[0].identifier, all[0].identifier,
             "page 2 must start after first page"
         );
     }

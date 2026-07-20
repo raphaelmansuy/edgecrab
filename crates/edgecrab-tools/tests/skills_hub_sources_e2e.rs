@@ -9,12 +9,12 @@ use edgecrab_tools::tools::skills_guard::{self, InstallPolicyContext, Verdict};
 use edgecrab_tools::tools::skills_hub::{
     ALL_SOURCE_IDS, HUB_CATALOG, InstallGate, MARKETPLACE_BROWSE_FETCH_MAX, MarketplaceSourceClass,
     SkillBundle, SkillSourceRouter, build_local_skill_bundle, classify_source_id,
-    ensure_default_taps, federation_endpoints, fetch_well_known_bundle_for_test, import_skills_from,
-    install_skill, is_provider_filter, marketplace_provider_filters, marketplace_result_limit,
-    marketplace_source_class, normalize_identifier, npm_pack_extract_for_test, parse_npm_spec,
-    peer_external_dir_presets, preview_install_scan, provider_filter_repos, read_taps,
-    render_sources_catalog, resolve_fetchable_identifier, resolve_github_token, search_hub,
-    source_id_catalog_lines,
+    ensure_default_taps, federation_endpoints, fetch_well_known_bundle_for_test,
+    import_skills_from, install_skill, is_provider_filter, marketplace_provider_filters,
+    marketplace_result_limit, marketplace_source_class, normalize_identifier,
+    npm_pack_extract_for_test, parse_npm_spec, peer_external_dir_presets, preview_install_scan,
+    provider_filter_repos, read_taps, render_sources_catalog, resolve_fetchable_identifier,
+    resolve_github_token, search_hub, source_id_catalog_lines,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -89,7 +89,10 @@ fn hermes_source_ids_catalogued() {
 
 #[test]
 fn normalize_peer_aliases() {
-    assert_eq!(normalize_identifier("@alice/cool-skill"), "clawhub:cool-skill");
+    assert_eq!(
+        normalize_identifier("@alice/cool-skill"),
+        "clawhub:cool-skill"
+    );
     assert_eq!(
         normalize_identifier("git:owner/repo/skills/foo"),
         "owner/repo/skills/foo"
@@ -294,9 +297,7 @@ async fn search_hub_dispatches_via_router_adapters() {
     let _ = router.search("github", "test-query", 3).await;
     let _ = router.search("clawhub", "test-query", 3).await;
     let _ = router.search("hermes-index", "test-query", 3).await;
-    let groups = router
-        .search_groups("test-query", "openai", 3, None)
-        .await;
+    let groups = router.search_groups("test-query", "openai", 3, None).await;
     // Provider filter path exercised (groups may be empty offline).
     let _ = groups;
     let report = search_hub("test-query", Some("index"), 3, None).await;
@@ -332,7 +333,10 @@ fn path_traversal_bundle_rejected_on_install() {
     let err = install_skill(&bundle, &skills_dir, InstallGate::default()).unwrap_err();
     let el = err.to_lowercase();
     assert!(
-        el.contains("traversal") || el.contains("..") || el.contains("invalid") || el.contains("path"),
+        el.contains("traversal")
+            || el.contains("..")
+            || el.contains("invalid")
+            || el.contains("path"),
         "expected path traversal rejection, got: {err}"
     );
 }
@@ -366,10 +370,7 @@ fn npm_extract_then_install_nested_skill() {
     std::fs::create_dir_all(&extract).unwrap();
     npm_pack_extract_for_test(&std::fs::read(&tgz_path).unwrap(), &extract).unwrap();
 
-    let skill_dir = extract
-        .join("package")
-        .join("skills")
-        .join("from-npm");
+    let skill_dir = extract.join("package").join("skills").join("from-npm");
     let bundle = build_local_skill_bundle(&skill_dir, None).unwrap();
     assert_eq!(bundle.name, "from-npm");
     install_skill(&bundle, &skills_dir, InstallGate::default()).unwrap();
@@ -397,20 +398,15 @@ fn sample_identifier_for_marketplace_filter(filter: &str) -> Option<&'static str
 #[test]
 fn each_marketplace_filter_has_fetchable_sample_identifier() {
     for filter in marketplace_provider_filters() {
-        let sample = sample_identifier_for_marketplace_filter(filter)
-            .unwrap_or_else(|| panic!("missing sample identifier for marketplace filter `{filter}`"));
+        let sample = sample_identifier_for_marketplace_filter(filter).unwrap_or_else(|| {
+            panic!("missing sample identifier for marketplace filter `{filter}`")
+        });
         let normalized = normalize_identifier(sample);
         let source_id = classify_source_id(&normalized);
         assert!(
             matches!(
                 source_id,
-                "github"
-                    | "clawhub"
-                    | "skills-sh"
-                    | "hermes-index"
-                    | "npm"
-                    | "well-known"
-                    | "url"
+                "github" | "clawhub" | "skills-sh" | "hermes-index" | "npm" | "well-known" | "url"
             ),
             "filter `{filter}` sample `{sample}` classified as unexpected `{source_id}`"
         );
@@ -520,9 +516,7 @@ fn each_marketplace_source_tap_opaque_id_is_fetchable() {
 async fn skills_sh_empty_browse_does_not_400() {
     let _home = TestHome::new();
     let router = SkillSourceRouter::new();
-    let groups = router
-        .search_groups("", "skills-sh", 5, None)
-        .await;
+    let groups = router.search_groups("", "skills-sh", 5, None).await;
     let skills_sh = groups
         .iter()
         .find(|g| g.source.id == "skills.sh" || g.source.id == "skills-sh");
@@ -557,10 +551,7 @@ async fn skills_sh_empty_browse_does_not_400() {
 async fn voltagent_browse_harvests_or_emits_honest_notice() {
     let _home = TestHome::new();
     let report = search_hub("", Some("voltagent"), 30, None).await;
-    let group = report
-        .groups
-        .iter()
-        .find(|g| g.source.id == "voltagent");
+    let group = report.groups.iter().find(|g| g.source.id == "voltagent");
     let Some(group) = group else {
         return; // offline
     };
@@ -733,11 +724,7 @@ async fn each_marketplace_source_empty_browse_fetchable_parity() {
 async fn github_raw_guard_scan_works_without_tree_api() {
     // Concrete skill path — should load via raw.githubusercontent.com even if tree is rate-limited.
     let _home = TestHome::new();
-    let preview = preview_install_scan(
-        "anthropics/skills/skills/algorithmic-art",
-        None,
-    )
-    .await;
+    let preview = preview_install_scan("anthropics/skills/skills/algorithmic-art", None).await;
     match preview {
         Ok(p) => {
             assert!(!p.skill_name.is_empty());
@@ -803,7 +790,8 @@ async fn well_known_install_via_mock_http() {
     let skills_dir = home.path().join("skills");
     std::fs::create_dir_all(&skills_dir).unwrap();
 
-    let skill_body = Arc::new("---\nname: wk-demo\ndescription: demo\n---\n# Well Known\n".to_string());
+    let skill_body =
+        Arc::new("---\nname: wk-demo\ndescription: demo\n---\n# Well Known\n".to_string());
     let index_body = Arc::new(
         r#"{"skills":[{"name":"wk-demo","description":"demo","files":["SKILL.md"]}]}"#.to_string(),
     );

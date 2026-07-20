@@ -143,15 +143,65 @@ impl TurnDispatchTrackers {
         let is_mutation = matches!(tool_name, "write_file" | "patch" | "apply_patch");
         self.evidence.count_tool(tool_name, is_mutation);
 
-        if is_mutation && !is_error {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(tool_result)
-                && v.get("ok").and_then(|o| o.as_bool()) == Some(true)
-                && let Some(path) = v.get("path").and_then(|p| p.as_str())
+        if is_mutation
+            && !is_error
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(tool_result)
+            && v.get("ok").and_then(|o| o.as_bool()) == Some(true)
+            && let Some(path) = v.get("path").and_then(|p| p.as_str())
+        {
+            self.evidence.note_artifact_path(path);
+            if crate::task_class::is_media_output_path(path) {
+                let bytes = v.get("bytes").and_then(|b| b.as_u64()).unwrap_or(1);
+                self.evidence.note_media_artifact_ok(path, bytes.max(1));
+            }
+        }
+
+        // 025: reading an existing demo seeds Artifact without requiring a write.
+        if matches!(tool_name, "read_file" | "file_read") && !is_error {
+            let path_hint = serde_json::from_str::<serde_json::Value>(args_json)
+                .ok()
+                .and_then(|v| {
+                    v.get("path")
+                        .or_else(|| v.get("file_path"))
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string())
+                })
+                .or_else(|| {
+                    serde_json::from_str::<serde_json::Value>(tool_result)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("path")
+                                .and_then(|p| p.as_str())
+                                .map(|s| s.to_string())
+                        })
+                });
+            if let Some(path) = path_hint
+                && let Some(root) = EvidenceState::demo_root_for_path(std::path::Path::new(&path))
             {
-                self.evidence.note_artifact_path(path);
-                if crate::task_class::is_media_output_path(path) {
-                    let bytes = v.get("bytes").and_then(|b| b.as_u64()).unwrap_or(1);
-                    self.evidence.note_media_artifact_ok(path, bytes.max(1));
+                self.evidence.seed_artifact_from_demo_dir(&root);
+            }
+        }
+
+        // 025: deterministic product oracle (smoketest / check.sh) latches done.
+        if matches!(tool_name, "terminal" | "run_process") && !is_error {
+            let cmd_blob = format!("{args_json}\n{tool_result}");
+            let oracle = crate::completion_assessor::visual_product_oracle_ok(tool_result)
+                || (edgecrab_tools::terminal_result_succeeded(tool_result)
+                    && crate::completion_assessor::visual_product_oracle_command(&cmd_blob));
+            if oracle {
+                if let Some(cwd) = edgecrab_tools::parse_terminal_result(tool_result)
+                    .map(|p| p.cwd.to_string())
+                    .filter(|c| !c.is_empty())
+                {
+                    self.evidence
+                        .seed_artifact_from_demo_dir(std::path::Path::new(&cwd));
+                }
+                self.evidence.seed_artifact_from_known_dirs();
+                if self.evidence.artifact {
+                    self.evidence.set_oracle_ok(true);
+                    if self.evidence.visual_evidence_complete() {
+                        self.evidence.phase = crate::evidence_latch::EvidencePhase::LatchedDone;
+                    }
                 }
             }
         }
@@ -161,30 +211,26 @@ impl TurnDispatchTrackers {
             && !is_error
             && let Some(cmd) = edgecrab_tools::dev_server::command_from_tool_args_json(args_json)
             && edgecrab_tools::dev_server::is_preview_server_command(&cmd)
+            && let Some(port) =
+                edgecrab_tools::dev_server::collect_http_server_ports(std::iter::once(cmd.as_str()))
+                    .into_iter()
+                    .next()
         {
-            if let Some(port) = edgecrab_tools::dev_server::collect_http_server_ports(
-                std::iter::once(cmd.as_str()),
-            )
-            .into_iter()
-            .next()
-            {
-                let dir = edgecrab_tools::recovery_catalog::infer_preview_serve_directory_from_text(
-                    &cmd,
-                );
-                // Prefer structured port from tool JSON when present (reuse/bind_ready).
-                let port = serde_json::from_str::<serde_json::Value>(tool_result)
-                    .ok()
-                    .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
-                    .map(|p| p as u16)
-                    .unwrap_or(port);
-                self.evidence.note_preview_candidate(
-                    std::path::PathBuf::from(&dir),
-                    port,
-                    format!("http://127.0.0.1:{port}/"),
-                    None,
-                    Some(200),
-                );
-            }
+            let dir =
+                edgecrab_tools::recovery_catalog::infer_preview_serve_directory_from_text(&cmd);
+            // Prefer structured port from tool JSON when present (reuse/bind_ready).
+            let port = serde_json::from_str::<serde_json::Value>(tool_result)
+                .ok()
+                .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
+                .map(|p| p as u16)
+                .unwrap_or(port);
+            self.evidence.note_preview_candidate(
+                std::path::PathBuf::from(&dir),
+                port,
+                format!("http://127.0.0.1:{port}/"),
+                None,
+                Some(200),
+            );
         }
 
         if matches!(
@@ -252,13 +298,7 @@ pub fn guardrail_before_dispatch_checked(
     tool_name: &str,
     args_json: &str,
 ) -> Option<String> {
-    crate::turn_dispatch_policy::pre_dispatch_decision(
-        trackers,
-        messages,
-        tool_name,
-        args_json,
-        "",
-    )
+    crate::turn_dispatch_policy::pre_dispatch_decision(trackers, messages, tool_name, args_json, "")
 }
 
 /// Like [`guardrail_before_dispatch_checked`] with session id for port-shopping halt.
@@ -273,11 +313,7 @@ pub fn guardrail_before_dispatch_checked_with_session(
     session_id: &str,
 ) -> Option<String> {
     crate::turn_dispatch_policy::pre_dispatch_decision(
-        trackers,
-        messages,
-        tool_name,
-        args_json,
-        session_id,
+        trackers, messages, tool_name, args_json, session_id,
     )
 }
 

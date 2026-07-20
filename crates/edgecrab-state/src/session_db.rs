@@ -595,9 +595,7 @@ impl SessionDb {
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 // Prefer per-message created_at (018 P6 forensics); else monotonic
                 // offset so ORDER BY timestamp matches conversation order.
-                let msg_ts = msg
-                    .created_at
-                    .unwrap_or(timestamp + (i as f64) * 0.001);
+                let msg_ts = msg.created_at.unwrap_or(timestamp + (i as f64) * 0.001);
                 conn.execute(
                     "INSERT INTO messages
                      (session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp,
@@ -1163,6 +1161,26 @@ impl SessionDb {
         })
     }
 
+    /// Close zombie sessions left open after process kill (025).
+    ///
+    /// Mid-turn checkpoints leave `ended_at IS NULL`. On next open, mark rows
+    /// older than `max_age_secs` as `abandoned` so `/history` stays honest.
+    pub fn close_stale_open_sessions(&self, max_age_secs: f64) -> Result<usize, AgentError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let cutoff = now - max_age_secs.max(0.0);
+        self.execute_write_with_result(|conn| {
+            let n = conn.execute(
+                "UPDATE sessions SET ended_at = ?1, end_reason = 'abandoned'
+                 WHERE ended_at IS NULL AND started_at < ?2 AND message_count > 0",
+                params![now, cutoff],
+            )?;
+            Ok(n)
+        })
+    }
+
     /// Clear ended_at and end_reason so a session can be resumed.
     pub fn reopen_session(&self, id: &str) -> Result<(), AgentError> {
         self.execute_write(|conn| {
@@ -1535,9 +1553,7 @@ impl SessionDb {
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                let msg_ts = msg
-                    .created_at
-                    .unwrap_or(timestamp + (i as f64) * 0.001);
+                let msg_ts = msg.created_at.unwrap_or(timestamp + (i as f64) * 0.001);
                 conn.execute(
                     "INSERT INTO messages
                      (session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp,
@@ -2538,6 +2554,21 @@ mod tests {
         assert!(hits[0].snippet.contains("Rust"));
         assert_eq!(hits[0].session.preview, "Rust ownership model");
         assert_eq!(hits[1].session.id, "s2");
+    }
+
+    #[test]
+    fn bal_025_close_stale_open_sessions_marks_abandoned() {
+        let db = test_db();
+        let mut session = sample_session("zombie");
+        session.message_count = 3;
+        session.started_at = 1.0; // ancient
+        session.ended_at = None;
+        db.save_session(&session).expect("save zombie");
+        let n = db.close_stale_open_sessions(60.0).expect("reap");
+        assert_eq!(n, 1);
+        let loaded = db.get_session("zombie").expect("get").expect("found");
+        assert!(loaded.ended_at.is_some());
+        assert_eq!(loaded.end_reason.as_deref(), Some("abandoned"));
     }
 
     #[test]

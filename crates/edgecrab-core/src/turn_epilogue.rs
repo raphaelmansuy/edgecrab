@@ -6,9 +6,7 @@ use edgecrab_tools::{
     HarnessAdvisorySignals, HarnessBuildInput, HarnessSnapshot, MutationTurnState,
     build_harness_snapshot,
 };
-use edgecrab_types::{
-    CompletionDecision, ExitReason, GoalContract, Message, RunOutcome,
-};
+use edgecrab_types::{CompletionDecision, ExitReason, GoalContract, Message, RunOutcome};
 
 use crate::completion_assessor::{
     CompletionContext, assess_completion, enrich_verification_with_contract,
@@ -97,10 +95,7 @@ pub fn assess_turn_outcome(params: TurnAssessParams<'_>) -> RunOutcome {
     });
     let pre_gate = crate::lifecycle_hooks::run_pre_verify_blocking(pre_ctx.clone());
     // Keep fire-and-forget emit for observers that only listen.
-    crate::lifecycle_hooks::emit_global(
-        crate::lifecycle_hooks::LifecycleEvent::PreVerify,
-        pre_ctx,
-    );
+    crate::lifecycle_hooks::emit_global(crate::lifecycle_hooks::LifecycleEvent::PreVerify, pre_ctx);
 
     let verification_strict = effective_verification_strict(params.harness_config, params.messages);
     let mut outcome = assess_completion(&CompletionContext {
@@ -158,15 +153,15 @@ pub fn assess_turn_outcome(params: TurnAssessParams<'_>) -> RunOutcome {
         {
             let cmd = contract.verification.trim();
             if !cmd.is_empty() {
-                let result =
-                    crate::contract_verify::run_contract_verification(cmd, params.cwd);
+                let result = crate::contract_verify::run_contract_verification(cmd, params.cwd);
                 if result.exit_code == 0 {
                     outcome.verification.contract_satisfied = true;
                     outcome.verification.evidence_present = true;
                     outcome.verification.debt_reason = None;
-                    outcome.verification.evidence.push(format!(
-                        "contract_verify: exit_code=0 cmd={cmd}"
-                    ));
+                    outcome
+                        .verification
+                        .evidence
+                        .push(format!("contract_verify: exit_code=0 cmd={cmd}"));
                     outcome.evidence = outcome.verification.evidence.clone();
                     // Harness proof can clear NeedsVerification when that was the only debt.
                     if matches!(
@@ -176,8 +171,7 @@ pub fn assess_turn_outcome(params: TurnAssessParams<'_>) -> RunOutcome {
                     {
                         outcome.state = CompletionDecision::Completed;
                         outcome.exit_reason = ExitReason::ModelReturnedFinalText;
-                        outcome.user_summary =
-                            "Completed — harness verified goal contract.".into();
+                        outcome.user_summary = "Completed — harness verified goal contract.".into();
                     }
                 } else {
                     outcome.verification.evidence.push(format!(
@@ -686,12 +680,7 @@ mod tests {
             ..Default::default()
         };
         let outcome = assess_turn_outcome(assess_params(
-            "Done.",
-            &messages,
-            harness,
-            &cfg,
-            None,
-            false,
+            "Done.", &messages, harness, &cfg, None, false,
         ));
         assert_eq!(outcome.state, CompletionDecision::NeedsVerification);
     }

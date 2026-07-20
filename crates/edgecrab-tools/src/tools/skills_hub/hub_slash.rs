@@ -46,9 +46,7 @@ pub async fn handle_skills_hub_slash(
         "remove" | "uninstall" | "rm" => handle_remove(rest, skills_dir),
         "catalog" | "sources" => Some(render_sources_catalog()),
         "tap" | "taps" => Some(handle_tap_subcommand(rest)),
-        "import-from" | "import_from" | "importfrom" => {
-            Some(handle_import_from(rest, skills_dir))
-        }
+        "import-from" | "import_from" | "importfrom" => Some(handle_import_from(rest, skills_dir)),
         "audit" => Some(handle_audit(rest, skills_dir)),
         "lock" | "installed" => Some(super::format_installed_lock()),
         "list-modified" | "modified" => Some(handle_list_modified(rest)),
@@ -134,13 +132,7 @@ async fn handle_browse(operand: &str, configured_hub_url: Option<&str>) -> Strin
     }
     if json {
         let fetch_limit = (page.max(1) * page_size.clamp(1, 100)).clamp(1, 10_000);
-        let report = search_hub(
-            "",
-            source.as_deref(),
-            fetch_limit,
-            configured_hub_url,
-        )
-        .await;
+        let report = search_hub("", source.as_deref(), fetch_limit, configured_hub_url).await;
         return render_browse_page_json(
             &report,
             page,
@@ -148,13 +140,7 @@ async fn handle_browse(operand: &str, configured_hub_url: Option<&str>) -> Strin
             source.as_deref().unwrap_or("all"),
         );
     }
-    browse_hub_page(
-        source.as_deref(),
-        page,
-        page_size,
-        configured_hub_url,
-    )
-    .await
+    browse_hub_page(source.as_deref(), page, page_size, configured_hub_url).await
 }
 
 fn handle_list_modified(operand: &str) -> String {
@@ -275,9 +261,7 @@ async fn handle_publish(operand: &str) -> String {
                     match PublishTarget::parse(t) {
                         Some(parsed) => target = parsed,
                         None => {
-                            return format!(
-                                "Unknown publish target '{t}'. Use: github | clawhub"
-                            );
+                            return format!("Unknown publish target '{t}'. Use: github | clawhub");
                         }
                     }
                 }
@@ -352,7 +336,8 @@ async fn handle_bundles(operand: &str, skills_dir: &Path) -> String {
                 }
             }
             if path.is_empty() {
-                return "Usage: /skills bundles install <file.json|.txt> [--force] [--trust]".into();
+                return "Usage: /skills bundles install <file.json|.txt> [--force] [--trust]"
+                    .into();
             }
             let manifest = match load_bundle_manifest(std::path::Path::new(&path)) {
                 Ok(m) => m,

@@ -25,6 +25,8 @@ impl App {
 
         self.render_output(frame, chunks[0]);
         if shelf_height > 0 {
+            let edit_ledger_caption = self.stream_presentation.edit_ledger.caption();
+            let thinking_truncated = self.stream_presentation.shelf_thinking_truncated();
             render_activity_shelf(
                 frame,
                 chunks[1],
@@ -36,6 +38,8 @@ impl App {
                     spinner_frame: self.shelf_spinner_frame(),
                     animate: self.animate_status_indicators,
                     verbose_tools: self.tool_progress_mode == ToolProgressMode::Verbose,
+                    edit_ledger_caption: edit_ledger_caption.as_deref(),
+                    thinking_truncated: thinking_truncated.as_deref(),
                 },
             );
         }
@@ -132,13 +136,8 @@ impl App {
                 self.render_remote_skill_selector(frame, frame.area());
             }
             match &self.skills_marketplace_mode {
-                super::skills_marketplace::MarketplaceMode::Installing {
-                    identifier,
-                    stage,
-                } => {
-                    let stage_elapsed = self
-                        .skills_install_stage_started
-                        .map(|t| t.elapsed());
+                super::skills_marketplace::MarketplaceMode::Installing { identifier, stage } => {
+                    let stage_elapsed = self.skills_install_stage_started.map(|t| t.elapsed());
                     super::skills_marketplace::render_install_theatre(
                         frame,
                         frame.area(),
@@ -165,11 +164,7 @@ impl App {
                     );
                 }
                 super::skills_marketplace::MarketplaceMode::SourcePick { selected } => {
-                    super::skills_marketplace::render_source_picker(
-                        frame,
-                        frame.area(),
-                        *selected,
-                    );
+                    super::skills_marketplace::render_source_picker(frame, frame.area(), *selected);
                 }
                 super::skills_marketplace::MarketplaceMode::Done { name } => {
                     super::skills_marketplace::render_marketplace_banner(

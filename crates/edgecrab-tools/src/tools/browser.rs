@@ -355,10 +355,7 @@ pub fn set_browser_launch_policy(policy: BrowserLaunchPolicy) {
 
 /// Snapshot of current launch policy (tests / doctor).
 pub fn browser_launch_policy() -> BrowserLaunchPolicy {
-    BROWSER_LAUNCH_POLICY
-        .lock()
-        .map(|g| *g)
-        .unwrap_or_default()
+    BROWSER_LAUNCH_POLICY.lock().map(|g| *g).unwrap_or_default()
 }
 
 /// Chrome `--proxy-server` + mandatory loopback bypass args.
@@ -4597,13 +4594,19 @@ mod tests {
         assert!(is_loopback_nav_server_failure(
             "Navigation error: net::ERR_EMPTY_RESPONSE"
         ));
-        assert!(is_loopback_nav_server_failure("net::ERR_CONNECTION_REFUSED"));
+        assert!(is_loopback_nav_server_failure(
+            "net::ERR_CONNECTION_REFUSED"
+        ));
         // Chrome UI prose alone is not a typed failure code.
         assert!(!is_loopback_nav_server_failure(
             "127.0.0.1 didn’t send any data"
         ));
-        assert!(!is_loopback_nav_server_failure("net::ERR_NAME_NOT_RESOLVED"));
-        assert!(!is_loopback_nav_server_failure("net::ERR_CERT_AUTHORITY_INVALID"));
+        assert!(!is_loopback_nav_server_failure(
+            "net::ERR_NAME_NOT_RESOLVED"
+        ));
+        assert!(!is_loopback_nav_server_failure(
+            "net::ERR_CERT_AUTHORITY_INVALID"
+        ));
     }
 
     #[test]
@@ -5690,7 +5693,8 @@ security:
             "software mode must not disable GPU (Three.js blank canvas): {args:?}"
         );
         assert!(
-            args.iter().any(|a| a.contains("swiftshader") || a.contains("angle")),
+            args.iter()
+                .any(|a| a.contains("swiftshader") || a.contains("angle")),
             "software mode should enable ANGLE/SwiftShader: {args:?}"
         );
         assert!(args.iter().any(|a| a == "--enable-webgl"));
@@ -5715,7 +5719,10 @@ security:
 
     #[test]
     fn headless_gpu_mode_parse() {
-        assert_eq!(HeadlessGpuMode::parse("software"), HeadlessGpuMode::Software);
+        assert_eq!(
+            HeadlessGpuMode::parse("software"),
+            HeadlessGpuMode::Software
+        );
         assert_eq!(HeadlessGpuMode::parse("disable"), HeadlessGpuMode::Disable);
         assert_eq!(HeadlessGpuMode::parse("legacy"), HeadlessGpuMode::Disable);
     }

@@ -256,10 +256,10 @@ pub fn classify_browser_content(
             return ContentClass::AppFail;
         }
     }
-    if let Some(t) = title {
-        if app_fail_marker_present(t) {
-            return ContentClass::AppFail;
-        }
+    if let Some(t) = title
+        && app_fail_marker_present(t)
+    {
+        return ContentClass::AppFail;
     }
     if let Some(0) = node_count {
         return ContentClass::EmptyDocument;

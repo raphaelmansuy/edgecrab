@@ -971,9 +971,7 @@ fn streaming_wait_liveness(provider: &str, phase: NonStreamingWaitPhase) -> &'st
             }
         },
         "xai" => match phase {
-            NonStreamingWaitPhase::Start => {
-                "xAI SSE open — Grok may reason before first token"
-            }
+            NonStreamingWaitPhase::Start => "xAI SSE open — Grok may reason before first token",
             NonStreamingWaitPhase::Heartbeat => {
                 "Grok still prefill/reasoning — first token can take 30–90s with tools"
             }

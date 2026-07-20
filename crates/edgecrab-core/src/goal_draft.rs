@@ -67,7 +67,10 @@ pub async fn draft_goal_contract_text(
     }
 
     // Soft accept: model returned prose without fields — use as free-form goal text.
-    Ok(format!("{objective}\noutcome: {}", text.lines().next().unwrap_or(text)))
+    Ok(format!(
+        "{objective}\noutcome: {}",
+        text.lines().next().unwrap_or(text)
+    ))
 }
 
 #[cfg(test)]

@@ -250,16 +250,15 @@ pub fn run_harness(config_override: Option<&str>) -> anyhow::Result<()> {
 /// CDP + launch policy + proxy + localhost content probes.
 async fn check_browser_stack(config: &edgecrab_core::AppConfig) -> Check {
     config.apply_security_runtime();
-    let report = edgecrab_tools::collect_browser_diagnostics(
-        edgecrab_tools::BrowserDiagnosticsInput {
+    let report =
+        edgecrab_tools::collect_browser_diagnostics(edgecrab_tools::BrowserDiagnosticsInput {
             session_id: None,
             preview_enabled: config.security.preview.enabled,
             preview_allow_any: config.security.preview.allow_any_loopback_port,
             preview_ports: config.security.preview.allow_localhost_ports.clone(),
             max_port_probes: 3,
-        },
-    )
-    .await;
+        })
+        .await;
     let (ok, detail) = edgecrab_tools::browser_diagnostics_doctor_detail(&report);
     if !config.security.preview.enabled {
         return Check::warn(
@@ -475,7 +474,13 @@ pub fn check_os_sandbox_probe(config: &edgecrab_core::AppConfig) -> Check {
         );
     }
     let deny_default = config.security.os_sandbox.deny_default;
-    let wrapped = wrap_command(mode, "echo edgecrab-sandbox-probe", Path::new("/tmp"), true, deny_default);
+    let wrapped = wrap_command(
+        mode,
+        "echo edgecrab-sandbox-probe",
+        Path::new("/tmp"),
+        true,
+        deny_default,
+    );
     if wrapped.passthrough {
         return Check::warn(
             "OS sandbox probe",
@@ -628,18 +633,12 @@ fn check_skills(home: &Path) -> Check {
 
     // Missing token is always at least a warn (exact env names in detail).
     match health.doctor_severity() {
-        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Fail => {
-            Check::fail("Skills", detail)
-        }
-        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Warn => {
-            Check::warn("Skills", detail)
-        }
+        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Fail => Check::fail("Skills", detail),
+        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Warn => Check::warn("Skills", detail),
         edgecrab_tools::tools::skills_hub::HubHealthSeverity::Pass if count == 0 => {
             Check::warn("Skills", detail)
         }
-        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Pass => {
-            Check::pass("Skills", detail)
-        }
+        edgecrab_tools::tools::skills_hub::HubHealthSeverity::Pass => Check::pass("Skills", detail),
     }
 }
 

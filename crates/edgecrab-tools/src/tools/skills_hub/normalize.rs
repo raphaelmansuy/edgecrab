@@ -137,22 +137,20 @@ mod tests {
     #[test]
     fn git_https_url() {
         assert_eq!(
-            normalize_identifier("git:https://github.com/openai/skills/tree/main/skills/.curated/foo"),
+            normalize_identifier(
+                "git:https://github.com/openai/skills/tree/main/skills/.curated/foo"
+            ),
             "openai/skills/skills/.curated/foo"
         );
     }
 
     #[test]
     fn skills_sh_alias() {
-        assert_eq!(
-            normalize_identifier("skills-sh:a/b/c"),
-            "skills.sh:a/b/c"
-        );
+        assert_eq!(normalize_identifier("skills-sh:a/b/c"), "skills.sh:a/b/c");
     }
 
     #[test]
     fn npm_kept() {
         assert_eq!(normalize_identifier("npm:pi-skills"), "npm:pi-skills");
     }
-
 }

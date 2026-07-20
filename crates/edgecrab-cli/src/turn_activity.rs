@@ -252,7 +252,14 @@ pub struct TurnActivityState {
     pub generating_preview: Option<String>,
     /// Bytes accumulated in the in-flight tool-call JSON stream.
     pub generating_args_bytes: usize,
+    /// Legacy field — kept empty; full CoT lives in StreamPresentation (DRY).
+    pub reasoning_buffer: String,
+    /// Derived shelf tail snippet (last N chars) from presentation.
     pub reasoning_snippet: Option<String>,
+    /// Derived Truncated last-N-lines body for multi-line shelf peek.
+    pub reasoning_truncated: Option<String>,
+    /// When the current thinking stream started.
+    pub thinking_started: Option<Instant>,
     /// Live rough estimate for thinking shelf header (Hermes `thinkingTokens`).
     pub thinking_token_est: u32,
     /// Accumulated rough estimate for tool args this turn (Hermes `toolTokenAcc`).
@@ -288,7 +295,10 @@ impl TurnActivityState {
             generating_tool: None,
             generating_preview: None,
             generating_args_bytes: 0,
+            reasoning_buffer: String::new(),
             reasoning_snippet: None,
+            reasoning_truncated: None,
+            thinking_started: None,
             thinking_token_est: 0,
             tool_token_acc: 0,
             hint: None,
@@ -320,7 +330,10 @@ impl TurnActivityState {
         self.generating_tool = None;
         self.generating_preview = None;
         self.generating_args_bytes = 0;
+        self.reasoning_buffer.clear();
         self.reasoning_snippet = None;
+        self.reasoning_truncated = None;
+        self.thinking_started = None;
         self.thinking_token_est = 0;
         self.tool_token_acc = 0;
         self.hint = None;
@@ -425,8 +438,7 @@ impl TurnActivityState {
         if self.activity_feed.len() >= SHELF_ACTIVITY_FEED_MAX {
             self.activity_feed.remove(0);
         }
-        self.activity_feed
-            .push(ActivityNotice::new(detail, tone));
+        self.activity_feed.push(ActivityNotice::new(detail, tone));
         self.hint = self.llm_wait_detail.clone();
     }
 
@@ -577,8 +589,7 @@ impl TurnActivityState {
             .any(|row| !row.finished && row.started_at.elapsed() >= threshold);
         if long_running {
             self.push_activity(
-                "Tip: shelf shows live tool output — t=expand · /agents · /tail for bg"
-                    .into(),
+                "Tip: shelf shows live tool output — t=expand · /agents · /tail for bg".into(),
                 ActivityTone::Info,
             );
             *onboarding_done = true;
@@ -632,22 +643,44 @@ impl TurnActivityState {
         }
     }
 
-    pub fn on_reasoning(&mut self, text: &str) {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            self.on_model_resuming();
-            self.reasoning_snippet =
-                Some(crate::stream_bridge::truncate_reasoning_snippet(trimmed));
+    /// Derived shelf peek from [`crate::stream_presentation::StreamPresentation`]
+    /// (sole CoT buffer). Does **not** accumulate a second full buffer.
+    pub fn sync_thinking_from_presentation(
+        &mut self,
+        snippet: Option<String>,
+        truncated_lines: Option<String>,
+        delta_for_tokens: &str,
+    ) {
+        if delta_for_tokens.is_empty() && snippet.is_none() && truncated_lines.is_none() {
+            return;
+        }
+        self.on_model_resuming();
+        if self.thinking_started.is_none() {
+            self.thinking_started = Some(Instant::now());
+        }
+        // Derived caches only — full text lives in StreamPresentation.
+        self.reasoning_buffer.clear();
+        self.reasoning_snippet = snippet.filter(|s| !s.trim().is_empty());
+        self.reasoning_truncated = truncated_lines.filter(|s| !s.trim().is_empty());
+        if !delta_for_tokens.is_empty() {
             self.thinking_token_est = self
                 .thinking_token_est
-                .saturating_add(crate::shelf_visual::estimate_tokens_rough(text));
-            if matches!(
-                self.phase,
-                ShelfPhase::Idle | ShelfPhase::AwaitingFirstToken
-            ) {
-                self.set_phase(ShelfPhase::Thinking);
-            }
+                .saturating_add(crate::shelf_visual::estimate_tokens_rough(delta_for_tokens));
         }
+        if !matches!(
+            self.phase,
+            ShelfPhase::ToolExec | ShelfPhase::GeneratingTool | ShelfPhase::Streaming
+        ) {
+            self.set_phase(ShelfPhase::Thinking);
+        }
+    }
+
+    /// Clear derived thinking peeks when the presentation card finalizes.
+    pub fn clear_thinking_peek(&mut self) {
+        self.reasoning_buffer.clear();
+        self.reasoning_snippet = None;
+        self.reasoning_truncated = None;
+        self.thinking_started = None;
     }
 
     pub fn on_subagent_start(
@@ -740,6 +773,9 @@ impl TurnActivityState {
                         "{} ({elapsed}s)",
                         edgecrab_core::safe_truncate(detail, 72)
                     ))
+                } else if elapsed >= 15 {
+                    // 025: long TTFT (free models) — make cancel discoverable.
+                    Some(format!("awaiting model response ({elapsed}s) · ^C cancel"))
                 } else {
                     Some(format!("awaiting model response ({elapsed}s)"))
                 }
@@ -873,9 +909,7 @@ impl TurnActivityState {
     }
 
     pub fn sorted_active_tools(&self) -> impl Iterator<Item = &ShelfToolRow> {
-        let primary_id = self
-            .primary_focus_tool()
-            .map(|r| r.tool_call_id.clone());
+        let primary_id = self.primary_focus_tool().map(|r| r.tool_call_id.clone());
         let mut rows: Vec<_> = self.tools.values().filter(|r| !r.finished).collect();
         rows.sort_by(|a, b| {
             let a_pri = primary_id.as_deref() == Some(a.tool_call_id.as_str());
@@ -1157,7 +1191,11 @@ mod tests {
     #[test]
     fn reasoning_and_tool_tokens_accumulate() {
         let mut state = TurnActivityState::new(true);
-        state.on_reasoning("Let me think about this problem carefully.");
+        state.sync_thinking_from_presentation(
+            Some("Let me think about this problem carefully.".into()),
+            Some("Let me think about this problem carefully.".into()),
+            "Let me think about this problem carefully.",
+        );
         assert!(state.thinking_token_est > 0);
         state.on_tool_exec(
             "t1".into(),
@@ -1289,12 +1327,7 @@ mod tests {
         if let Some(row) = state.tools.get_mut("t1") {
             row.started_at = Instant::now() - Duration::from_secs(LONG_RUN_HINT_SECS + 1);
         }
-        state.on_tool_progress(
-            "t1",
-            "Compiling edgecrab-cli".into(),
-            2,
-            Instant::now(),
-        );
+        state.on_tool_progress("t1", "Compiling edgecrab-cli".into(), 2, Instant::now());
         assert!(
             state.activity_feed.is_empty(),
             "charms must not fire when stdout evidence exists: {:?}",
@@ -1324,7 +1357,9 @@ mod tests {
         state.on_tool_progress("t1", huge, 4, Instant::now());
         let row = state.tools.get("t1").unwrap();
         assert!(row.progress_log.chars().count() <= TOOL_PROGRESS_LOG_MAX + 1);
-        assert!(row.progress_log.starts_with('…') || row.progress_log.len() <= TOOL_PROGRESS_LOG_MAX);
+        assert!(
+            row.progress_log.starts_with('…') || row.progress_log.len() <= TOOL_PROGRESS_LOG_MAX
+        );
     }
 
     #[test]
@@ -1392,7 +1427,11 @@ mod tests {
                 .iter()
                 .all(|n| !TurnActivityState::is_llm_wait_shelf_line(&n.text)),
             "wait lines must be purged on resume: {:?}",
-            state.activity_feed.iter().map(|n| &n.text).collect::<Vec<_>>()
+            state
+                .activity_feed
+                .iter()
+                .map(|n| &n.text)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1436,10 +1475,7 @@ mod tests {
         // Detail cleared (as on resume) — caption must stay calm.
         state.llm_wait_detail = None;
         let caption = state.phase_line().unwrap();
-        assert!(
-            caption.contains("awaiting model"),
-            "got: {caption}"
-        );
+        assert!(caption.contains("awaiting model"), "got: {caption}");
         assert!(!caption.contains("vscode-copilot"));
     }
 }

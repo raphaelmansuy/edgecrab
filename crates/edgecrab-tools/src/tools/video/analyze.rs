@@ -124,10 +124,11 @@ impl ToolHandler for VideoAnalyzeTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        let args: AnalyzeArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "video_analyze".into(),
-            message: e.to_string(),
-        })?;
+        let args: AnalyzeArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: "video_analyze".into(),
+                message: e.to_string(),
+            })?;
 
         let temp = tempfile::TempDir::new().map_err(|e| ToolError::ExecutionFailed {
             tool: "video_analyze".into(),

@@ -57,7 +57,10 @@ fn invent_recovery_mandates_tool_search_dictionary() {
         .to_llm_payload()
         .recovery_feedback
         .expect("recovery_feedback");
-    assert_eq!(recovery.suggestions[0].action, RecoveryAction::CallToolFirst);
+    assert_eq!(
+        recovery.suggestions[0].action,
+        RecoveryAction::CallToolFirst
+    );
     let params = serde_json::to_string(&recovery.suggestions[0].parameters).expect("json");
     assert!(params.contains("tool_search"));
     assert!(params.contains("query"));

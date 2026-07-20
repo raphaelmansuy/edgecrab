@@ -258,16 +258,10 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
                 };
                 let stop_hint = if elapsed_secs >= 10 { "  ^C=stop" } else { "" };
                 let expand_hint = if elapsed_secs >= 3 { "  t=expand" } else { "" };
-                let status_detail = detail
-                    .as_deref()
-                    .filter(|d| !d.trim().is_empty())
-                    .map(|d| {
-                        edgecrab_core::safe_truncate(
-                            crate::turn_activity::last_detail_line(d),
-                            52,
-                        )
+                let status_detail = detail.as_deref().filter(|d| !d.trim().is_empty()).map(|d| {
+                    edgecrab_core::safe_truncate(crate::turn_activity::last_detail_line(d), 52)
                         .to_string()
-                    });
+                });
                 let content = if let Some(active) = summary {
                     let detail_show = crate::turn_activity::last_detail_line(&active.detail);
                     let detail_show = edgecrab_core::safe_truncate(detail_show, 52);
@@ -280,9 +274,8 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
                     let verb = tool_action_verb(name);
                     let preview = status_detail.unwrap_or_else(|| {
                         // Use width-adaptive preview — status bar has more room on wide terminals.
-                        let widths = DisplayWidths::from_terminal_width(
-                            params.last_terminal_width as usize,
-                        );
+                        let widths =
+                            DisplayWidths::from_terminal_width(params.last_terminal_width as usize);
                         tool_status_preview_width(name, args_json, widths.status_preview)
                     });
                     format!(

@@ -9,6 +9,7 @@ use crate::stream_bridge::{
     apply_subagent_finish, apply_subagent_start, apply_subagent_tool, apply_tool_done,
     apply_tool_exec, apply_tool_generating, apply_tool_progress, maybe_agents_nudge,
 };
+use crate::stream_presentation::StreamPresentation;
 use crate::tool_display::extract_tool_preview;
 use crate::turn_activity::{ActivityTone, TurnActivityState};
 use edgecrab_tools::tool_progress_tail::format_tail_from_text;
@@ -18,6 +19,7 @@ use edgecrab_tools::tool_progress_tail::format_tail_from_text;
 #[derive(Debug)]
 pub struct TurnStreamHarness {
     pub activity: TurnActivityState,
+    pub presentation: StreamPresentation,
     pub agents_nudged: bool,
     progress_seq: u64,
 }
@@ -27,6 +29,7 @@ impl TurnStreamHarness {
     pub fn new() -> Self {
         Self {
             activity: TurnActivityState::new(true),
+            presentation: StreamPresentation::new(),
             agents_nudged: false,
             progress_seq: 0,
         }
@@ -35,7 +38,12 @@ impl TurnStreamHarness {
     pub fn apply(&mut self, event: StreamEvent, now: Instant) {
         match event {
             StreamEvent::Reasoning(text) => {
-                apply_reasoning_delta(&mut self.activity, &text);
+                self.presentation.on_reasoning(&text);
+                apply_reasoning_delta(&mut self.activity, &self.presentation, &text);
+                crate::stream_bridge::sync_shelf_phase_from_presentation(
+                    &mut self.activity,
+                    &self.presentation,
+                );
             }
             StreamEvent::ToolGenerating {
                 tool_call_id,
@@ -43,12 +51,20 @@ impl TurnStreamHarness {
                 partial_args,
             } => {
                 apply_tool_generating(&mut self.activity, tool_call_id, name, partial_args);
+                crate::stream_bridge::sync_shelf_phase_from_presentation(
+                    &mut self.activity,
+                    &self.presentation,
+                );
             }
             StreamEvent::ToolExec {
                 tool_call_id,
                 name,
                 args_json,
             } => {
+                let _ = self
+                    .presentation
+                    .on_tool_exec(tool_call_id.clone(), name.clone());
+                self.activity.clear_thinking_peek();
                 self.progress_seq += 1;
                 let preview = extract_tool_preview(&name, &args_json);
                 apply_tool_exec(
@@ -58,6 +74,10 @@ impl TurnStreamHarness {
                     args_json,
                     preview,
                     self.progress_seq,
+                );
+                crate::stream_bridge::sync_shelf_phase_from_presentation(
+                    &mut self.activity,
+                    &self.presentation,
                 );
             }
             StreamEvent::ToolProgress {
@@ -71,6 +91,7 @@ impl TurnStreamHarness {
                 } else {
                     message
                 };
+                self.presentation.on_tool_progress(&tool_call_id, &detail);
                 apply_tool_progress(
                     &mut self.activity,
                     &tool_call_id,
@@ -78,9 +99,25 @@ impl TurnStreamHarness {
                     self.progress_seq,
                     now,
                 );
+                crate::stream_bridge::sync_shelf_phase_from_presentation(
+                    &mut self.activity,
+                    &self.presentation,
+                );
             }
             StreamEvent::ToolDone { tool_call_id, .. } => {
+                let _ = self.presentation.on_tool_done(&tool_call_id);
                 apply_tool_done(&mut self.activity, &tool_call_id);
+                crate::stream_bridge::sync_shelf_phase_from_presentation(
+                    &mut self.activity,
+                    &self.presentation,
+                );
+            }
+            StreamEvent::Token(_) => {
+                let _ = self.presentation.on_token();
+                crate::stream_bridge::sync_shelf_phase_from_presentation(
+                    &mut self.activity,
+                    &self.presentation,
+                );
             }
             StreamEvent::SubAgentStart {
                 task_index,
@@ -163,6 +200,11 @@ impl TurnStreamHarness {
 
     pub fn reasoning_snippet(&self) -> Option<&str> {
         self.activity.reasoning_snippet.as_deref()
+    }
+
+    /// Sole CoT buffer (presentation) — activity no longer duplicates full text.
+    pub fn reasoning_full(&self) -> &str {
+        self.presentation.thinking_full()
     }
 }
 
@@ -282,12 +324,63 @@ mod tests {
     fn reasoning_delta_respects_cot_budget() {
         let mut h = TurnStreamHarness::new();
         h.apply(StreamEvent::Reasoning("x".repeat(400)), Instant::now());
+        // Full buffer keeps entire stream; shelf snippet is tail-capped.
+        assert_eq!(h.reasoning_full().len(), 400);
         assert!(
             h.reasoning_snippet()
                 .map(|s| s.chars().count())
                 .unwrap_or(0)
-                <= crate::stream_bridge::THINKING_COT_MAX
+                <= crate::stream_bridge::THINKING_COT_MAX + 1 // optional … prefix
         );
+    }
+
+    #[test]
+    fn super_grok_thinking_accumulates_then_tool_finalizes() {
+        let mut h = TurnStreamHarness::new();
+        let now = Instant::now();
+        h.apply(StreamEvent::Reasoning("Step 1: inspect. ".into()), now);
+        h.apply(StreamEvent::Reasoning("Step 2: write file.".into()), now);
+        assert!(h.reasoning_full().contains("Step 1"));
+        assert!(h.reasoning_full().contains("Step 2"));
+        assert!(matches!(h.activity.phase, ShelfPhase::Thinking));
+        h.apply(
+            StreamEvent::ToolExec {
+                tool_call_id: "tc1".into(),
+                name: "write_file".into(),
+                args_json: r#"{"path":"a.rs"}"#.into(),
+            },
+            now,
+        );
+        // Thinking cleared for next phase; tool tracked.
+        assert!(h.presentation.thinking_full().is_empty());
+        assert!(h.activity.reasoning_snippet.is_none());
+        assert!(h.activity.contains_tool("tc1"));
+        h.apply(
+            StreamEvent::ToolProgress {
+                tool_call_id: "tc1".into(),
+                name: "write_file".into(),
+                message: "writing…".into(),
+            },
+            now,
+        );
+        assert!(
+            h.presentation
+                .tools
+                .get("tc1")
+                .is_some_and(|b| b.body.contains("writing"))
+        );
+        h.apply(
+            StreamEvent::ToolDone {
+                tool_call_id: "tc1".into(),
+                name: "write_file".into(),
+                args_json: "{}".into(),
+                result_preview: Some("ok".into()),
+                duration_ms: 12,
+                is_error: false,
+            },
+            now,
+        );
+        assert!(!h.activity.contains_tool("tc1"));
     }
 
     #[test]
@@ -371,5 +464,53 @@ mod tests {
         );
         assert!(h.activity.generating_tool.is_none());
         assert!(h.activity.contains_tool("tc1"));
+    }
+
+    #[test]
+    fn turn_phase_drives_shelf_chrome() {
+        use crate::stream_presentation::{ChromePhaseHint, TurnPhase};
+        let mut h = TurnStreamHarness::new();
+        let now = Instant::now();
+        h.apply(StreamEvent::Reasoning("plan".into()), now);
+        assert!(matches!(h.presentation.phase, TurnPhase::Thinking));
+        assert_eq!(
+            h.presentation.chrome_phase_hint(false),
+            ChromePhaseHint::Thinking
+        );
+        assert!(matches!(h.activity.phase, ShelfPhase::Thinking));
+
+        h.apply(
+            StreamEvent::ToolExec {
+                tool_call_id: "tc1".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"ls"}"#.into(),
+            },
+            now,
+        );
+        assert!(matches!(h.presentation.phase, TurnPhase::Tool { .. }));
+        assert!(matches!(h.activity.phase, ShelfPhase::ToolExec));
+
+        h.apply(
+            StreamEvent::ToolDone {
+                tool_call_id: "tc1".into(),
+                name: "terminal".into(),
+                args_json: "{}".into(),
+                result_preview: Some("ok".into()),
+                duration_ms: 10,
+                is_error: false,
+            },
+            now,
+        );
+        assert_eq!(
+            h.presentation.chrome_phase_hint(false),
+            ChromePhaseHint::AwaitingFirstToken
+        );
+
+        h.apply(StreamEvent::Token("hello".into()), now);
+        assert!(matches!(h.presentation.phase, TurnPhase::Responding));
+        assert!(matches!(h.activity.phase, ShelfPhase::Streaming));
+        assert!(
+            h.presentation.worked_for_label().is_some() || h.presentation.turn_started.is_some()
+        );
     }
 }

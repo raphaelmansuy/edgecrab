@@ -11,7 +11,7 @@
 //! 8. SUMMARY_PREFIX anti-hijack lives in summary messages only.
 
 use edgecrab_core::compression::{
-    FIRST_COMPRESSION_NOTE, GATEWAY_HYGIENE_THRESHOLD, SUMMARY_PREFIX, CompressionRuntimeState,
+    CompressionRuntimeState, FIRST_COMPRESSION_NOTE, GATEWAY_HYGIENE_THRESHOLD, SUMMARY_PREFIX,
     apply_first_compression_system_note, automatic_compression_blocked, effective_threshold,
     record_completed_compaction, should_defer_preflight_to_real_usage, should_run_session_hygiene,
 };

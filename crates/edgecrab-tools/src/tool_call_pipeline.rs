@@ -145,13 +145,8 @@ pub fn unknown_tool_error_response(registry: &ToolRegistry, invalid_name: &str) 
     let suggestion = tool_name_repair::repair_tool_name(registry, invalid_name);
     let query = unknown_tool_search_query(invalid_name);
     let sample = unknown_tool_recovery_sample(registry, &query, UNKNOWN_TOOL_SAMPLE_LIMIT);
-    crate::recovery_catalog::unknown_tool(
-        invalid_name,
-        suggestion.as_deref(),
-        &query,
-        &sample,
-    )
-    .to_llm_response()
+    crate::recovery_catalog::unknown_tool(invalid_name, suggestion.as_deref(), &query, &sample)
+        .to_llm_response()
 }
 
 /// Result of validating a tool-call batch before dispatch.
@@ -386,7 +381,11 @@ mod tests {
             sample.iter().any(|n| n == "web_search"),
             "web_search must be among candidates, got {sample:?}"
         );
-        assert!(!sample.iter().any(|n| n == "apply_patch" && sample[0] == "apply_patch"));
+        assert!(
+            !sample
+                .iter()
+                .any(|n| n == "apply_patch" && sample[0] == "apply_patch")
+        );
         let body = unknown_tool_error_response(&registry, "quick_stock_quote");
         assert!(body.contains("tool_search"), "must mandate tool_search");
         assert!(body.contains("web_search"), "must cite registry candidates");

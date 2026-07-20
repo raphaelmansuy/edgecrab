@@ -289,8 +289,7 @@ pub async fn evaluate_goal_after_turn(
     .await;
 
     // Contract law: judge vibes alone cannot mark done — need tool-result evidence.
-    if verdict.done
-        && !crate::goal_judge::contract_evidence_in_messages(&state.contract, messages)
+    if verdict.done && !crate::goal_judge::contract_evidence_in_messages(&state.contract, messages)
     {
         verdict.done = false;
         verdict.reason = format!(

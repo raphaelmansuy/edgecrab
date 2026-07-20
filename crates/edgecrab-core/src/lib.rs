@@ -11,6 +11,7 @@ use edgecrab_lsp as _;
 pub mod agent;
 pub mod auxiliary_model;
 pub mod completion_assessor;
+pub mod completion_reopen;
 pub mod compression;
 pub mod config;
 pub mod context_budget;
@@ -21,13 +22,13 @@ pub mod conversation;
 pub mod copilot_agent_probe;
 pub mod copilot_model_policy;
 pub mod credential_pool;
+pub mod evidence_latch;
 pub mod failover;
 pub mod file_manifest;
 pub mod gateway_home;
 pub mod goal_draft;
 pub mod goal_judge;
 pub mod goals;
-pub mod evidence_latch;
 pub mod harness_advisory;
 pub mod harness_analyzer;
 pub mod harness_loop_policy;
@@ -98,15 +99,11 @@ pub use context_engine::{
     load_context_engine,
 };
 pub use context_references::{ContextRef, ExpansionResult, expand_context_refs};
-pub use edgecrab_tools::{
-    HarnessBuildInput, HarnessSnapshot, build_harness_snapshot, terminal_mutation_tool_error,
-};
 pub use credential_pool::{
     CredentialPool, PooledCredential, global_mark_exhausted_and_rotate, global_pool_ensure,
 };
-pub use tool_batch::{PlannedToolCall, ToolBatchPlan, parallel_max_workers, plan_tool_batch};
-pub use turn_prologue::{
-    TurnPrologueState, compression_made_progress, should_run_preflight_estimate,
+pub use edgecrab_tools::{
+    HarnessBuildInput, HarnessSnapshot, build_harness_snapshot, terminal_mutation_tool_error,
 };
 pub use gateway_home::{
     HANDOFF_PLATFORM_HINT, handoff_platform_from_name, resolve_gateway_home_channel,
@@ -207,6 +204,10 @@ pub use state_snapshot::{
 pub use steering::{
     SteeringEvent, SteeringKind, SteeringReceiver, SteeringSender, drain_pending_steers,
     steering_channel,
+};
+pub use tool_batch::{PlannedToolCall, ToolBatchPlan, parallel_max_workers, plan_tool_batch};
+pub use turn_prologue::{
+    TurnPrologueState, compression_made_progress, should_run_preflight_estimate,
 };
 
 /// Truncate `s` to at most `max_bytes` bytes, always stopping at a valid UTF-8

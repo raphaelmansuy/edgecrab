@@ -42,9 +42,13 @@ pub enum MarketplaceMode {
         preview_scroll: u16,
     },
     /// Peer import-from picker.
-    ImportFrom { selected: usize },
+    ImportFrom {
+        selected: usize,
+    },
     /// Marketplace source/provider picker (browse by source).
-    SourcePick { selected: usize },
+    SourcePick {
+        selected: usize,
+    },
     /// Staged install in progress.
     Installing {
         identifier: String,
@@ -60,10 +64,13 @@ pub enum MarketplaceMode {
         identifier: String,
         preserved_query: String,
     },
-    Done { name: String },
-    Error { message: String },
+    Done {
+        name: String,
+    },
+    Error {
+        message: String,
+    },
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarketplaceAction {
@@ -178,22 +185,14 @@ fn step_provider_filter(current: Option<&str>, delta: isize) -> Option<&'static 
     let len = filters.len() as isize;
     let next_idx = ((idx as isize + delta).rem_euclid(len)) as usize;
     let next = filters[next_idx];
-    if next == "all" {
-        None
-    } else {
-        Some(next)
-    }
+    if next == "all" { None } else { Some(next) }
 }
 
 /// Jump to Nth filter (0-based). Returns `None` for `all`.
 pub fn provider_filter_at(index: usize) -> Option<&'static str> {
     let filters = marketplace_provider_filters();
     let key = *filters.get(index)?;
-    if key == "all" {
-        None
-    } else {
-        Some(key)
-    }
+    if key == "all" { None } else { Some(key) }
 }
 
 /// Pure keymap for marketplace chrome (GuardReview keys stay in skill_trust_overlay).
@@ -280,9 +279,9 @@ pub fn map_marketplace_key(
         (MarketplaceModeKind::SearchRemote, KeyCode::Char('/')) => MarketplaceAction::Noop,
         (MarketplaceModeKind::SearchRemote, KeyCode::Esc) => MarketplaceAction::GoBrowseInstalled,
         (MarketplaceModeKind::ImportFrom, KeyCode::Esc) => MarketplaceAction::Back,
-        (MarketplaceModeKind::ImportFrom, KeyCode::Enter) => {
-            MarketplaceAction::ImportPeer(ctx.import_selected.min(ctx.import_count.saturating_sub(1)))
-        }
+        (MarketplaceModeKind::ImportFrom, KeyCode::Enter) => MarketplaceAction::ImportPeer(
+            ctx.import_selected.min(ctx.import_count.saturating_sub(1)),
+        ),
         (MarketplaceModeKind::ImportFrom, KeyCode::Up | KeyCode::Char('k')) => {
             MarketplaceAction::ImportFromMoveUp
         }
@@ -298,12 +297,9 @@ pub fn map_marketplace_key(
             }
         }
         (MarketplaceModeKind::SourcePick, KeyCode::Esc) => MarketplaceAction::Back,
-        (MarketplaceModeKind::SourcePick, KeyCode::Enter) => {
-            MarketplaceAction::SelectSource(
-                ctx.source_selected
-                    .min(ctx.source_count.saturating_sub(1)),
-            )
-        }
+        (MarketplaceModeKind::SourcePick, KeyCode::Enter) => MarketplaceAction::SelectSource(
+            ctx.source_selected.min(ctx.source_count.saturating_sub(1)),
+        ),
         (MarketplaceModeKind::SourcePick, KeyCode::Up | KeyCode::Char('k')) => {
             MarketplaceAction::SourcePickMoveUp
         }
@@ -375,10 +371,7 @@ pub fn render_install_theatre(
     render_marketplace_popup(
         frame,
         area,
-        &format!(
-            " Skill Install · {} ",
-            unicode_truncate(identifier, 40)
-        ),
+        &format!(" Skill Install · {} ", unicode_truncate(identifier, 40)),
         |_inner| {
             let current = stage.index();
             let elapsed_hint = stage_elapsed
@@ -458,41 +451,36 @@ pub fn render_marketplace_banner(
 
 /// Confirm-safe banner with explicit Install / Cancel affordances.
 pub fn render_confirm_safe_banner(frame: &mut Frame, area: Rect, name: &str) {
-    render_marketplace_popup(
-        frame,
-        area,
-        " Skill Install · Confirm ",
-        |_| {
-            vec![
-                Line::from(Span::styled(
-                    format!("Install `{name}` — Skill Guard: Safe."),
-                    Style::default().fg(Color::Rgb(200, 210, 210)),
-                )),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        " [Install] ",
-                        Style::default()
-                            .fg(MARKETPLACE_BG)
-                            .bg(MARKETPLACE_ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        " [Cancel] ",
-                        Style::default()
-                            .fg(Color::Rgb(200, 210, 210))
-                            .bg(Color::Rgb(50, 55, 65)),
-                    ),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    " Enter confirm · Esc cancel · click a button ",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ]
-        },
-    );
+    render_marketplace_popup(frame, area, " Skill Install · Confirm ", |_| {
+        vec![
+            Line::from(Span::styled(
+                format!("Install `{name}` — Skill Guard: Safe."),
+                Style::default().fg(Color::Rgb(200, 210, 210)),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    " [Install] ",
+                    Style::default()
+                        .fg(MARKETPLACE_BG)
+                        .bg(MARKETPLACE_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    " [Cancel] ",
+                    Style::default()
+                        .fg(Color::Rgb(200, 210, 210))
+                        .bg(Color::Rgb(50, 55, 65)),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Enter confirm · Esc cancel · click a button ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    });
 }
 
 /// Hit-test ConfirmSafe button row inside the marketplace popup.
@@ -568,10 +556,7 @@ fn render_marketplace_popup(
         .split(popup);
 
     let lines = lines_fn(inner[0]);
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Left),
-        inner[0],
-    );
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner[0]);
 }
 
 pub fn render_import_from_picker(frame: &mut Frame, area: Rect, selected: usize) {
@@ -725,7 +710,11 @@ fn unicode_truncate(s: &str, max: usize) -> String {
 
 /// Apply a stage update to marketplace mode.
 /// Returns `true` when the stage value changed (caller should reset elapsed timer).
-pub fn advance_install_stage(mode: &mut MarketplaceMode, identifier: &str, stage: InstallStage) -> bool {
+pub fn advance_install_stage(
+    mode: &mut MarketplaceMode,
+    identifier: &str,
+    stage: InstallStage,
+) -> bool {
     let changed = match mode {
         MarketplaceMode::Installing {
             identifier: cur_id,
@@ -791,7 +780,9 @@ mod tests {
     fn browse_installed_footer_mentions_marketplace() {
         let help = marketplace_footer_help(false, MarketplaceModeKind::BrowseInstalled);
         assert!(
-            help.contains("Skills Hub") || help.contains("search remote") || help.contains("/ or S")
+            help.contains("Skills Hub")
+                || help.contains("search remote")
+                || help.contains("/ or S")
         );
     }
 

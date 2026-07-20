@@ -116,8 +116,7 @@ pub fn format_turn_completion_explanation(
         }
         TaskClass::Document => {
             if outcome.state == edgecrab_types::CompletionDecision::NeedsVerification {
-                let hint =
-                    "Document task: confirm the artifact exists on disk (non-zero .pptx/.pdf bytes).";
+                let hint = "Document task: confirm the artifact exists on disk (non-zero .pptx/.pdf bytes).";
                 if !line_already_present(&lines, hint) {
                     lines.push(hint.into());
                 }
@@ -137,8 +136,7 @@ pub fn format_turn_completion_explanation(
     }
 
     if ctx.copilot_nonstreaming {
-        let hint =
-            "Provider: Copilot tool turn used non-streaming compose (expect longer waits).";
+        let hint = "Provider: Copilot tool turn used non-streaming compose (expect longer waits).";
         if !line_already_present(&lines, hint) {
             lines.push(hint.into());
         }
@@ -173,7 +171,9 @@ pub fn format_operator_notice(outcome: &RunOutcome) -> String {
     let emoji_headline = outcome.emoji_headline();
     if !summary.is_empty() {
         let first = summary.lines().next().unwrap_or("").trim();
-        if first == emoji_headline || summary == emoji_headline || summary.starts_with(&emoji_headline)
+        if first == emoji_headline
+            || summary == emoji_headline
+            || summary.starts_with(&emoji_headline)
         {
             return summary.to_string();
         }
@@ -230,10 +230,8 @@ mod tests {
             ExitReason::InvalidToolBudget,
             "Model generated invalid tool call: quick_stock_quote",
         );
-        outcome.user_summary = format_turn_completion_explanation(
-            &outcome,
-            &TurnCompletionContext::default(),
-        );
+        outcome.user_summary =
+            format_turn_completion_explanation(&outcome, &TurnCompletionContext::default());
         let notice = format_operator_notice(&outcome);
         assert_eq!(
             notice.matches("❌").count(),

@@ -65,12 +65,8 @@ impl GoalStore for SqliteGoalStore {
         max_turns: u32,
         contract: &GoalContract,
     ) -> Result<(), AgentError> {
-        self.db.goals_set_with_contract(
-            session_id,
-            text,
-            max_turns,
-            contract.to_json().as_deref(),
-        )
+        self.db
+            .goals_set_with_contract(session_id, text, max_turns, contract.to_json().as_deref())
     }
 
     fn clear(&self, session_id: &str) -> Result<(), AgentError> {

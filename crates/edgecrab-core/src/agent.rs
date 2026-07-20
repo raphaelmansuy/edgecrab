@@ -1726,9 +1726,7 @@ impl Agent {
     }
 
     /// Combined + stable + semi-stable prompt tiers (session branch / persistence).
-    pub async fn system_prompt_tiers(
-        &self,
-    ) -> (Option<String>, Option<String>, Option<String>) {
+    pub async fn system_prompt_tiers(&self) -> (Option<String>, Option<String>, Option<String>) {
         let session = self.session.read().await;
         (
             session.cached_system_prompt.clone(),
@@ -2084,9 +2082,7 @@ impl Agent {
     pub async fn goal_draft(&self, text: &str) -> Result<String, AgentError> {
         let objective = text.trim();
         if objective.is_empty() {
-            return Err(AgentError::Config(
-                "usage: /goal draft <objective>".into(),
-            ));
+            return Err(AgentError::Config("usage: /goal draft <objective>".into()));
         }
         let cfg = self.config.read().await;
         let judge_cfg = cfg.auxiliary.goal_judge.clone();
@@ -2174,7 +2170,11 @@ impl Agent {
             return Ok("No active goal. Use /goal <text> to set one.".into());
         }
         let mut out = crate::goals::status_line(&state);
-        if let Some(goal) = state.goal_text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+        if let Some(goal) = state
+            .goal_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
         {
             out.push('\n');
             out.push_str(goal);
@@ -2209,7 +2209,9 @@ impl Agent {
                 ));
             }
         } else {
-            out.push_str("\n(no completion contract — use /goal draft <text> or inline verification:)");
+            out.push_str(
+                "\n(no completion contract — use /goal draft <text> or inline verification:)",
+            );
         }
         if !state.subgoals.is_empty() {
             out.push('\n');
@@ -2603,7 +2605,11 @@ impl Agent {
     }
 
     /// Emit a core lifecycle hook event (e.g. after skills install/mutate).
-    pub fn emit_lifecycle(&self, event: crate::lifecycle_hooks::LifecycleEvent, context: serde_json::Value) {
+    pub fn emit_lifecycle(
+        &self,
+        event: crate::lifecycle_hooks::LifecycleEvent,
+        context: serde_json::Value,
+    ) {
         let session_id = self
             .session
             .try_read()
@@ -4505,7 +4511,11 @@ def register(ctx):
         assert_eq!(session.cached_semi_stable_prompt.as_deref(), Some(semi));
         assert_eq!(session.last_prompt_tokens, 0);
         assert_eq!(session.compression_runtime.compression_count, 1);
-        assert!(session.compression_runtime.awaiting_real_usage_after_compression);
+        assert!(
+            session
+                .compression_runtime
+                .awaiting_real_usage_after_compression
+        );
         assert!(session.compression_runtime.verify_compaction_pending);
 
         let combined = session.cached_system_prompt.as_deref().expect("combined");
@@ -4513,9 +4523,8 @@ def register(ctx):
             combined.starts_with(stable),
             "stable prefix must survive first-compression note"
         );
-        let peeled = crate::conversation::split_dynamic_after_cache_prefixes(
-            combined, stable, semi,
-        );
+        let peeled =
+            crate::conversation::split_dynamic_after_cache_prefixes(combined, stable, semi);
         assert!(
             peeled.contains("Earlier conversation turns have been compacted"),
             "note must land in dynamic zone, got: {peeled}"
@@ -4546,7 +4555,15 @@ def register(ctx):
         }
         let outcome = agent.maybe_session_hygiene().await;
         assert_eq!(outcome, crate::compression::SessionHygieneOutcome::Skipped);
-        assert_eq!(agent.session.read().await.compression_runtime.compression_count, 0);
+        assert_eq!(
+            agent
+                .session
+                .read()
+                .await
+                .compression_runtime
+                .compression_count,
+            0
+        );
     }
 
     #[tokio::test]
@@ -4601,7 +4618,11 @@ def register(ctx):
         let session = agent.session.read().await;
         assert!(session.first_compression_done);
         assert_eq!(session.compression_runtime.compression_count, 1);
-        assert!(session.compression_runtime.awaiting_real_usage_after_compression);
+        assert!(
+            session
+                .compression_runtime
+                .awaiting_real_usage_after_compression
+        );
         assert_eq!(session.cached_stable_prompt.as_deref(), Some("STABLE"));
         let combined = session.cached_system_prompt.as_deref().expect("combined");
         let dynamic =

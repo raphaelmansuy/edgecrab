@@ -224,7 +224,8 @@ fn e16_no_false_completed_on_visual_without_perception() {
         child_runs_in_flight: 0,
         harness,
         verification_strict: true,
-            evidence: Default::default(),    });
+        evidence: Default::default(),
+    });
     assert_ne!(outcome.state, edgecrab_types::CompletionDecision::Completed);
 }
 
@@ -245,8 +246,8 @@ fn games003_browser_recovery_cites_config_not_read_file() {
 #[test]
 fn session_0aeef965_terminal_storm_blocks_completion_and_act() {
     use edgecrab_core::completion_assessor::{CompletionContext, assess_completion};
-    use edgecrab_core::harness_loop_policy::visual_storm_block_result;
     use edgecrab_core::harness_advisory::HarnessTurnAdvisory;
+    use edgecrab_core::harness_loop_policy::visual_storm_block_result;
     use edgecrab_tools::{
         HarnessAdvisorySignals, HarnessBuildInput, MutationTurnState, build_harness_snapshot,
     };
@@ -267,11 +268,7 @@ fn session_0aeef965_terminal_storm_blocks_completion_and_act() {
         edgecrab_types::Message::tool_result("t6", "terminal", "grep"),
         edgecrab_types::Message::tool_result("t7", "terminal", "ls again"),
         edgecrab_types::Message::tool_result("t8", "terminal", "pwd"),
-        edgecrab_types::Message::tool_result(
-            "t9",
-            "write_file",
-            r#"{"path":"VERIFICATION.md"}"#,
-        ),
+        edgecrab_types::Message::tool_result("t9", "write_file", r#"{"path":"VERIFICATION.md"}"#),
     ];
 
     let mut advisory = HarnessTurnAdvisory::new();
@@ -318,6 +315,7 @@ fn session_0aeef965_terminal_storm_blocks_completion_and_act() {
         child_runs_in_flight: 0,
         harness,
         verification_strict: true,
-            evidence: Default::default(),    });
+        evidence: Default::default(),
+    });
     assert_ne!(outcome.state, edgecrab_types::CompletionDecision::Completed);
 }

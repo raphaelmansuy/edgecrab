@@ -4,7 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 
 fn workspace_file(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
 }
 
 #[test]
@@ -103,8 +105,10 @@ fn indexed_hot_tools_stay_at_five() {
 
 #[test]
 fn materialize_path_does_not_mention_cached_system_prompt_assignment() {
-    let src = fs::read_to_string(workspace_file("crates/edgecrab-tools/src/tool_schema_index.rs"))
-        .expect("tool_schema_index.rs");
+    let src = fs::read_to_string(workspace_file(
+        "crates/edgecrab-tools/src/tool_schema_index.rs",
+    ))
+    .expect("tool_schema_index.rs");
     assert!(
         !src.contains("cached_system_prompt"),
         "tool_schema_index must not touch cached_system_prompt (cache law)"

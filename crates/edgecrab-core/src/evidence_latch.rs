@@ -185,9 +185,84 @@ impl EvidenceState {
         self.dirty_if_preview_paths_changed();
     }
 
+    /// Seed artifact latch from an already-built demo directory (025).
+    ///
+    /// Pre-existing `index.html` counts without a write this turn — otherwise
+    /// perceive Ok can never reach `visual_evidence_complete` for resume tasks.
+    pub fn seed_artifact_from_demo_dir(&mut self, dir: &Path) {
+        if !self.config.enabled || self.artifact {
+            return;
+        }
+        let index = dir.join("index.html");
+        if !index.is_file() {
+            return;
+        }
+        let index_s = index.to_string_lossy().replace('\\', "/");
+        self.note_artifact_path(&index_s);
+        // Optional JS peers improve fingerprint stability; presence is not required.
+        if let Ok(entries) = std::fs::read_dir(dir.join("js")) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("js") {
+                    self.note_artifact_path(&p.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        } else if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("js") {
+                    self.note_artifact_path(&p.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        self.enter_verify_phase();
+    }
+
+    /// Seed from known preview / heal directories when present on disk.
+    pub fn seed_artifact_from_known_dirs(&mut self) {
+        if !self.config.enabled || self.artifact {
+            return;
+        }
+        let dirs: Vec<PathBuf> = [
+            self.last_heal_dir.clone(),
+            self.preview.as_ref().map(|p| p.dir.clone()),
+            self.preview_candidate.as_ref().map(|p| p.dir.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for dir in dirs {
+            self.seed_artifact_from_demo_dir(&dir);
+            if self.artifact {
+                break;
+            }
+        }
+    }
+
+    /// Resolve a file path to its demo root (directory containing `index.html`).
+    pub fn demo_root_for_path(path: &Path) -> Option<PathBuf> {
+        let mut cur = if path.is_file() {
+            path.parent().map(|p| p.to_path_buf())
+        } else {
+            Some(path.to_path_buf())
+        };
+        for _ in 0..6 {
+            let dir = cur?;
+            if dir.join("index.html").is_file() {
+                return Some(dir);
+            }
+            cur = dir.parent().map(|p| p.to_path_buf());
+        }
+        None
+    }
+
     /// Mark verify phase (e.g. after artifact exists and task is visual).
     pub fn enter_verify_phase(&mut self) {
-        if self.artifact && !matches!(self.phase, EvidencePhase::Escalated | EvidencePhase::LatchedDone)
+        if self.artifact
+            && !matches!(
+                self.phase,
+                EvidencePhase::Escalated | EvidencePhase::LatchedDone
+            )
         {
             self.phase = EvidencePhase::Verify;
         }
@@ -200,19 +275,17 @@ impl EvidenceState {
         }
         if is_mutation || matches!(self.phase, EvidencePhase::Create) && !self.artifact {
             self.create_tools = self.create_tools.saturating_add(1);
-        } else if matches!(
+        } else if (matches!(
             self.phase,
             EvidencePhase::Verify | EvidencePhase::Heal | EvidencePhase::Escalated
-        ) || self.artifact
-        {
-            if is_verify_tool(tool_name)
+        ) || self.artifact)
+            && (is_verify_tool(tool_name)
                 || self.preview.is_some()
-                || self.preview_candidate.is_some()
-            {
-                self.verify_tools = self.verify_tools.saturating_add(1);
-                if matches!(self.phase, EvidencePhase::Create) {
-                    self.phase = EvidencePhase::Verify;
-                }
+                || self.preview_candidate.is_some())
+        {
+            self.verify_tools = self.verify_tools.saturating_add(1);
+            if matches!(self.phase, EvidencePhase::Create) {
+                self.phase = EvidencePhase::Verify;
             }
         }
         if matches!(self.phase, EvidencePhase::LatchedDone) && is_browser_tool(tool_name) {
@@ -221,9 +294,7 @@ impl EvidenceState {
     }
 
     pub fn verify_budget_exhausted(&self) -> bool {
-        self.config.enabled
-            && self.artifact
-            && self.verify_tools >= self.config.verify_tool_budget
+        self.config.enabled && self.artifact && self.verify_tools >= self.config.verify_tool_budget
     }
 
     /// Bind candidate only — does **not** content-qualify or block re-serve (022 A1).
@@ -251,7 +322,8 @@ impl EvidenceState {
         };
         self.preview_candidate = Some(latch);
         self.last_heal_port = Some(port);
-        self.last_heal_dir = Some(dir);
+        self.last_heal_dir = Some(dir.clone());
+        self.seed_artifact_from_demo_dir(&dir);
         if matches!(self.phase, EvidencePhase::Heal) {
             self.consume_heal_serve();
         } else if matches!(self.phase, EvidencePhase::Create) {
@@ -327,9 +399,7 @@ impl EvidenceState {
             return true;
         }
         // Content-qualified latch only.
-        self.preview
-            .as_ref()
-            .is_some_and(|p| p.content_qualified)
+        self.preview.as_ref().is_some_and(|p| p.content_qualified)
     }
 
     /// Block browser tools when thrash Escalated or post LatchedDone budget exhausted.
@@ -357,7 +427,10 @@ impl EvidenceState {
         if !self.config.enabled {
             return None;
         }
-        if matches!(self.phase, EvidencePhase::Escalated | EvidencePhase::LatchedDone) {
+        if matches!(
+            self.phase,
+            EvidencePhase::Escalated | EvidencePhase::LatchedDone
+        ) {
             if edgecrab_tools::dev_server::is_preview_server_command(command) {
                 return Some(false);
             }
@@ -391,12 +464,7 @@ impl EvidenceState {
     }
 
     /// Record perception; only snapshot/vision Ok latches Perceive (not bare navigate).
-    pub fn note_perceive(
-        &mut self,
-        tool_name: &str,
-        url: &str,
-        content_class: ContentClass,
-    ) {
+    pub fn note_perceive(&mut self, tool_name: &str, url: &str, content_class: ContentClass) {
         if !self.config.enabled {
             return;
         }
@@ -412,6 +480,8 @@ impl EvidenceState {
 
         if content_class.is_evidence() && can_latch_perceive {
             self.ensure_preview_from_url(url);
+            // 025: pre-built demos must latch Artifact from disk before LatchedDone.
+            self.seed_artifact_from_known_dirs();
             self.perceive = Some(PerceiveLatch {
                 url: url.to_string(),
                 content_class,
@@ -445,8 +515,10 @@ impl EvidenceState {
         if self.heal_remaining == 0 {
             return false;
         }
-        if matches!(self.phase, EvidencePhase::Heal | EvidencePhase::Escalated | EvidencePhase::LatchedDone)
-        {
+        if matches!(
+            self.phase,
+            EvidencePhase::Heal | EvidencePhase::Escalated | EvidencePhase::LatchedDone
+        ) {
             return false;
         }
         // Only content failures that indicate wrong/broken preview.
@@ -560,13 +632,16 @@ impl EvidenceState {
         self.oracle_ok = ok;
     }
 
-    /// Visual_ux: artifact + content-qualified preview + perceive(Ok).
+    /// Visual_ux: artifact + (product oracle **or** content-qualified preview + perceive).
     pub fn visual_evidence_complete(&self) -> bool {
-        self.artifact
-            && self
-                .preview
-                .as_ref()
-                .is_some_and(|p| p.content_qualified)
+        if !self.artifact {
+            return false;
+        }
+        // Deterministic product oracle (smoketest / check.sh) is sufficient (025).
+        if self.oracle_ok {
+            return true;
+        }
+        self.preview.as_ref().is_some_and(|p| p.content_qualified)
             && self
                 .perceive
                 .as_ref()
@@ -617,8 +692,7 @@ impl EvidenceState {
                     .into()
             }
             EvidencePhase::Verify if self.verify_budget_exhausted() => {
-                "[harness] VERIFY BUDGET EXHAUSTED — stop tool thrash; summarize status."
-                    .into()
+                "[harness] VERIFY BUDGET EXHAUSTED — stop tool thrash; summarize status.".into()
             }
             EvidencePhase::Verify | EvidencePhase::Create => {
                 if let Some(p) = self.preview.as_ref().filter(|p| p.content_qualified) {
@@ -642,11 +716,7 @@ impl EvidenceState {
     }
 
     fn ensure_preview_from_url(&mut self, url: &str) {
-        if self
-            .preview
-            .as_ref()
-            .is_some_and(|p| p.content_qualified)
-        {
+        if self.preview.as_ref().is_some_and(|p| p.content_qualified) {
             return;
         }
         let port = parse_loopback_port(url).unwrap_or(8000);
@@ -660,14 +730,7 @@ impl EvidenceState {
             .preview_candidate
             .as_ref()
             .and_then(|c| c.process_id.clone());
-        self.latch_preview_qualified(
-            dir,
-            port,
-            url.to_string(),
-            process_id,
-            Some(200),
-            true,
-        );
+        self.latch_preview_qualified(dir, port, url.to_string(), process_id, Some(200), true);
     }
 
     fn dirty_if_preview_paths_changed(&mut self) {
@@ -799,7 +862,11 @@ mod tests {
             None,
             None,
         );
-        st.note_perceive("browser_snapshot", "http://127.0.0.1:8000/", ContentClass::Ok);
+        st.note_perceive(
+            "browser_snapshot",
+            "http://127.0.0.1:8000/",
+            ContentClass::Ok,
+        );
         assert!(st.perceive.is_some());
         st.note_artifact_path("b.js");
         assert!(st.perceive.is_none(), "new artifact path dirties perceive");
@@ -871,6 +938,36 @@ mod tests {
     }
 
     #[test]
+    fn bal_025_seed_artifact_from_existing_demo_dir() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        std::fs::write(dir.path().join("index.html"), "<html></html>").unwrap();
+        std::fs::create_dir(dir.path().join("js")).unwrap();
+        std::fs::write(dir.path().join("js/game.js"), "export {};\n").unwrap();
+
+        let mut st = EvidenceState::default();
+        assert!(!st.artifact);
+        st.seed_artifact_from_demo_dir(dir.path());
+        assert!(st.artifact, "index.html on disk must seed Artifact");
+        st.note_preview_candidate(
+            dir.path().to_path_buf(),
+            8000,
+            "http://127.0.0.1:8000/".into(),
+            None,
+            Some(200),
+        );
+        st.note_perceive(
+            "browser_snapshot",
+            "http://127.0.0.1:8000/",
+            ContentClass::Ok,
+        );
+        assert!(
+            st.visual_evidence_complete(),
+            "seeded artifact + Ok snapshot must complete visual evidence"
+        );
+        assert_eq!(st.phase, EvidencePhase::LatchedDone);
+    }
+
+    #[test]
     fn nf_u10_verify_budget_exhaust() {
         let mut st = EvidenceState::new(EvidenceLatchConfig {
             enabled: true,
@@ -930,16 +1027,11 @@ mod tests {
         st.phase = EvidencePhase::Heal;
         st.heal_remaining = 1;
         assert_eq!(
-            st.terminal_heal_policy(
-                "python3 -m http.server 8000 --directory demos/chess"
-            ),
+            st.terminal_heal_policy("python3 -m http.server 8000 --directory demos/chess"),
             Some(true)
         );
         assert_eq!(st.terminal_heal_policy("ls -la"), Some(false));
-        assert_eq!(
-            st.terminal_heal_policy("lsof -i :8000"),
-            Some(true)
-        );
+        assert_eq!(st.terminal_heal_policy("lsof -i :8000"), Some(true));
     }
 
     #[test]

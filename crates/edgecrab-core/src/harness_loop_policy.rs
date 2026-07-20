@@ -66,21 +66,23 @@ pub fn visual_storm_block_result_with_args(
     if class != TaskClass::VisualUx || !advisory.is_act_storm_without_perception(class) {
         return None;
     }
-    Some(edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
-        &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
-            action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
-            code: "visual_storm_act_block",
-            message: "Blocked shell/code debugging — visual task needs browser evidence. \
+    Some(
+        edgecrab_tools::tool_loop_guardrails::guardrail_block_result(
+            &edgecrab_tools::tool_loop_guardrails::ToolGuardrailDecision {
+                action: edgecrab_tools::tool_loop_guardrails::GuardrailAction::Block,
+                code: "visual_storm_act_block",
+                message: "Blocked shell/code debugging — visual task needs browser evidence. \
                        To preview: call terminal with \
                        `python3 -m http.server 8000 --directory <demo-dir>` \
                        (preview-server starts are allowed), then \
                        browser_navigate http://127.0.0.1:8000/ and browser_snapshot. \
                        Do not try other localhost ports. Do not ls/cat/grep-storm."
-                .into(),
-            tool_name: tool_name.to_string(),
-            count: advisory.act_tool_count_in_window() as u32,
-        },
-    ))
+                    .into(),
+                tool_name: tool_name.to_string(),
+                count: advisory.act_tool_count_in_window() as u32,
+            },
+        ),
+    )
 }
 
 /// If the guardrail controller recorded a halt, return an operator-facing steer message.
@@ -114,13 +116,15 @@ mod tests {
             adv.record_tool("terminal");
         }
         let messages = vec![Message::user("make demo/games003/index.html beautiful UX")];
-        assert!(visual_storm_block_result_with_args(
-            &adv,
-            &messages,
-            "terminal",
-            r#"{"command":"ls -la"}"#
-        )
-        .is_some());
+        assert!(
+            visual_storm_block_result_with_args(
+                &adv,
+                &messages,
+                "terminal",
+                r#"{"command":"ls -la"}"#
+            )
+            .is_some()
+        );
         assert!(visual_storm_block_result(&adv, &messages, "write_file").is_none());
     }
 
@@ -131,13 +135,15 @@ mod tests {
             adv.record_tool("execute_code");
         }
         let messages = vec![Message::user("make demo/games003/index.html beautiful UX")];
-        assert!(visual_storm_block_result_with_args(
-            &adv,
-            &messages,
-            "execute_code",
-            r#"{"code":"print('hi')"}"#
-        )
-        .is_some());
+        assert!(
+            visual_storm_block_result_with_args(
+                &adv,
+                &messages,
+                "execute_code",
+                r#"{"code":"print('hi')"}"#
+            )
+            .is_some()
+        );
     }
 
     #[test]

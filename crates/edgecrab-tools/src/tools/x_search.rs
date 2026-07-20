@@ -124,10 +124,11 @@ impl ToolHandler for XSearchTool {
         args: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        let args: XSearchArgs = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
-            tool: "x_search".into(),
-            message: e.to_string(),
-        })?;
+        let args: XSearchArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                tool: "x_search".into(),
+                message: e.to_string(),
+            })?;
         if args.query.trim().is_empty() {
             return Err(ToolError::InvalidArgs {
                 tool: "x_search".into(),

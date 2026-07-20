@@ -6,8 +6,8 @@
 
 use edgecrab_types::ToolError;
 
-use crate::registry::{ApprovalKind, ApprovalRequest, ApprovalResponse, ToolContext};
 use crate::recovery_catalog::preview_loopback_grant_from_error;
+use crate::registry::{ApprovalKind, ApprovalRequest, ApprovalResponse, ToolContext};
 
 /// If `err` carries a grantable preview_loopback recovery, ask the user and apply.
 ///

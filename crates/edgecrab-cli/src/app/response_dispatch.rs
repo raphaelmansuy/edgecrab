@@ -8,6 +8,11 @@ impl App {
         while let Ok(resp) = self.response_rx.try_recv() {
             match resp {
                 AgentResponse::Token(text) => {
+                    // Close thinking card when first answer token arrives (SuperGrok stream).
+                    self.finalize_thinking_stream_card();
+                    self.stream_presentation.phase =
+                        crate::stream_presentation::TurnPhase::Responding;
+                    self.sync_presentation_chrome();
                     // Accumulate per-turn token count regardless of streaming mode.
                     self.turn_stream_tokens += 1;
                     // Record TTFB (Time To First Token) on the very first token that
@@ -80,12 +85,7 @@ impl App {
                     // Accumulate response text for voice mode TTS readback.
                     self.last_agent_response_text.push_str(&text);
                     self.turn_activity.on_model_resuming();
-                    if matches!(self.display_state, DisplayState::Streaming { .. })
-                        || !self.turn_activity.tools.is_empty()
-                        || matches!(self.turn_activity.phase, ShelfPhase::AwaitingFirstToken)
-                    {
-                        self.turn_activity.set_phase(ShelfPhase::Streaming);
-                    }
+                    self.sync_presentation_chrome();
                     self.note_shelf_activity();
                 }
                 AgentResponse::Footer(text) => {
@@ -201,17 +201,37 @@ impl App {
                             started: Instant::now(),
                         };
                     }
-                    if self.show_reasoning && !text.trim().is_empty() {
+                    // Sole buffer: presentation accumulates; shelf peeks derived.
+                    self.stream_presentation.on_reasoning(&text);
+                    stream_bridge::apply_reasoning_delta(
+                        &mut self.turn_activity,
+                        &self.stream_presentation,
+                        &text,
+                    );
+                    self.sync_presentation_chrome();
+                    // Live Truncated card in transcript (Grok last-N lines).
+                    if self.show_reasoning && !text.is_empty() {
+                        let trunc_text = self
+                            .stream_presentation
+                            .live_thinking_transcript_text()
+                            .unwrap_or_else(|| "Thinking…".into());
+                        let full = self.stream_presentation.thinking_full().to_string();
                         if let Some(idx) = self.reasoning_line {
                             if idx < self.output.len() {
-                                self.output[idx].text.push_str(&text);
+                                // Asymmetric fold: while running keep Truncated
+                                // view unless user expanded to full body.
+                                if self.output[idx].expanded {
+                                    self.output[idx].text = full.clone();
+                                    self.output[idx].set_collapsed_text_preview(trunc_text);
+                                } else {
+                                    self.output[idx].text = trunc_text;
+                                }
+                                self.output[idx].attach_expandable_body_always(full);
                                 self.output[idx].invalidate_render_cache();
                             }
                         } else {
-                            let line = OutputLine::new_text(
-                                format!("Thinking\n{text}"),
-                                OutputRole::Reasoning,
-                            );
+                            let mut line = OutputLine::new_text(trunc_text, OutputRole::Reasoning);
+                            line.attach_expandable_body_always(full);
                             if let Some(idx) = self.streaming_line {
                                 let insert_idx = idx.min(self.output.len());
                                 self.output.insert(insert_idx, line);
@@ -227,7 +247,6 @@ impl App {
                         }
                         self.needs_redraw = true;
                     }
-                    stream_bridge::apply_reasoning_delta(&mut self.turn_activity, &text);
                     self.note_shelf_activity();
                 }
                 AgentResponse::ToolGenerating {
@@ -235,6 +254,7 @@ impl App {
                     name,
                     partial_args,
                 } => {
+                    self.finalize_thinking_stream_card();
                     let preview = extract_streaming_tool_preview(&name, &partial_args);
                     stream_bridge::apply_tool_generating(
                         &mut self.turn_activity,
@@ -242,6 +262,7 @@ impl App {
                         name.clone(),
                         partial_args.clone(),
                     );
+                    self.sync_presentation_chrome();
                     self.display_state = DisplayState::ToolExec {
                         tool_call_id,
                         name,
@@ -267,6 +288,10 @@ impl App {
                         self.needs_redraw = true;
                         continue;
                     }
+                    self.finalize_thinking_stream_card();
+                    let _ = self
+                        .stream_presentation
+                        .on_tool_exec(tool_call_id.clone(), name.clone());
                     self.flush_buffered_assistant_output();
                     // CRITICAL: Break the streaming buffer at the tool boundary.
                     // Without this, tokens arriving after the tool call append to
@@ -279,14 +304,16 @@ impl App {
                     self.progress_seq = self.progress_seq.saturating_add(1);
                     let started_at = Instant::now();
                     let preview = extract_tool_preview(&name, &args_json);
+                    let tool_kind = ToolCardKind::classify(&name);
                     stream_bridge::apply_tool_exec(
                         &mut self.turn_activity,
                         tool_call_id.clone(),
                         name.clone(),
                         args_json.clone(),
-                        preview,
+                        preview.clone(),
                         self.progress_seq,
                     );
+                    self.sync_presentation_chrome();
                     self.display_state = DisplayState::ToolExec {
                         tool_call_id: tool_call_id.clone(),
                         name: name.clone(),
@@ -298,13 +325,19 @@ impl App {
                     if self.should_render_in_flight_tool_in_transcript(&name, &args_json) {
                         // Push a live "in-flight" placeholder line to the output area.
                         let edit_snapshot = capture_local_edit_snapshot(&name, &args_json);
-                        let running_spans = build_tool_running_line_width(
-                            &name,
-                            &args_json,
-                            None,
-                            &self.theme.tool_emojis,
-                            &DisplayWidths::from_terminal_width(self.last_terminal_width as usize),
-                        );
+                        let running_spans = if tool_kind.is_edit() {
+                            build_editing_running_spans(&preview)
+                        } else {
+                            build_tool_running_line_width(
+                                &name,
+                                &args_json,
+                                None,
+                                &self.theme.tool_emojis,
+                                &DisplayWidths::from_terminal_width(
+                                    self.last_terminal_width as usize,
+                                ),
+                            )
+                        };
                         let line_idx = self.output.len();
                         self.output
                             .push(OutputLine::new_spans(running_spans, OutputRole::Tool));
@@ -354,6 +387,8 @@ impl App {
                         continue;
                     }
                     self.progress_seq = self.progress_seq.saturating_add(1);
+                    self.stream_presentation
+                        .on_tool_progress(&tool_call_id, &detail);
                     stream_bridge::apply_tool_progress(
                         &mut self.turn_activity,
                         &tool_call_id,
@@ -361,6 +396,7 @@ impl App {
                         self.progress_seq,
                         Instant::now(),
                     );
+                    self.sync_presentation_chrome();
                     self.maybe_shelf_onboarding();
                     if let Some(row) = self.turn_activity.tool_row(&tool_call_id) {
                         if matches!(self.display_state, DisplayState::ToolExec { .. }) {
@@ -381,6 +417,41 @@ impl App {
                         && active_tool_call_id == &tool_call_id
                     {
                         *active_detail = Some(detail.clone());
+                    }
+                    // Update durable transcript card even when shelf owns live chrome (024 W2).
+                    if let Some(PendingToolLine {
+                        line_idx,
+                        tool_name,
+                        args_json,
+                        minimal_indicator: false,
+                        ..
+                    }) = self.pending_tool_lines.get(&tool_call_id).cloned()
+                        && line_idx < self.output.len()
+                    {
+                        let kind = ToolCardKind::classify(&tool_name);
+                        let elapsed = self.turn_activity.tool_elapsed_secs(&tool_call_id);
+                        if kind.is_edit() {
+                            let preview = extract_tool_preview(&tool_name, &args_json);
+                            self.output[line_idx].prebuilt_spans =
+                                Some(build_editing_running_spans(&preview));
+                        } else {
+                            let tail = self
+                                .stream_presentation
+                                .tool_body_tail(&tool_call_id)
+                                .unwrap_or_else(|| detail.clone());
+                            self.output[line_idx].prebuilt_spans =
+                                Some(build_tool_running_line_width_elapsed(
+                                    &tool_name,
+                                    &args_json,
+                                    Some(tail.as_str()),
+                                    elapsed,
+                                    &self.theme.tool_emojis,
+                                    &DisplayWidths::from_terminal_width(
+                                        self.last_terminal_width as usize,
+                                    ),
+                                ));
+                        }
+                        self.output[line_idx].invalidate_render_cache();
                     }
                     if self.turn_activity.enabled {
                         if self.at_bottom {
@@ -547,64 +618,107 @@ impl App {
                             self.collapsed_tool_fail = None;
                         }
 
-                        if !collapsed_into_prior {
-                        let spans = build_tool_done_line_width(
-                            &name,
-                            &resolved_args,
-                            result_preview.as_deref(),
-                            duration_ms,
-                            is_error,
-                            &self.theme.tool_emojis,
-                            &widths,
-                        );
-                        // Upgrade the in-flight placeholder in-place (if present).
-                        //
-                        // WHY in-place: replacing the placeholder avoids appending a
-                        // second line for the same tool call — the layout stays stable
-                        // (no shift), and the cyan "···" naturally becomes the gold
-                        // timing string without any visual flash.
-                        let written_line_idx = if let Some(PendingToolLine { line_idx, .. }) =
-                            pending.as_ref()
-                        {
-                            if *line_idx < self.output.len() {
-                                self.output[*line_idx].prebuilt_spans = Some(spans);
-                                if matches!(
-                                    name.as_str(),
-                                    "terminal" | "execute_code" | "browser_snapshot"
-                                ) && let Some(body) = result_preview
+                        let tool_kind = ToolCardKind::classify(&name);
+                        let live_body = self
+                            .stream_presentation
+                            .on_tool_done(&tool_call_id)
+                            .map(|b| b.body)
+                            .filter(|t| !t.trim().is_empty())
+                            .or_else(|| {
+                                self.turn_activity
+                                    .tool_row(&tool_call_id)
+                                    .map(|r| r.progress_log.clone())
+                                    .filter(|t| !t.trim().is_empty())
+                            })
+                            .or_else(|| {
+                                result_preview
                                     .clone()
                                     .filter(|text| !text.trim().is_empty())
+                            });
+
+                        if !collapsed_into_prior {
+                            let spans = build_tool_done_line_width(
+                                &name,
+                                &resolved_args,
+                                result_preview.as_deref(),
+                                duration_ms,
+                                is_error,
+                                &self.theme.tool_emojis,
+                                &widths,
+                            );
+                            // Upgrade the in-flight placeholder in-place (if present).
+                            //
+                            // WHY in-place: replacing the placeholder avoids appending a
+                            // second line for the same tool call — the layout stays stable
+                            // (no shift), and the cyan "···" naturally becomes the gold
+                            // timing string without any visual flash.
+                            let written_line_idx = if let Some(PendingToolLine {
+                                line_idx, ..
+                            }) = pending.as_ref()
+                            {
+                                if *line_idx < self.output.len() {
+                                    self.output[*line_idx].prebuilt_spans = Some(spans);
+                                    if tool_kind.is_execute()
+                                        && let Some(body) = live_body.clone()
+                                    {
+                                        let body =
+                                            crate::transcript_heights::truncate_verbose_trail(
+                                                &body,
+                                            );
+                                        if is_error {
+                                            self.output[*line_idx]
+                                                .attach_expandable_body_always(body);
+                                        } else {
+                                            self.output[*line_idx].attach_expandable_body(body);
+                                        }
+                                    }
+                                    self.output[*line_idx].invalidate_render_cache();
+                                    Some(*line_idx)
+                                } else {
+                                    // Index out of range — fall back to append (shouldn't happen).
+                                    self.push_output_spans(spans, OutputRole::Tool);
+                                    Some(self.output.len().saturating_sub(1))
+                                }
+                            } else {
+                                // Shelf-only tools still get a done line with live body when available.
+                                self.push_output_spans(spans, OutputRole::Tool);
+                                let idx = self.output.len().saturating_sub(1);
+                                if tool_kind.is_execute()
+                                    && let Some(body) = live_body
                                 {
                                     let body =
                                         crate::transcript_heights::truncate_verbose_trail(&body);
-                                    self.output[*line_idx].attach_expandable_body(body);
+                                    if is_error {
+                                        self.output[idx].attach_expandable_body_always(body);
+                                    } else {
+                                        self.output[idx].attach_expandable_body(body);
+                                    }
                                 }
-                                self.output[*line_idx].invalidate_render_cache();
-                                Some(*line_idx)
-                            } else {
-                                // Index out of range — fall back to append (shouldn't happen).
-                                self.push_output_spans(spans, OutputRole::Tool);
-                                Some(self.output.len().saturating_sub(1))
+                                Some(idx)
+                            };
+                            if is_error && let Some(line_idx) = written_line_idx {
+                                self.collapsed_tool_fail = Some(CollapsedToolFail {
+                                    fingerprint: crate::tool_display::tool_failure_fingerprint(
+                                        &name,
+                                        &resolved_args,
+                                        result_preview.as_deref(),
+                                    ),
+                                    line_idx,
+                                    count: 1,
+                                });
                             }
-                        } else {
-                            // No pending placeholder (e.g. streaming disabled, or the
-                            // tool fired before the feature was introduced) — append.
-                            self.push_output_spans(spans, OutputRole::Tool);
-                            Some(self.output.len().saturating_sub(1))
-                        };
-                        if is_error
-                            && let Some(line_idx) = written_line_idx
-                        {
-                            self.collapsed_tool_fail = Some(CollapsedToolFail {
-                                fingerprint: crate::tool_display::tool_failure_fingerprint(
+                            // 024 W4: fold consecutive reads/searches into verb headers.
+                            if !is_error
+                                && matches!(tool_kind, ToolCardKind::Read | ToolCardKind::Search)
+                            {
+                                let item = extract_tool_preview(&name, &resolved_args);
+                                self.push_read_search_verb_group(
                                     &name,
-                                    &resolved_args,
-                                    result_preview.as_deref(),
-                                ),
-                                line_idx,
-                                count: 1,
-                            });
-                        }
+                                    &item,
+                                    is_error,
+                                    written_line_idx,
+                                );
+                            }
                         } // !collapsed_into_prior
                         if self.tool_progress_mode == ToolProgressMode::Verbose
                             && !self.turn_activity.enabled
@@ -647,6 +761,9 @@ impl App {
                             let command_preview = extract_tool_preview(&name, &resolved_args);
                             self.upsert_bg_process_line(&process_id, &command_preview, "starting…");
                         }
+                    } else {
+                        // Hidden / shelf-suppressed: still drain presentation buffer.
+                        let _ = self.stream_presentation.on_tool_done(&tool_call_id);
                     }
                     if name == "clarify" && self.clarify_pending_tx.is_some() {
                         self.flush_abandoned_clarify("timed out");
@@ -664,8 +781,8 @@ impl App {
                             frame: 0,
                             started: Instant::now(),
                         };
-                        self.turn_activity
-                            .set_phase(crate::turn_activity::ShelfPhase::AwaitingFirstToken);
+                        // Presentation already Idle; sync maps to AwaitingFirstToken.
+                        self.sync_presentation_chrome();
                     } else if let Some((active_tool_call_id, row)) =
                         self.turn_activity.latest_active_tool()
                     {
@@ -677,6 +794,7 @@ impl App {
                             frame: 0,
                             started: row.started_at,
                         };
+                        self.sync_presentation_chrome();
                     }
                     self.refresh_foreground_tool_live_panel();
                     self.needs_redraw = true;
@@ -894,6 +1012,11 @@ impl App {
                 }
                 AgentResponse::Done => {
                     self.flush_buffered_assistant_output();
+                    self.finalize_thinking_stream_card();
+                    // 024 W4: Grok-style turn footer before clearing presentation.
+                    if let Some(worked) = self.stream_presentation.worked_for_label() {
+                        self.push_output(format!("  ◆ {worked}"), OutputRole::System);
+                    }
                     self.auto_update_status();
                     let turn_metrics = TurnCommitMetrics {
                         token_est: self

@@ -41,10 +41,7 @@ impl CredentialPool {
         let mut pool = Self::new();
         let specific = format!(
             "EDGECRAB_API_KEY_POOL_{}",
-            provider
-                .to_ascii_uppercase()
-                .replace('-', "_")
-                .replace('/', "_")
+            provider.to_ascii_uppercase().replace(['-', '/'], "_")
         );
         let raw = std::env::var(&specific)
             .ok()

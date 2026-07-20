@@ -429,7 +429,9 @@ pub fn handle_skills_pending_subcommand(
                 Some(pending)
             } else {
                 let bundled = crate::tools::skills_sync::diff_bundled_skill(arg);
-                Some(crate::tools::skills_hub::format_bundled_diff_result(&bundled))
+                Some(crate::tools::skills_hub::format_bundled_diff_result(
+                    &bundled,
+                ))
             }
         }
         "approval" | "mode" => Some(set_approval_mode(

@@ -158,8 +158,7 @@ impl SubAgentRunner for CoreSubAgentRunner {
             if let Some(repo_root) = edgecrab_tools::isolated_worktree::git_repo_root_from(&cwd) {
                 let task_key = format!("{task_index}-{agent_id}");
                 let info = edgecrab_tools::isolated_worktree::setup_isolated_worktree(
-                    &repo_root,
-                    &task_key,
+                    &repo_root, &task_key,
                 )
                 .map_err(|e| format!("worktree setup: {e}"))?;
                 let report = edgecrab_tools::isolated_worktree::merge_report(&info);

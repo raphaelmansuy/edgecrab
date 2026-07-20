@@ -16,11 +16,12 @@
 #![allow(clippy::result_large_err)]
 
 pub mod approval_runtime;
-pub mod preview_grant;
 pub mod artifact_spill;
 pub mod budget_config;
 mod command_interaction;
+pub mod preview_grant;
 pub use command_interaction::{command_invokes_screencapture, command_is_inspect_only};
+pub mod browser_diagnostics;
 pub mod config_ref;
 pub mod copilot_model_normalize;
 pub mod delegation_state;
@@ -52,19 +53,18 @@ pub mod schema_mode;
 mod shell_syntax;
 pub mod skills;
 pub mod smart_approval;
+pub mod structured_browser;
 pub mod subagent_ids;
+pub mod terminal_result;
 pub mod tool_argument_pipeline;
 pub mod tool_call_pipeline;
+pub mod tool_input_examples;
 pub mod tool_loop_guardrails;
 pub mod tool_name_repair;
 pub mod tool_progress_tail;
-pub mod tool_input_examples;
 pub mod tool_schema_index;
 pub mod tool_search_bm25;
-pub mod browser_diagnostics;
 pub mod tools;
-pub mod structured_browser;
-pub mod terminal_result;
 pub mod toolsets;
 pub mod vision_models;
 
@@ -86,6 +86,10 @@ pub use artifact_spill::{
     SpillConfig, SpillContext, SpillOutcome, SpillSequence, SpillWritten, WEB_EXTRACT_INLINE_BYTES,
     WEB_SEARCH_INLINE_BYTES, detect_spill_without_read,
 };
+pub use browser_diagnostics::{
+    BrowserDiagnosticsInput, BrowserDiagnosticsReport, UrlProbe, browser_diagnostics_doctor_detail,
+    collect_browser_diagnostics, format_browser_diagnostics, probe_loopback_url,
+};
 pub use config_ref::AppConfigRef;
 pub use edgecrab_security::approval::ApprovalMode;
 pub use execution_fs::{ExecutionFilesystemView, describe_execution_filesystem};
@@ -105,6 +109,7 @@ pub use mutations::{
 pub use process_table::ProcessTable;
 pub use provider_factory::{build_copilot_provider, create_provider_for_model};
 pub use provider_tracing::{llm_tracing_enabled, wrap_provider_with_tracing};
+pub use recovery_catalog::tools_to_materialize_from_error_json;
 pub use registry::{
     SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolProgressUpdate, ToolRegistry,
     build_wire_llm_definitions, to_llm_definitions, to_llm_definitions_with_materialized,
@@ -114,27 +119,27 @@ pub use schema_mode::{
     ToolSchemaMode, compact_tool_schema, prepare_schemas_for_mode, resolve_effective_schema_mode,
 };
 pub use smart_approval::handle_approvals_slash;
+pub use structured_browser::{
+    ContentClass, StructuredBrowserResult, browser_content_class, classify_browser_content,
+    parse_structured_browser_result, structured_browser_nav_succeeded, url_is_chrome_error,
+};
+pub use terminal_result::{ParsedTerminalResult, parse_terminal_result, terminal_result_succeeded};
 pub use tool_argument_pipeline::{
     canonical_tool_args_json, parse_tool_arguments_json, prepare_parsed_tool_arguments,
     repair_stream_tool_arguments, repair_tool_arguments,
 };
 pub use tool_call_pipeline::{
     MAX_INVALID_TOOL_RETRIES, PreparedToolCall, UNKNOWN_TOOL_SAMPLE_LIMIT,
-    classify_unknown_tool_batch, is_tool_registered, normalize_incoming_tool_call, prepare_tool_call,
-    repair_tool_call_arguments_for_api, sanitize_assistant_tool_calls_for_api,
+    classify_unknown_tool_batch, is_tool_registered, normalize_incoming_tool_call,
+    prepare_tool_call, repair_tool_call_arguments_for_api, sanitize_assistant_tool_calls_for_api,
     unknown_tool_error_response, unknown_tool_names, unknown_tool_recovery_sample,
     unknown_tool_search_query,
 };
-pub use recovery_catalog::tools_to_materialize_from_error_json;
-pub use tool_search_bm25::{
-    CatalogEntry, build_deferred_catalog, build_registry_catalog, looks_like_create_file_intent,
-    prefetch_tools_for_user_message, search_deferred_catalog,
+pub use tool_input_examples::{
+    MAX_INPUT_EXAMPLES_PER_TOOL, input_examples_for_names, input_examples_for_tool,
 };
 pub use tool_name_repair::{
     ResolvedToolName, fuzzy_match_tool_name, repair_tool_name, resolve_tool_call_name,
-};
-pub use tool_input_examples::{
-    MAX_INPUT_EXAMPLES_PER_TOOL, input_examples_for_names, input_examples_for_tool,
 };
 pub use tool_schema_index::{
     AUTO_INDEXED_TOOL_COUNT_THRESHOLD, DEFAULT_MAX_MATERIALIZED_TOOLS, DEFAULT_PREFETCH_LIMIT,
@@ -142,6 +147,10 @@ pub use tool_schema_index::{
     TOOL_SEARCH_NAME, deferred_names_for_toolset, deferred_tool_error_response,
     format_deferred_index, is_deferred_not_on_wire, materialize_tool_names, partition_schemas,
     read_materialized_set, wire_partition_counts, wire_schemas,
+};
+pub use tool_search_bm25::{
+    CatalogEntry, build_deferred_catalog, build_registry_catalog, looks_like_create_file_intent,
+    prefetch_tools_for_user_message, search_deferred_catalog,
 };
 pub use tools::checkpoint::{
     AutoPruneResult, CheckpointConfig, CheckpointManager, PruneCounts, RollbackOutcome,
@@ -176,17 +185,6 @@ pub use tools::web::{
     search_override_warning, search_section_override_from_path, summarize_web_search_backend,
     web_command_overlay, web_command_usage, web_menu_status_hint, web_provider_picker_rows,
     web_search_is_available, web_search_result_note, web_status_one_liner,
-};
-pub use browser_diagnostics::{
-    BrowserDiagnosticsInput, BrowserDiagnosticsReport, UrlProbe, browser_diagnostics_doctor_detail,
-    collect_browser_diagnostics, format_browser_diagnostics, probe_loopback_url,
-};
-pub use structured_browser::{
-    ContentClass, StructuredBrowserResult, browser_content_class, classify_browser_content,
-    parse_structured_browser_result, structured_browser_nav_succeeded, url_is_chrome_error,
-};
-pub use terminal_result::{
-    ParsedTerminalResult, parse_terminal_result, terminal_result_succeeded,
 };
 pub use toolsets::{
     CORE_TOOLS, HONCHO_TOOLS, INDEXED_HOT_TOOLS, LSP_TOOLS, MCP_EXTENDED_TOOLS, MOA_TOOLS,

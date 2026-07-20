@@ -309,7 +309,9 @@ fn xai_oauth_options_for_tui() -> edgecrab_proxy::XaiOAuthLoginOptions {
         manual_paste: true,
         pasted_code: None,
         // Empty hook: suppress default eprintln path and print_grok_oauth_signin.
-        on_authorize: Some(Arc::new(|_prompt: edgecrab_proxy::XaiOAuthAuthorizePrompt| {})),
+        on_authorize: Some(Arc::new(
+            |_prompt: edgecrab_proxy::XaiOAuthAuthorizePrompt| {},
+        )),
         ..Default::default()
     }
 }

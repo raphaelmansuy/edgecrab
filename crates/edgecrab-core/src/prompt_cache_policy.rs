@@ -282,9 +282,7 @@ fn apply_envelope_system_and_3(messages: &mut [ChatMessage], marker: &CacheContr
     let carryable: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| {
-            !matches!(m.role, ChatRole::System) && message_can_carry_marker(m, false)
-        })
+        .filter(|(_, m)| !matches!(m.role, ChatRole::System) && message_can_carry_marker(m, false))
         .map(|(i, _)| i)
         .collect();
 
@@ -335,11 +333,7 @@ mod tests {
 
     #[test]
     fn nous_portal_kimi_enables_cache() {
-        let d = decide_prompt_cache(
-            "nous",
-            "kimi-k2",
-            Some("https://api.nousresearch.com/v1"),
-        );
+        let d = decide_prompt_cache("nous", "kimi-k2", Some("https://api.nousresearch.com/v1"));
         assert!(d.should_cache);
         assert!(!d.native_inner_layout);
     }
@@ -391,7 +385,7 @@ mod tests {
             ChatMessage::system("sys"),
             ChatMessage::user("u1"),
             ChatMessage::assistant_with_tools("", vec![]), // empty content
-            ChatMessage::tool_result("t1", ""),           // empty tool
+            ChatMessage::tool_result("t1", ""),            // empty tool
             ChatMessage::user("u2"),
             ChatMessage::assistant("a1 with text"),
             ChatMessage::tool_result("t2", "tool body"),
@@ -425,7 +419,9 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert!(
-            marked_non_sys.contains(&4) || marked_non_sys.contains(&5) || marked_non_sys.contains(&6),
+            marked_non_sys.contains(&4)
+                || marked_non_sys.contains(&5)
+                || marked_non_sys.contains(&6),
             "carryable tail must be marked: {marked_non_sys:?}"
         );
         assert!(!marked_non_sys.contains(&2));
@@ -458,7 +454,10 @@ mod tests {
             ..Default::default()
         };
         apply_prompt_cache_breakpoints(&mut msgs, decision, &cfg, true);
-        assert!(msgs[1].cache_control.is_none(), "dynamic must stay unmarked");
+        assert!(
+            msgs[1].cache_control.is_none(),
+            "dynamic must stay unmarked"
+        );
         assert!(msgs[3].cache_control.is_some());
         assert!(msgs[4].cache_control.is_some());
         assert!(msgs[2].cache_control.is_none());
