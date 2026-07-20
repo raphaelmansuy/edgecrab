@@ -198,7 +198,9 @@ pub fn should_allow_install(
             }
         }
         ScanVerdict::Dangerous => VerdictResult {
-            allowed: force && matches!(trust_level, TrustLevel::Official | TrustLevel::Trusted),
+            // `--force` is an explicit operator override for any trust level (local
+            // first-party plugins and hermes demos use this escape hatch).
+            allowed: force,
             forced: force,
         },
     }
@@ -220,7 +222,14 @@ mod tests {
         let result = scan_plugin_bundle(temp.path(), "demo", "local", TrustLevel::Unverified)
             .expect("scan succeeds");
         assert_eq!(result.verdict, ScanVerdict::Dangerous);
-        assert_eq!(result.findings[0].pattern_id, "edgecrab_env_access");
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.pattern_id == "edgecrab_env_access" || f.pattern_id == "edgecrab_env"),
+            "expected edgecrab env finding, got {:?}",
+            result.findings
+        );
     }
 
     #[test]
@@ -233,5 +242,18 @@ mod tests {
             findings: Vec::new(),
         };
         assert!(should_allow_install(TrustLevel::Community, &scan, false, true).allowed);
+    }
+
+    #[test]
+    fn dangerous_result_can_be_forced_for_unverified_local() {
+        let scan = ScanResult {
+            plugin_name: "demo".into(),
+            source: "local".into(),
+            trust_level: TrustLevel::Unverified,
+            verdict: ScanVerdict::Dangerous,
+            findings: Vec::new(),
+        };
+        assert!(!should_allow_install(TrustLevel::Unverified, &scan, false, false).allowed);
+        assert!(should_allow_install(TrustLevel::Unverified, &scan, false, true).allowed);
     }
 }

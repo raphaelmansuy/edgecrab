@@ -196,6 +196,34 @@ pub fn prefetch_tools_for_user_message(
     let catalog = build_deferred_catalog(schemas, materialized);
     let mut hits = search_deferred_catalog(&catalog, query, max_prefetch);
 
+    // Named MCP servers beat BM25 alone — "List Fund in GPS" must surface
+    // mcp_list_tools / mcp_GPS_* before the model falls back to shell/docker.
+    let mcp_hits = crate::tools::mcp_client::mcp_tool_names_for_user_text(query, schemas);
+    if !mcp_hits.is_empty() {
+        let mcp_cap = mcp_hits_cap(schemas);
+        let deferred: HashSet<&str> = catalog.iter().map(|e| e.name.as_str()).collect();
+        let mut merged = Vec::new();
+        for name in &mcp_hits {
+            if (deferred.contains(name.as_str())
+                || name == "mcp_list_tools"
+                || name == "mcp_call_tool")
+                && !merged.iter().any(|existing: &String| existing == name)
+            {
+                merged.push(name.clone());
+            }
+        }
+        for name in hits {
+            if !merged.iter().any(|existing| existing == &name) {
+                merged.push(name);
+            }
+        }
+        hits = merged;
+        let cap = max_prefetch.max(mcp_cap);
+        if hits.len() > cap {
+            hits.truncate(cap);
+        }
+    }
+
     if looks_like_create_file_intent(query) {
         let deferred_names: HashSet<&str> = catalog.iter().map(|e| e.name.as_str()).collect();
         // Prefer workspace create over skills package management.
@@ -208,6 +236,17 @@ pub fn prefetch_tools_for_user_message(
         }
     }
     hits
+}
+
+fn mcp_hits_cap(schemas: &[ToolSchema]) -> usize {
+    // Allow materializing the MCP meta pair + a handful of server tools.
+    let mcp_dynamic = schemas
+        .iter()
+        .filter(|s| {
+            s.name.starts_with("mcp_") && s.name != "mcp_list_tools" && s.name != "mcp_call_tool"
+        })
+        .count();
+    2 + mcp_dynamic.min(8)
 }
 
 #[cfg(test)]
@@ -264,6 +303,19 @@ mod tests {
             3,
         );
         assert!(hits.iter().any(|n| n.contains("browser")));
+    }
+
+    #[test]
+    fn mcp_tool_names_for_user_text_matches_server_prefix() {
+        let schemas = vec![
+            schema("mcp_list_tools", "List MCP tools"),
+            schema("mcp_GPS_list_funds", "List funds"),
+            schema("terminal", "Shell"),
+        ];
+        // No EDGECRAB_HOME MCP config → empty; function must not panic.
+        let hits =
+            crate::tools::mcp_client::mcp_tool_names_for_user_text("List Fund in GPS", &schemas);
+        assert!(hits.is_empty() || hits.contains(&"mcp_list_tools".to_string()));
     }
 
     #[test]

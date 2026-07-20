@@ -69,6 +69,11 @@ pub struct Agent {
     /// kept `/status`, session inspection, and other read paths blocked for the
     /// full duration of prompt assembly, API calls, and tool execution.
     pub(crate) conversation_lock: Mutex<()>,
+    /// Serializes all manual, hygiene, and in-loop compression attempts.
+    ///
+    /// This is separate from `conversation_lock`: gateway hygiene can run just
+    /// before a turn while operator-triggered compression runs concurrently.
+    pub(crate) compression_lock: Mutex<()>,
     pub(crate) session: RwLock<SessionState>,
     pub(crate) budget: Arc<IterationBudget>,
     /// Cancel token is wrapped in a Mutex so it can be RESET before each new
@@ -157,6 +162,8 @@ pub struct AgentConfig {
     pub streaming: bool,
     pub temperature: Option<f32>,
     pub platform: Platform,
+    /// Optional least-privilege envelope. `None` keeps trusted CLI unrestricted.
+    pub capability_grants: Option<edgecrab_tools::CapabilityGrants>,
     pub api_mode: ApiMode,
     pub session_id: Option<String>,
     pub quiet_mode: bool,
@@ -244,6 +251,8 @@ pub struct AgentConfig {
     pub path_restrictions: Vec<std::path::PathBuf>,
     /// LSP runtime configuration projected from AppConfig.
     pub lsp: crate::config::LspConfig,
+    /// Default registry deadline for one foreground tool invocation.
+    pub tool_timeout_secs: u64,
     /// Whether tool-result spill-to-artifact is enabled.
     pub result_spill: bool,
     /// Byte threshold for spilling tool results.
@@ -294,6 +303,7 @@ impl Default for AgentConfig {
             streaming: true,
             temperature: None,
             platform: Platform::Cli,
+            capability_grants: None,
             api_mode: ApiMode::ChatCompletions,
             session_id: None,
             quiet_mode: false,
@@ -344,6 +354,7 @@ impl Default for AgentConfig {
             file_allowed_roots: Vec::new(),
             path_restrictions: Vec::new(),
             lsp: crate::config::LspConfig::default(),
+            tool_timeout_secs: 120,
             result_spill: true,
             result_spill_threshold: 16_384,
             result_spill_preview_lines: 80,
@@ -448,6 +459,7 @@ impl AgentConfig {
         tool_policy: &ResolvedToolPolicy,
     ) -> AppConfigRef {
         AppConfigRef {
+            tool_timeout_secs: self.tool_timeout_secs,
             edgecrab_home: crate::config::edgecrab_home(),
             file_allowed_roots: self.file_allowed_roots.clone(),
             path_restrictions: self.path_restrictions.clone(),
@@ -808,6 +820,7 @@ impl Agent {
             gateway_sender: RwLock::new(None),
             process_table,
             conversation_lock: Mutex::new(()),
+            compression_lock: Mutex::new(()),
             session: RwLock::new(SessionState::default()),
             budget,
             cancel: std::sync::Mutex::new(CancellationToken::new()),
@@ -840,6 +853,16 @@ impl Agent {
     /// Inject or replace the gateway-backed outbound sender used by `send_message`.
     pub async fn set_gateway_sender(&self, sender: Arc<dyn GatewaySender>) {
         *self.gateway_sender.write().await = Some(sender);
+    }
+
+    /// Apply least-privilege grants to future tool contexts.
+    pub async fn set_capability_grants(&self, grants: Option<edgecrab_tools::CapabilityGrants>) {
+        self.config.write().await.capability_grants = grants;
+    }
+
+    /// Return the least-privilege grants applied to direct tool operations.
+    pub async fn capability_grants(&self) -> Option<edgecrab_tools::CapabilityGrants> {
+        self.config.read().await.capability_grants
     }
 
     /// Toggle the shadow judge completion oracle for this session.
@@ -1552,6 +1575,7 @@ impl Agent {
                 config: app_config_ref.clone(),
                 state_db: self.state_db.clone(),
                 platform: config.platform,
+                capability_grants: config.capability_grants,
                 process_table: Some(self.process_table.clone()),
                 provider: Some(self.provider.read().await.clone()),
                 tool_registry: Some(registry.clone()),
@@ -1893,6 +1917,8 @@ impl Agent {
 
     /// Manual `/compress [focus topic]` (Hermes parity).
     pub async fn force_compress_with_focus(&self, focus: Option<&str>) {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        let _compression_guard = self.compression_lock.lock().await;
         let provider = self.provider.read().await.clone();
         let config = self.config.read().await.clone();
         let mut session = self.session.write().await;
@@ -1932,6 +1958,8 @@ impl Agent {
         if !config.compression.enabled {
             return SessionHygieneOutcome::Skipped;
         }
+        let _conversation_guard = self.conversation_lock.lock().await;
+        let _compression_guard = self.compression_lock.lock().await;
 
         let snapshot = {
             let session = self.session.read().await;
@@ -2528,6 +2556,7 @@ impl Agent {
                 .to_app_config_ref(self.gateway_sender.read().await.is_some(), &tool_policy),
             state_db: self.state_db.clone(),
             platform: config.platform,
+            capability_grants: config.capability_grants,
             process_table: Some(self.process_table.clone()),
             provider: Some(self.provider.read().await.clone()),
             tool_registry: Some(registry.clone()),
@@ -2928,6 +2957,12 @@ pub enum StreamEvent {
         /// Channel to send the secret value back to the agent (empty = abort).
         response_tx: tokio::sync::oneshot::Sender<String>,
     },
+    /// An MCP HTTP tool needs interactive OAuth (token missing / refresh failed / 401).
+    ///
+    /// Non-blocking: the TUI should open `/mcp login {server_name}` (browser/device
+    /// flow) while the model receives a `mcp_oauth_required` capability error.
+    /// After login, `McpRuntimeRefresh` rebuilds the live tool registry.
+    McpOAuthRequired { server_name: String },
     /// A lifecycle hook event emitted from the conversation loop.
     ///
     /// Subscribers (gateway, CLI) receive these events and forward them to
@@ -3098,6 +3133,9 @@ impl std::fmt::Debug for StreamEvent {
             Self::SecretRequest {
                 var_name, is_sudo, ..
             } => write!(f, "SecretRequest({var_name:?}, sudo={is_sudo})"),
+            Self::McpOAuthRequired { server_name } => {
+                write!(f, "McpOAuthRequired({server_name:?})")
+            }
             Self::HookEvent { event, .. } => write!(f, "HookEvent({event:?})"),
             Self::ContextPressure {
                 estimated_tokens,
@@ -3277,6 +3315,7 @@ impl AgentBuilder {
                 file_allowed_roots: config.tools.file.allowed_roots.clone(),
                 path_restrictions: config.security.path_restrictions.clone(),
                 lsp: config.lsp.clone(),
+                tool_timeout_secs: config.tools.timeout_secs,
                 result_spill: config.tools.result_spill,
                 result_spill_threshold: config.tools.result_spill_threshold,
                 result_spill_preview_lines: config.tools.result_spill_preview_lines,
@@ -3619,6 +3658,58 @@ mod tests {
             self.release.notified().await;
             Ok(edgequake_llm::LLMResponse::new("slow answer", self.model()))
         }
+    }
+
+    #[tokio::test]
+    async fn compression_lock_blocks_concurrent_compression() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(SlowChatProvider {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let agent = Arc::new(
+            AgentBuilder::new("slow-chat/mock")
+                .provider(provider)
+                .build()
+                .expect("agent"),
+        );
+        {
+            let mut config = agent.config.write().await;
+            config.compression.protect_last_n = 4;
+        }
+        {
+            let mut session = agent.session.write().await;
+            session.messages = (0..20)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        Message::user(&format!("question {i}"))
+                    } else {
+                        Message::assistant(&format!("answer {i}"))
+                    }
+                })
+                .collect();
+        }
+
+        let lock = agent.compression_lock.lock().await;
+        let started_signal = started.notified();
+        tokio::pin!(started_signal);
+        let task = {
+            let agent = agent.clone();
+            tokio::spawn(async move { agent.force_compress().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, &mut started_signal)
+                .await
+                .is_err(),
+            "provider must not start while compression lease is held"
+        );
+
+        drop(lock);
+        started_signal.await;
+        release.notify_waiters();
+        task.await.expect("compression task");
     }
 
     #[async_trait]

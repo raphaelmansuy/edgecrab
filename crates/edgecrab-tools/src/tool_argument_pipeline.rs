@@ -27,8 +27,12 @@ pub fn repair_tool_arguments(raw: &str) -> String {
 fn repair_tool_arguments_inner(raw: &str, allow_empty_fallback: bool) -> String {
     let raw_stripped = raw.trim();
     if raw_stripped.is_empty() || raw_stripped == "null" || raw_stripped == "None" {
-        tracing::warn!("tool_argument_pipeline: empty tool args normalized to {{}}");
-        return "{}".to_string();
+        if allow_empty_fallback {
+            tracing::warn!("tool_argument_pipeline: empty tool args normalized to {{}}");
+            return "{}".to_string();
+        }
+        // Leave empty so callers / finalize can reject when fallback is off.
+        return String::new();
     }
 
     // Pass 0: already valid JSON — canonicalize (compact wire form).
@@ -299,6 +303,13 @@ mod tests {
         assert_eq!(repair_tool_arguments("   "), "{}");
         assert_eq!(repair_tool_arguments("null"), "{}");
         assert_eq!(repair_tool_arguments("None"), "{}");
+    }
+
+    #[test]
+    fn ta01b_empty_stays_empty_when_fallback_disabled() {
+        assert_eq!(repair_tool_arguments_inner("", false), "");
+        assert_eq!(repair_tool_arguments_inner("null", false), "");
+        assert_eq!(repair_tool_arguments_inner("None", false), "");
     }
 
     #[test]

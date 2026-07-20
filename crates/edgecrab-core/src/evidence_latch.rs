@@ -934,7 +934,8 @@ mod tests {
         let mut st = EvidenceState::default();
         st.note_media_artifact_ok("/tmp/out.mp4", 1024);
         assert!(st.media_evidence_complete());
-        assert!(!st.visual_evidence_complete());
+        // Media latch sets oracle_ok so visual evidence also completes (no browser needed).
+        assert!(st.visual_evidence_complete());
     }
 
     #[test]

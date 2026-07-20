@@ -14,6 +14,7 @@ fn ctx_in(dir: &std::path::Path, session_id: &str) -> ToolContext {
         config: AppConfigRef::default(),
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: None,
         tool_registry: None,
@@ -72,8 +73,23 @@ async fn registry_blocks_stale_write_file_overwrite() {
     match err {
         ToolError::InvalidArgs { tool, message } => {
             assert_eq!(tool, "write_file");
-            assert!(message.contains("modified since you last read it"));
+            assert!(
+                message.contains("modified since you last read it")
+                    || message.contains("changed since it was last read"),
+                "{message}"
+            );
         }
+        ToolError::WithRecovery { inner, .. } => match *inner {
+            ToolError::InvalidArgs { tool, message } => {
+                assert_eq!(tool, "write_file");
+                assert!(
+                    message.contains("modified since you last read it")
+                        || message.contains("changed since it was last read"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InvalidArgs recovery inner, got {other:?}"),
+        },
         other => panic!("expected InvalidArgs, got {other:?}"),
     }
 }
@@ -119,8 +135,23 @@ async fn registry_blocks_stale_apply_patch_update() {
     match err {
         ToolError::InvalidArgs { tool, message } => {
             assert_eq!(tool, "apply_patch");
-            assert!(message.contains("modified since you last read it"));
+            assert!(
+                message.contains("modified since you last read it")
+                    || message.contains("changed since it was last read"),
+                "{message}"
+            );
         }
+        ToolError::WithRecovery { inner, .. } => match *inner {
+            ToolError::InvalidArgs { tool, message } => {
+                assert_eq!(tool, "apply_patch");
+                assert!(
+                    message.contains("modified since you last read it")
+                        || message.contains("changed since it was last read"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InvalidArgs recovery inner, got {other:?}"),
+        },
         other => panic!("expected InvalidArgs, got {other:?}"),
     }
 }

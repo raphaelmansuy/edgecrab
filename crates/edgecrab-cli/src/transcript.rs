@@ -452,10 +452,7 @@ pub fn render_transcript_rich(
             let sticky_area = Rect::new(content_area.x, area.y, content_area.width, 1);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        "▎ ",
-                        Style::default().fg(Color::Rgb(205, 127, 50)),
-                    ),
+                    Span::styled("▎ ", Style::default().fg(Color::Rgb(205, 127, 50))),
                     Span::styled(
                         sticky_text.clone(),
                         Style::default()
@@ -467,7 +464,10 @@ pub fn render_transcript_rich(
                 sticky_area,
             );
         }
-        let hint = format!(" ↑{}  ↓follow/G  ↕scroll  {} ", scroll, params.paging_key_hint);
+        let hint = format!(
+            " ↑{}  ↓follow/G  ↕scroll  {} ",
+            scroll, params.paging_key_hint
+        );
         let hint_len = hint
             .len()
             .min(content_area.width.saturating_sub(1) as usize);

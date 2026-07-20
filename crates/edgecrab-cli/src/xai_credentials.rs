@@ -226,10 +226,6 @@ pub fn super_grok_login_success_agent_hint(pending_model: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialize env-mutating tests in this module.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn provider_needs_covers_xai_grok_super_grok() {
@@ -259,13 +255,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
     async fn prepare_uses_static_key_without_auth_json() {
-        let _g = ENV_LOCK.lock().expect("lock");
-        // SAFETY: test isolation under lock.
+        let _guard = crate::gateway_catalog::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        // SAFETY: test isolation under shared env lock.
         unsafe {
             std::env::set_var("XAI_API_KEY", "test-static-key");
             std::env::remove_var(EDGECRAB_XAI_AUTH_MODE_ENV);
-            std::env::set_var("EDGECRAB_HOME", tempfile::tempdir().unwrap().path());
+            std::env::set_var("EDGECRAB_HOME", home.path());
         }
         prepare_xai_credentials(false).await.expect("prepare");
         assert_eq!(
@@ -275,12 +273,14 @@ mod tests {
         unsafe {
             std::env::remove_var("XAI_API_KEY");
             std::env::remove_var(EDGECRAB_XAI_AUTH_MODE_ENV);
+            std::env::remove_var("EDGECRAB_HOME");
         }
     }
 
     #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
     async fn prepare_loads_oauth_from_auth_json() {
-        let _g = ENV_LOCK.lock().expect("lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let home = tempfile::tempdir().expect("home");
         let edge = home.path().join(".edgecrab");
         std::fs::create_dir_all(&edge).expect("dir");
@@ -324,8 +324,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(edgecrab_home_env)]
     async fn prefer_oauth_overrides_static_key_when_tokens_present() {
-        let _g = ENV_LOCK.lock().expect("lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let home = tempfile::tempdir().expect("home");
         let edge = home.path().join(".edgecrab");
         std::fs::create_dir_all(&edge).expect("dir");
@@ -370,8 +371,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(edgecrab_home_env)]
     fn status_line_missing_when_unconfigured() {
-        let _g = ENV_LOCK.lock().expect("lock");
+        let _guard = crate::gateway_catalog::lock_test_env();
         let home = tempfile::tempdir().expect("home");
         unsafe {
             std::env::set_var("EDGECRAB_HOME", home.path().join(".edgecrab"));

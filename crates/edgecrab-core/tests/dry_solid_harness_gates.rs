@@ -77,7 +77,7 @@ fn turn_epilogue_bans_default_snapshot_in_docs_comment() {
 }
 
 #[test]
-fn indexed_hot_tools_stay_at_five() {
+fn indexed_hot_tools_keep_file_shell_and_mcp_meta() {
     let src = fs::read_to_string(workspace_file("crates/edgecrab-tools/src/toolsets.rs"))
         .expect("toolsets.rs");
     let Some(start) = src.find("pub const INDEXED_HOT_TOOLS") else {
@@ -94,12 +94,16 @@ fn indexed_hot_tools_stay_at_five() {
     let body = &rest[1..end];
     let count = body.matches('"').count() / 2;
     assert_eq!(
-        count, 5,
-        "INDEXED_HOT_TOOLS must stay at 5 without new meter proof (found {count})"
+        count, 7,
+        "INDEXED_HOT_TOOLS must stay at 7 (file/shell + MCP meta) without new meter proof (found {count})"
     );
     assert!(
         body.contains("write_file"),
         "write_file must remain hot (create-path disclosure)"
+    );
+    assert!(
+        body.contains("mcp_list_tools") && body.contains("mcp_call_tool"),
+        "MCP meta tools must stay hot so configured servers are discoverable"
     );
 }
 

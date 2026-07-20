@@ -703,16 +703,18 @@ mod tests {
         }
         let b = DockerBackend::new("test-docker-tmp", default_config());
         let marker = uuid::Uuid::new_v4().simple().to_string();
+        // alpine:latest has no python3 — use shell only.
         let Some(out) = try_exec(
             &b,
             &format!(
-                "python3 - <<'PY'\nimport os, tempfile\nopen('/tmp/{marker}.txt', 'w').write('tmp')\nprint(os.environ['EDGECRAB_TMPDIR'])\nprint(tempfile.gettempdir())\nPY"
+                "printf '%s\\n' \"$EDGECRAB_TMPDIR\" \"${{TMPDIR:-}}\"; printf tmp > /tmp/{marker}.txt"
             ),
         )
         .await
         else {
             return;
         };
+        assert_eq!(out.exit_code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
         let lines: Vec<&str> = out.stdout.lines().collect();
         assert!(
             lines.len() >= 2,

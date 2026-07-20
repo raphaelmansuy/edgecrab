@@ -652,13 +652,25 @@ mod tests {
 
     #[test]
     fn execute_code_snippet_does_not_record_unbound_port() {
-        let code = r#"
+        // Pick an ephemeral port that is not listening after we drop the bind.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            drop(listener);
+            port
+        };
+        let code = format!(
+            r#"
 import subprocess
-subprocess.Popen(["python3", "-m", "http.server", "8765"])
-"#;
-        let sid = "sess-exec-no-spawn-record";
-        record_session_http_from_text(sid, code);
+subprocess.Popen(["python3", "-m", "http.server", "{port}"])
+"#
+        );
+        let sid = format!("sess-exec-no-spawn-record-{port}");
+        record_session_http_from_text(&sid, &code);
         // Port truth: text alone never records without a listen probe.
-        assert!(!session_http_server_ports(sid).contains(&8765));
+        assert!(
+            !session_http_server_ports(&sid).contains(&port),
+            "unbound port {port} must not be recorded"
+        );
     }
 }

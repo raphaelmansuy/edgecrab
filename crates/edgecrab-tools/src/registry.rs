@@ -25,12 +25,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use edgecrab_state::SessionDb;
 use edgecrab_types::{Message, Platform, RunOutcome, ToolError, ToolSchema};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::config_ref::AppConfigRef;
@@ -189,6 +191,16 @@ pub trait SubAgentRunner: Send + Sync {
 
 // ─── ToolHandler trait ────────────────────────────────────────────────
 
+/// Broad side-effect class used by schedulers, approvals, and audit logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SideEffect {
+    Read,
+    #[default]
+    Write,
+    Network,
+    Destructive,
+}
+
 /// Trait that every tool must implement.
 ///
 /// WHY async_trait: Tool execution is inherently async (file I/O, HTTP,
@@ -238,6 +250,24 @@ pub trait ToolHandler: Send + Sync + 'static {
         false
     }
 
+    /// Broad side-effect class. The conservative default avoids treating
+    /// existing tools as read-only until they explicitly opt in.
+    fn side_effect(&self) -> SideEffect {
+        SideEffect::Write
+    }
+
+    /// Whether repeating the same invocation is expected to be safe.
+    fn idempotent(&self) -> bool {
+        false
+    }
+
+    /// Optional tool-specific execution deadline.
+    ///
+    /// `None` uses `ToolContext::config.tool_timeout_secs`.
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
+
     /// Argument names containing file paths — used for path-overlap detection
     /// in parallel dispatch. Tools that return non-empty path_arguments can be
     /// parallelised even if `parallel_safe()` is false, provided no two
@@ -257,10 +287,95 @@ inventory::collect!(&'static dyn ToolHandler);
 
 // ─── ToolContext ───────────────────────────────────────────────────────
 
+/// Optional least-privilege envelope for untrusted principals.
+///
+/// `ToolContext::capability_grants == None` preserves the trusted local CLI
+/// behavior: every capability is unrestricted. Gateway sessions set `Some`
+/// so dangerous tool families are denied unless explicitly granted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CapabilityGrants {
+    pub file: bool,
+    pub net: bool,
+    pub mcp: bool,
+}
+
+impl CapabilityGrants {
+    pub const fn unrestricted() -> Self {
+        Self {
+            file: true,
+            net: true,
+            mcp: true,
+        }
+    }
+
+    fn allows(self, scope: CapabilityScope) -> bool {
+        match scope {
+            CapabilityScope::File => self.file,
+            CapabilityScope::Net => self.net,
+            CapabilityScope::Mcp => self.mcp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityScope {
+    File,
+    Net,
+    Mcp,
+}
+
+impl CapabilityScope {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Net => "net",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
+fn required_capability(tool_name: &str, toolset: &str) -> Option<CapabilityScope> {
+    if toolset == "mcp" || toolset.starts_with("mcp-") || tool_name.starts_with("mcp_") {
+        return Some(CapabilityScope::Mcp);
+    }
+    if matches!(
+        toolset,
+        "web"
+            | "browser"
+            | "x_search"
+            | "homeassistant"
+            | "honcho"
+            | "vision"
+            | "tts"
+            | "transcribe"
+            | "video"
+    ) {
+        return Some(CapabilityScope::Net);
+    }
+    if matches!(
+        toolset,
+        "file"
+            | "terminal"
+            | "process"
+            | "execute_code"
+            | "memory"
+            | "skills"
+            | "checkpoint"
+            | "pdf"
+            | "lsp"
+            | "computer_use"
+    ) {
+        return Some(CapabilityScope::File);
+    }
+    None
+}
+
 /// Shared context passed to every tool execution.
 ///
 /// WHY Arc for config/state_db: Multiple tools may execute in parallel,
 /// and each needs read access to shared state without cloning heavy objects.
+#[derive(Clone)]
 pub struct ToolContext {
     /// Unique identifier for the current task/conversation
     pub task_id: String,
@@ -278,6 +393,9 @@ pub struct ToolContext {
     pub state_db: Option<Arc<SessionDb>>,
     /// Platform context — affects tool behavior (CLI vs gateway vs ACP)
     pub platform: Platform,
+    /// Least-privilege grants for an untrusted principal.
+    /// `None` means unrestricted (trusted local CLI compatibility).
+    pub capability_grants: Option<CapabilityGrants>,
     /// Shared background process table for this agent session.
     /// WHY Option: Not all callers (tests, ACP) need process management.
     pub process_table: Option<Arc<ProcessTable>>,
@@ -433,6 +551,7 @@ impl ToolContext {
             config: AppConfigRef::default(),
             state_db: None,
             platform: Platform::Cli,
+            capability_grants: None,
             process_table: None,
             provider: None,
             tool_registry: None,
@@ -647,6 +766,131 @@ fn coerce_tool_args(args: &mut serde_json::Value, schema: &serde_json::Value) {
     }
 }
 
+// ── Central schema validation ─────────────────────────────────────────
+
+fn value_matches_type(value: &Value, expected: &str) -> bool {
+    match expected {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "string" => value.is_string(),
+        _ => true, // Unknown/extension types are left to the handler.
+    }
+}
+
+fn schema_type_matches(value: &Value, schema: &Value) -> bool {
+    if value.is_null() && schema_allows_null(schema) {
+        return true;
+    }
+    match schema.get("type") {
+        Some(Value::String(expected)) => value_matches_type(value, expected),
+        Some(Value::Array(expected)) => expected
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|kind| value_matches_type(value, kind)),
+        _ => true,
+    }
+}
+
+fn validate_schema_value(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+        if branches
+            .iter()
+            .any(|branch| validate_schema_value(value, branch, path).is_ok())
+        {
+            return Ok(());
+        }
+        return Err(format!("{path} does not match any allowed schema"));
+    }
+    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
+        if branches
+            .iter()
+            .any(|branch| validate_schema_value(value, branch, path).is_ok())
+        {
+            return Ok(());
+        }
+        return Err(format!("{path} does not match any allowed schema"));
+    }
+
+    if !schema_type_matches(value, schema) {
+        let expected = schema
+            .get("type")
+            .map_or_else(|| "declared type".to_string(), Value::to_string);
+        return Err(format!(
+            "{path} must be {expected}, got {}",
+            match value {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            }
+        ));
+    }
+
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        return Err(format!(
+            "{path} must be one of {}",
+            Value::Array(allowed.clone())
+        ));
+    }
+    if let Some(expected) = schema.get("const")
+        && value != expected
+    {
+        return Err(format!("{path} must equal {expected}"));
+    }
+
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(format!("{path} is missing required property '{field}'"));
+                }
+            }
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            let required: std::collections::HashSet<&str> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            for (field, field_schema) in properties {
+                if let Some(field_value) = object.get(field) {
+                    // Optional JSON nulls mean "omit" — models and Python wrappers
+                    // often send `"timeout": null` for unused optional args.
+                    if field_value.is_null() && !required.contains(field.as_str()) {
+                        continue;
+                    }
+                    validate_schema_value(field_value, field_schema, &format!("{path}.{field}"))?;
+                }
+            }
+        }
+    }
+
+    if let Some(items) = value.as_array()
+        && let Some(item_schema) = schema.get("items")
+    {
+        for (index, item) in items.iter().enumerate() {
+            validate_schema_value(item, item_schema, &format!("{path}[{index}]"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_tool_args(tool: &str, args: &Value, schema: &Value) -> Result<(), ToolError> {
+    validate_schema_value(args, schema, "arguments").map_err(|message| ToolError::InvalidArgs {
+        tool: tool.to_string(),
+        message,
+    })
+}
+
 // ─── FP14: Schema cross-reference filtering ────────────────────────────────
 //
 // Known cross-references: (tool_with_ref, referenced_tool, text_to_strip).
@@ -702,6 +946,56 @@ pub fn strip_unavailable_cross_refs(definitions: &mut [ToolSchema]) {
 impl ToolRegistry {
     fn tool_allowed_in_ctx(tool_name: &str, toolset: &str, ctx: &ToolContext) -> bool {
         ctx.config.is_tool_enabled(tool_name, toolset)
+            && ctx.capability_grants.is_none_or(|grants| {
+                required_capability(tool_name, toolset).is_none_or(|scope| grants.allows(scope))
+            })
+    }
+
+    async fn execute_checked(
+        handler: &dyn ToolHandler,
+        mut args: Value,
+        ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        let schema = handler.schema();
+        coerce_tool_args(&mut args, &schema.parameters);
+        validate_tool_args(handler.name(), &args, &schema.parameters)?;
+
+        let timeout = handler.timeout().or_else(|| {
+            (ctx.config.tool_timeout_secs > 0)
+                .then(|| Duration::from_secs(ctx.config.tool_timeout_secs))
+        });
+        let Some(timeout) = timeout else {
+            return handler.execute(args, ctx).await;
+        };
+
+        let deadline_cancel = ctx.cancel.child_token();
+        let mut deadline_ctx = ctx.clone();
+        deadline_ctx.cancel = deadline_cancel.clone();
+        match tokio::time::timeout(timeout, handler.execute(args, &deadline_ctx)).await {
+            Ok(result) => result,
+            Err(_) => {
+                deadline_cancel.cancel();
+                Err(ToolError::Timeout {
+                    tool: handler.name().to_string(),
+                    seconds: timeout.as_secs().max(1),
+                })
+            }
+        }
+    }
+
+    fn capability_denial_reason(
+        tool_name: &str,
+        toolset: &str,
+        ctx: &ToolContext,
+    ) -> Option<String> {
+        let grants = ctx.capability_grants?;
+        let scope = required_capability(tool_name, toolset)?;
+        (!grants.allows(scope)).then(|| {
+            format!(
+                "tool '{tool_name}' requires the '{}' capability, which is not granted to this principal",
+                scope.label()
+            )
+        })
     }
 
     /// Build registry from all inventory-registered tools.
@@ -782,8 +1076,11 @@ impl ToolRegistry {
 
                 let toolset_allowed = explicitly_enabled
                     || (Self::tool_allowed_in_ctx(tool_name, toolset, ctx)
-                        && enabled.is_none_or(|sets| sets.iter().any(|s| s == toolset))
-                        && disabled.is_none_or(|sets| !sets.iter().any(|s| s == toolset)));
+                        && enabled
+                            .is_none_or(|sets| crate::toolsets::toolset_covered_by(sets, toolset))
+                        && disabled.is_none_or(|sets| {
+                            !crate::toolsets::toolset_covered_by(sets, toolset)
+                        }));
 
                 available && passes_check && toolset_allowed
             };
@@ -878,7 +1175,7 @@ impl ToolRegistry {
     pub async fn dispatch(
         &self,
         name: &str,
-        mut args: serde_json::Value,
+        args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<String, ToolError> {
         let resolved = self.resolve_tool_call_name(name);
@@ -902,10 +1199,13 @@ impl ToolRegistry {
             if !Self::tool_allowed_in_ctx(handler.name(), handler.toolset(), ctx) {
                 return Err(ToolError::Unavailable {
                     tool: name.to_string(),
-                    reason: format!(
-                        "tool '{}' is disabled in this session policy",
-                        handler.name()
-                    ),
+                    reason: Self::capability_denial_reason(handler.name(), handler.toolset(), ctx)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "tool '{}' is disabled in this session policy",
+                                handler.name()
+                            )
+                        }),
                 });
             }
             if !handler.check_fn(ctx) {
@@ -914,8 +1214,7 @@ impl ToolRegistry {
                     reason: "tool gating check failed".into(),
                 });
             }
-            coerce_tool_args(&mut args, &handler.schema().parameters);
-            return handler.execute(args, ctx).await;
+            return Self::execute_checked(*handler, args, ctx).await;
         }
 
         // Check dynamic tools
@@ -928,10 +1227,13 @@ impl ToolRegistry {
             if !Self::tool_allowed_in_ctx(handler.name(), handler.toolset(), ctx) {
                 return Err(ToolError::Unavailable {
                     tool: name.to_string(),
-                    reason: format!(
-                        "tool '{}' is disabled in this session policy",
-                        handler.name()
-                    ),
+                    reason: Self::capability_denial_reason(handler.name(), handler.toolset(), ctx)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "tool '{}' is disabled in this session policy",
+                                handler.name()
+                            )
+                        }),
                 });
             }
             if !handler.check_fn(ctx) {
@@ -940,8 +1242,7 @@ impl ToolRegistry {
                     reason: "tool gating check failed".into(),
                 });
             }
-            coerce_tool_args(&mut args, &handler.schema().parameters);
-            return handler.execute(args, ctx).await;
+            return Self::execute_checked(handler.as_ref(), args, ctx).await;
         }
 
         // Fuzzy fallback — suggest closest registered tool (Hermes difflib parity).
@@ -1656,6 +1957,7 @@ mod tests {
 
     // Test tool for unit tests
     struct TestTool;
+    struct FileTestTool;
 
     #[async_trait]
     impl ToolHandler for TestTool {
@@ -1703,6 +2005,31 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ToolHandler for FileTestTool {
+        fn name(&self) -> &'static str {
+            "file_test_tool"
+        }
+        fn toolset(&self) -> &'static str {
+            "file"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: self.name().into(),
+                description: "Capability test".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
+            }
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<String, ToolError> {
+            Ok("file-ok".into())
+        }
+    }
+
     struct GatedTool;
 
     #[async_trait]
@@ -1733,6 +2060,33 @@ mod tests {
         }
     }
 
+    struct HungTool;
+
+    #[async_trait]
+    impl ToolHandler for HungTool {
+        fn name(&self) -> &'static str {
+            "hung_tool"
+        }
+        fn toolset(&self) -> &'static str {
+            "test"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "hung_tool".into(),
+                description: "Never completes".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
+            }
+        }
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+        async fn execute(&self, _args: Value, ctx: &ToolContext) -> Result<String, ToolError> {
+            ctx.cancel.cancelled().await;
+            Ok("cancelled".into())
+        }
+    }
+
     fn make_registry_with_tools() -> ToolRegistry {
         let mut registry = ToolRegistry {
             tools: HashMap::new(),
@@ -1745,12 +2099,16 @@ mod tests {
         // Leak static references for test tools (only in tests)
         let test_tool: &'static dyn ToolHandler = Box::leak(Box::new(TestTool));
         let gated_tool: &'static dyn ToolHandler = Box::leak(Box::new(GatedTool));
+        let hung_tool: &'static dyn ToolHandler = Box::leak(Box::new(HungTool));
+        let file_tool: &'static dyn ToolHandler = Box::leak(Box::new(FileTestTool));
 
         registry.tools.insert(test_tool.name(), test_tool);
         registry
             .tool_aliases
             .insert("legacy_test_tool", "test_tool");
         registry.tools.insert(gated_tool.name(), gated_tool);
+        registry.tools.insert(hung_tool.name(), hung_tool);
+        registry.tools.insert(file_tool.name(), file_tool);
         registry
             .toolset_index
             .entry("test")
@@ -1761,6 +2119,16 @@ mod tests {
             .entry("gated")
             .or_default()
             .push("gated_tool");
+        registry
+            .toolset_index
+            .entry("test")
+            .or_default()
+            .push("hung_tool");
+        registry
+            .toolset_index
+            .entry("file")
+            .or_default()
+            .push("file_test_tool");
 
         registry
     }
@@ -1782,6 +2150,86 @@ mod tests {
             .await;
 
         assert_eq!(result.expect("dispatch"), "echo: hello");
+    }
+
+    #[tokio::test]
+    async fn capability_grants_restrict_gateway_without_changing_cli_default() {
+        let registry = make_registry_with_tools();
+        let cli = ToolContext::test_context();
+        assert_eq!(
+            registry
+                .dispatch("file_test_tool", json!({}), &cli)
+                .await
+                .expect("trusted CLI remains unrestricted"),
+            "file-ok"
+        );
+
+        let mut gateway = ToolContext::test_context();
+        gateway.capability_grants = Some(CapabilityGrants::default());
+        let err = registry
+            .dispatch("file_test_tool", json!({}), &gateway)
+            .await
+            .expect_err("restricted principal must be denied");
+        assert!(matches!(
+            err,
+            ToolError::Unavailable { ref reason, .. }
+                if reason.contains("file") && reason.contains("not granted")
+        ));
+
+        gateway.capability_grants = Some(CapabilityGrants {
+            file: true,
+            ..CapabilityGrants::default()
+        });
+        assert!(
+            registry
+                .dispatch("file_test_tool", json!({}), &gateway)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn per_server_mcp_toolsets_require_mcp_capability() {
+        assert_eq!(
+            required_capability("github__create_issue", "mcp-github"),
+            Some(CapabilityScope::Mcp)
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_schema_violation_before_handler() {
+        let registry = make_registry_with_tools();
+        let ctx = ToolContext::test_context();
+
+        let err = registry
+            .dispatch("test_tool", json!({}), &ctx)
+            .await
+            .expect_err("missing required field must be rejected centrally");
+        match err {
+            ToolError::InvalidArgs { tool, message } => {
+                assert_eq!(tool, "test_tool");
+                assert!(message.contains("required property 'input'"), "{message}");
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_deadline_kills_hung_tool_without_wall_clock_wait() {
+        let registry = make_registry_with_tools();
+        let ctx = ToolContext::test_context();
+
+        let err = registry
+            .dispatch("hung_tool", json!({}), &ctx)
+            .await
+            .expect_err("deadline must terminate a hung tool");
+        assert!(matches!(
+            err,
+            ToolError::Timeout {
+                ref tool,
+                seconds: 1
+            } if tool == "hung_tool"
+        ));
     }
 
     #[tokio::test]
@@ -1973,6 +2421,54 @@ mod tests {
         // Dynamic tools should show in definitions
         let defs = registry.get_definitions(None, None, &ctx);
         assert!(defs.iter().any(|d| d.name == "test_tool"));
+    }
+
+    /// Per-server MCP toolsets (`mcp-GPS`) must be visible when meta `"mcp"` is enabled.
+    #[test]
+    fn get_definitions_includes_dynamic_mcp_toolsets_when_mcp_enabled() {
+        struct GpsFundTool;
+        #[async_trait]
+        impl ToolHandler for GpsFundTool {
+            fn name(&self) -> &'static str {
+                "mcp_GPS_list_funds"
+            }
+            fn toolset(&self) -> &'static str {
+                "mcp-GPS"
+            }
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    name: "mcp_GPS_list_funds".into(),
+                    description: "List funds from GPS MCP".into(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                    strict: None,
+                }
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Result<String, ToolError> {
+                Ok("[]".into())
+            }
+        }
+
+        let mut registry = make_registry_with_tools();
+        registry.register_dynamic(Box::new(GpsFundTool));
+        let mut ctx = ToolContext::test_context();
+        ctx.config.parent_active_toolsets = vec!["mcp".into()];
+
+        let enabled = vec!["mcp".to_string()];
+        let defs = registry.get_definitions(Some(&enabled), None, &ctx);
+        assert!(
+            defs.iter().any(|d| d.name == "mcp_GPS_list_funds"),
+            "mcp-GPS dynamic tools must appear when toolset mcp is enabled"
+        );
+
+        let blocked = registry.get_definitions(Some(&["file".to_string()]), None, &ctx);
+        assert!(
+            !blocked.iter().any(|d| d.name == "mcp_GPS_list_funds"),
+            "mcp-GPS must stay hidden when mcp is not enabled"
+        );
     }
 
     #[test]

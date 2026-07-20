@@ -652,10 +652,7 @@ impl App {
                             );
                             // 026 C3: mute finished Read/Search noise so replies dominate.
                             if !is_error
-                                && matches!(
-                                    tool_kind,
-                                    ToolCardKind::Read | ToolCardKind::Search
-                                )
+                                && matches!(tool_kind, ToolCardKind::Read | ToolCardKind::Search)
                             {
                                 mute_tool_spans(&mut spans);
                             }
@@ -1328,6 +1325,16 @@ impl App {
                     report,
                 } => {
                     self.apply_remote_mcp_search_result(request_id, query, report);
+                }
+                AgentResponse::McpRuntimeRefresh { notice } => {
+                    self.apply_mcp_runtime_refresh(notice);
+                }
+                AgentResponse::McpOAuthRequired { server_name } => {
+                    self.handle_mcp_oauth_required(server_name);
+                }
+                AgentResponse::McpOAuthLoginFinished { server_name } => {
+                    self.mcp_oauth_login_inflight
+                        .remove(&server_name.to_ascii_lowercase());
                 }
                 AgentResponse::RemotePluginActionComplete {
                     message,

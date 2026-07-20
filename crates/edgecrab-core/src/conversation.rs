@@ -179,6 +179,7 @@ fn build_tool_context(
     cancel: &CancellationToken,
     state_db: &Option<Arc<edgecrab_state::SessionDb>>,
     platform: edgecrab_types::Platform,
+    capability_grants: Option<edgecrab_tools::CapabilityGrants>,
     process_table: &Arc<edgecrab_tools::ProcessTable>,
     provider: Option<Arc<dyn edgequake_llm::LLMProvider>>,
     tool_registry: Option<Arc<ToolRegistry>>,
@@ -230,6 +231,7 @@ fn build_tool_context(
         config: app_config_ref,
         state_db: state_db.clone(),
         platform,
+        capability_grants,
         process_table: Some(process_table.clone()),
         provider,
         tool_registry,
@@ -286,12 +288,14 @@ const MAX_DELEGATE_TASK_CALLS_PER_TURN: usize = 3;
 /// `clippy::too_many_arguments` lint. Grouping the 6 shared dispatch
 /// params into one struct reduces argument count to 3 for each function
 /// and makes the shared state explicit.
+#[derive(Clone)]
 struct DispatchContext {
     cwd: std::path::PathBuf,
     registry: Option<Arc<ToolRegistry>>,
     cancel: CancellationToken,
     state_db: Option<Arc<edgecrab_state::SessionDb>>,
     platform: edgecrab_types::Platform,
+    capability_grants: Option<edgecrab_tools::CapabilityGrants>,
     process_table: Arc<edgecrab_tools::ProcessTable>,
     provider: Option<Arc<dyn edgequake_llm::LLMProvider>>,
     gateway_sender: Option<Arc<dyn edgecrab_tools::registry::GatewaySender>>,
@@ -493,6 +497,7 @@ impl Agent {
                     &cancel,
                     &self.state_db,
                     config.platform,
+                    config.capability_grants,
                     &self.process_table,
                     Some(provider.clone()),
                     tool_registry.clone(),
@@ -907,7 +912,7 @@ impl Agent {
 
         // If smart routing selected a cheaper model, create an alternate provider.
         // This overrides the primary provider for this turn only.
-        let (effective_provider, smart_routed_provider_active) = if !route.is_primary {
+        let (mut effective_provider, smart_routed_provider_active) = if !route.is_primary {
             if let Some((prov_name, model_name)) = route.model.split_once('/') {
                 let canonical = edgecrab_tools::vision_models::normalize_provider_name(prov_name);
                 // Special-case copilot: build directly to use direct API mode
@@ -1287,22 +1292,14 @@ impl Agent {
         let mut invalid_tool_budget_exhausted = false;
         // Accumulate per-tool-call error records — mirrors hermes AgentResult.tool_errors.
         let mut tool_errors_acc: Vec<edgecrab_types::ToolErrorRecord> = Vec::new();
-        let turn = crate::turn_prologue::TurnPrologueState::begin(&config.harness);
-        let mut trackers = turn.trackers;
+        let mut turn = crate::turn_prologue::TurnPrologueState::begin(&config.harness);
+        let mut phase = crate::turn_phase::TurnPhaseTracker::begin();
         let mut completion_reopen_gate = crate::completion_reopen::CompletionReopenGate::new(
             config.harness.max_completion_reopens,
         );
         let capability_suppressions: Arc<Mutex<HashMap<String, ToolErrorResponse>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let spill_seq = Arc::new(crate::tool_result_spill::SpillSequence::new());
-        let mut pressure_warned = turn.pressure_warned;
-        let mut compression_llm_failures = turn.compression_llm_failures;
-        let mut prologue_opening_rough_tokens = turn.opening_rough_tokens;
-        // Assigned on first compression preflight path; initial false is never read.
-        #[allow(unused_assignments)]
-        let mut prologue_preflight_evaluated = false;
-        #[allow(unused_assignments)]
-        let mut prologue_preflight_ran = false;
         const MAX_COMPRESSION_LLM_FAILURES: u32 = 3;
 
         // ── Shadow Judge setup ────────────────────────────────────────────────
@@ -1336,6 +1333,7 @@ impl Agent {
         };
 
         'conversation_loop: loop {
+            phase.transition(crate::turn_phase::TurnPhase::Preflight);
             if tool_defs_dirty {
                 active_tool_defs = if let Some(ref registry) = tool_registry {
                     let schema_ctx = build_tool_context(
@@ -1344,6 +1342,7 @@ impl Agent {
                         &cancel,
                         &self.state_db,
                         config.platform,
+                        config.capability_grants,
                         &self.process_table,
                         Some(effective_provider.clone()),
                         tool_registry.clone(),
@@ -1475,9 +1474,7 @@ impl Agent {
                 &active_tool_defs,
             );
             let threshold_tokens = compression_params.threshold_tokens();
-            if prologue_opening_rough_tokens.is_none() {
-                prologue_opening_rough_tokens = Some(estimated_prompt_tokens);
-            }
+            turn.observe_opening_tokens(estimated_prompt_tokens);
             // Hermes few-but-huge preflight gate (turn_prologue / turn_context parity).
             let protect_first = crate::compression::effective_protect_first_n(
                 session.compression_runtime.compression_count,
@@ -1514,15 +1511,8 @@ impl Agent {
                 &compression_params,
             ) {
                 CompressionStatus::NeedsCompression if blocked => {
-                    prologue_preflight_evaluated = true;
-                    prologue_preflight_ran = false;
-                    tracing::debug!(
-                        ?prologue_opening_rough_tokens,
-                        prologue_preflight_evaluated,
-                        prologue_preflight_ran,
-                        preflight_gate,
-                        "prologue preflight metrics (blocked)"
-                    );
+                    turn.note_preflight(false);
+                    turn.trace_preflight(preflight_gate, "blocked");
                     tracing::warn!(
                         ineffective = session.compression_runtime.ineffective_compression_count,
                         fallback = session.compression_runtime.fallback_compression_streak,
@@ -1530,18 +1520,12 @@ impl Agent {
                     );
                 }
                 CompressionStatus::NeedsCompression if defer_preflight => {
-                    prologue_preflight_evaluated = true;
-                    prologue_preflight_ran = false;
-                    tracing::debug!(
-                        ?prologue_opening_rough_tokens,
-                        prologue_preflight_evaluated,
-                        prologue_preflight_ran,
-                        preflight_gate,
-                        "prologue preflight metrics (deferred)"
-                    );
+                    turn.note_preflight(false);
+                    turn.trace_preflight(preflight_gate, "deferred");
                     // Rough estimate deferred — debug already emitted above.
                 }
                 CompressionStatus::NeedsCompression => {
+                    let _compression_guard = self.compression_lock.lock().await;
                     // NeedsCompression already implies size pressure; preflight_gate
                     // is retained for few-but-huge observability (Hermes parity).
                     if !preflight_gate {
@@ -1551,15 +1535,8 @@ impl Agent {
                             "preflight compress despite count gate (token threshold hit)"
                         );
                     }
-                    prologue_preflight_evaluated = true;
-                    prologue_preflight_ran = true;
-                    tracing::debug!(
-                        ?prologue_opening_rough_tokens,
-                        prologue_preflight_evaluated,
-                        prologue_preflight_ran,
-                        preflight_gate,
-                        "prologue preflight metrics (running)"
-                    );
+                    turn.note_preflight(true);
+                    turn.trace_preflight(preflight_gate, "running");
                     emit_activity(
                         event_tx,
                         edgecrab_tools::tool_progress_tail::format_compression_started(),
@@ -1584,15 +1561,15 @@ impl Agent {
                     // FP12: Compression circuit breaker — if LLM compression has
                     // failed 3 times consecutively, skip the LLM call and use
                     // structural-only compression (cheap, never fails).
-                    if compression_llm_failures >= MAX_COMPRESSION_LLM_FAILURES {
+                    if turn.compression_llm_failures >= MAX_COMPRESSION_LLM_FAILURES {
                         emit_activity(
                             event_tx,
                             edgecrab_tools::tool_progress_tail::format_compression_circuit_breaker(
-                                compression_llm_failures,
+                                turn.compression_llm_failures,
                             ),
                         );
                         tracing::warn!(
-                            failures = compression_llm_failures,
+                            failures = turn.compression_llm_failures,
                             "compression circuit breaker active — using structural fallback only"
                         );
                         session.messages = crate::compression::compress_structural_only_counted(
@@ -1620,12 +1597,12 @@ impl Agent {
                         session.messages = compressed;
                         if llm_succeeded {
                             // Successful LLM compression — reset failure count.
-                            compression_llm_failures = 0;
+                            turn.compression_llm_failures = 0;
                         } else {
-                            compression_llm_failures += 1;
+                            turn.compression_llm_failures += 1;
                             used_fallback = true;
                             tracing::warn!(
-                                failures = compression_llm_failures,
+                                failures = turn.compression_llm_failures,
                                 "LLM compression fell back to structural, tracking for circuit breaker (FP29)"
                             );
                         }
@@ -1666,11 +1643,11 @@ impl Agent {
                         &compression_params,
                     ) == CompressionStatus::Ok
                     {
-                        pressure_warned = false;
+                        turn.pressure_warned = false;
                     }
                     self.publish_session_state(&session).await;
                 }
-                CompressionStatus::PressureWarning if !pressure_warned => {
+                CompressionStatus::PressureWarning if !turn.pressure_warned => {
                     tracing::warn!(
                         estimated_tokens = estimated_prompt_tokens,
                         threshold_tokens,
@@ -1682,7 +1659,7 @@ impl Agent {
                             threshold_tokens,
                         });
                     }
-                    pressure_warned = true;
+                    turn.pressure_warned = true;
                 }
                 _ => {}
             }
@@ -1807,6 +1784,17 @@ impl Agent {
                     .active(&conversation_session_id)
                     .unwrap_or_default(),
             );
+            // Ephemeral MCP inventory (cache-safe): stop free/small models from
+            // treating configured server names (e.g. GPS) as local CLI/Docker.
+            let last_user_text = session
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .map(|m| m.text_content())
+                .unwrap_or_default();
+            let mcp_block =
+                edgecrab_tools::tools::mcp_client::render_mcp_api_context(&last_user_text);
             let base_completion_options = completion_options_for(&config);
             let max_mutation_payload_bytes = app_config_ref.max_write_payload_bytes();
             let local_abs_max = app_config_ref.local_max_tool_turn_tokens;
@@ -1844,12 +1832,19 @@ impl Agent {
                 );
             }
 
-            let messages_for_api = if goal_block.is_empty() {
-                session.messages.clone()
-            } else {
+            let messages_for_api = {
                 let mut extended = session.messages.clone();
-                extended.push(Message::user(&goal_block));
-                extended
+                if !goal_block.is_empty() {
+                    extended.push(Message::user(&goal_block));
+                }
+                if !mcp_block.is_empty() {
+                    extended.push(Message::user(&mcp_block));
+                }
+                if extended.len() == session.messages.len() {
+                    session.messages.clone()
+                } else {
+                    extended
+                }
             };
 
             let mut chat_messages = build_api_chat_messages(
@@ -1902,6 +1897,7 @@ impl Agent {
                 prompt_tokens_for_plan as u32,
             );
 
+            phase.transition(crate::turn_phase::TurnPhase::ModelCall);
             let api_outcome = match api_call_with_retry(
                 &effective_provider,
                 &chat_messages,
@@ -1998,7 +1994,7 @@ impl Agent {
                 }
             };
 
-            let api_outcome = match api_outcome {
+            let mut api_outcome = match api_outcome {
                 Ok(outcome) => {
                     crate::lifecycle_hooks::emit_global(
                         crate::lifecycle_hooks::LifecycleEvent::TurnAfter,
@@ -2159,10 +2155,23 @@ impl Agent {
                     }
                 }
             };
+            if let Some(replacement) = api_outcome.provider_replacement.take() {
+                let replaces_primary = Arc::ptr_eq(&effective_provider, &provider);
+                effective_provider = replacement.clone();
+                if replaces_primary {
+                    *self.provider.write().await = replacement;
+                }
+                tracing::info!(
+                    provider = effective_provider.name(),
+                    model = effective_provider.model(),
+                    "installed credential-rotated provider at turn boundary"
+                );
+            }
             if api_outcome.disabled_native_tool_streaming {
                 session.native_tool_streaming_disabled = true;
             }
             let response = api_outcome.response;
+            phase.transition(crate::turn_phase::TurnPhase::Response);
 
             // ── Post-call cancellation check ──────────────────────────────
             // The API call returned successfully but the token may have been
@@ -2314,7 +2323,7 @@ impl Agent {
                 session.messages.push(Message::user(&recovery));
                 self.publish_session_state(&session).await;
                 // API geometry failure — not a tool dispatch streak.
-                trackers.failure.record_success();
+                turn.trackers.failure.record_success();
                 continue;
             }
 
@@ -2359,6 +2368,7 @@ impl Agent {
                 cancel: cancel.clone(),
                 state_db: self.state_db.clone(),
                 platform: config.platform,
+                capability_grants: config.capability_grants,
                 process_table: self.process_table.clone(),
                 provider: Some(provider.clone()),
                 gateway_sender: self.gateway_sender.read().await.clone(),
@@ -2386,12 +2396,15 @@ impl Agent {
                 subdirectory_hints: subdirectory_hints.clone(),
                 skills_zone_dirty: Some(self.skills_zone_dirty.clone()),
             };
+            if response.has_tool_calls() {
+                phase.transition(crate::turn_phase::TurnPhase::ToolDispatch);
+            }
             let action = match process_response(
                 &response,
                 &mut session,
                 &dctx,
                 &mut tool_errors_acc,
-                &mut trackers,
+                &mut turn.trackers,
             )
             .await
             {
@@ -2461,8 +2474,8 @@ impl Agent {
                             mutation_turn: &mutation_turn,
                             cwd: &cwd,
                             post_mutation_oracles: false,
-                            harness_advisory: &trackers.harness_advisory,
-                            guardrail_halt: trackers.guardrail_halt,
+                            harness_advisory: &turn.trackers.harness_advisory,
+                            guardrail_halt: turn.trackers.guardrail_halt,
                             task_class,
                         },
                     );
@@ -2498,14 +2511,14 @@ impl Agent {
                             // Provisional mid-loop never runs harness contract verify.
                             harness_contract_verify: false,
                             cwd: &cwd,
-                            evidence: trackers.evidence.assess_snapshot(),
+                            evidence: turn.trackers.evidence.assess_snapshot(),
                         },
                     );
 
                     match crate::completion_reopen::decide_completion_reopen(
                         &provisional_outcome,
                         &session.messages,
-                        trackers.evidence.assess_snapshot(),
+                        turn.trackers.evidence.assess_snapshot(),
                         &completion_reopen_gate,
                     ) {
                         crate::completion_reopen::ReopenDecision::Reopen => {
@@ -2541,7 +2554,7 @@ impl Agent {
                             );
                             final_response = text;
                             // Terminal: escalate so final assess cannot reopen into thrash.
-                            trackers.evidence.escalate("reopen_cap");
+                            turn.trackers.evidence.escalate("reopen_cap");
                             break;
                         }
                         crate::completion_reopen::ReopenDecision::DoNotReopen => {}
@@ -2674,8 +2687,8 @@ impl Agent {
                         break;
                     }
                     // ── Visual / evidence Done latch (022) ────────────────────
-                    if trackers.evidence.visual_evidence_complete()
-                        || trackers.evidence.media_evidence_complete()
+                    if turn.trackers.evidence.visual_evidence_complete()
+                        || turn.trackers.evidence.media_evidence_complete()
                     {
                         tracing::info!("visual/media evidence latch complete — ending turn");
                         final_response = session
@@ -2691,12 +2704,12 @@ impl Agent {
                         break;
                     }
                     // ── Evidence hard stop (escalated / verify budget) ───────
-                    if trackers.evidence.should_hard_stop() {
+                    if turn.trackers.evidence.should_hard_stop() {
                         tracing::warn!(
-                            phase = ?trackers.evidence.phase,
+                            phase = ?turn.trackers.evidence.phase,
                             "evidence hard stop — ending turn (GuardrailHalt)"
                         );
-                        trackers.guardrail_halt = true;
+                        turn.trackers.guardrail_halt = true;
                         final_response = session
                             .messages
                             .iter()
@@ -2704,7 +2717,7 @@ impl Agent {
                             .find(|m| m.role == Role::Assistant)
                             .map(|m| m.text_content())
                             .filter(|t| !t.trim().is_empty())
-                            .unwrap_or_else(|| trackers.evidence.allowed_action_message());
+                            .unwrap_or_else(|| turn.trackers.evidence.allowed_action_message());
                         emit_activity(event_tx, "⏹ Verification escalated — ending turn.");
                         self.publish_session_state(&session).await;
                         break;
@@ -2793,6 +2806,7 @@ impl Agent {
             final_response = msg;
         }
 
+        phase.transition(crate::turn_phase::TurnPhase::Epilogue);
         if !interrupted
             && !final_response.is_empty()
             && crate::config::file_mutation_verifier_enabled(config.file_mutation_verifier)
@@ -2819,8 +2833,8 @@ impl Agent {
                 post_mutation_oracles: crate::config::harness_post_mutation_oracles_enabled(
                     config.harness_post_mutation_oracles,
                 ),
-                harness_advisory: &trackers.harness_advisory,
-                guardrail_halt: trackers.guardrail_halt,
+                harness_advisory: &turn.trackers.harness_advisory,
+                guardrail_halt: turn.trackers.guardrail_halt,
                 task_class,
             },
         );
@@ -2891,6 +2905,7 @@ impl Agent {
                 cancel: cancel.clone(),
                 state_db: self.state_db.clone(),
                 platform: config.platform,
+                capability_grants: config.capability_grants,
                 process_table: Arc::clone(&self.process_table),
                 provider: Arc::clone(&effective_provider),
                 gateway_sender: self.gateway_sender.read().await.clone(),
@@ -2929,7 +2944,7 @@ impl Agent {
                 goal_contract: final_goal_contract,
                 harness_contract_verify: true,
                 cwd: &cwd,
-                evidence: trackers.evidence.assess_snapshot(),
+                evidence: turn.trackers.evidence.assess_snapshot(),
             });
         run_outcome = crate::turn_epilogue::enrich_turn_outcome(
             run_outcome,
@@ -3155,6 +3170,7 @@ impl Agent {
             .lock()
             .expect("steer_event_tx mutex not poisoned") = None;
 
+        phase.transition(crate::turn_phase::TurnPhase::Complete);
         Ok(ConversationResult {
             final_response,
             messages,
@@ -3562,6 +3578,16 @@ fn emit_tool_done(
             is_error,
         },
     );
+    // MCP Authorization: open interactive OAuth UX when silent refresh is impossible.
+    if is_error
+        && let Some(server_name) =
+            edgecrab_tools::tools::mcp_client::parse_mcp_oauth_required_server(tool_result)
+    {
+        crate::progress_sink::emit_optional(
+            tx,
+            crate::StreamEvent::McpOAuthRequired { server_name },
+        );
+    }
 }
 
 fn make_tool_progress_tx(
@@ -4084,7 +4110,7 @@ async fn process_response(
         }
 
         let tool_turn_start = session.messages.len();
-        trackers.tool_guardrail.reset_for_turn();
+        crate::turn_prologue::TurnPrologueState::reset_tool_dispatch(trackers);
         let dispatch_calls: Vec<edgequake_llm::ToolCall> = effective_tool_calls
             .iter()
             .zip(our_tool_calls.iter())
@@ -4100,7 +4126,6 @@ async fn process_response(
             .collect();
 
         // Budget-filter first, then DRY plan parallel vs sequential (tool_batch / 014 WS-B).
-        let mut parallel_tasks = tokio::task::JoinSet::new();
         let mut sequential_calls = Vec::new();
         let mut argument_loop_blocked = false;
         // Track parallel tool call IDs/names so we can inject error results
@@ -4172,7 +4197,8 @@ async fn process_response(
         );
         let parallel_cap =
             crate::tool_batch::parallel_max_workers(None, batch_plan.parallel.len().max(1));
-        let parallel_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel_cap));
+        let mut parallel_tasks =
+            crate::tool_batch::JoinSetToolBatch::new(Some(parallel_cap), batch_plan.parallel.len());
         if batch_plan.has_parallel() {
             tracing::debug!(
                 parallel = batch_plan.parallel.len(),
@@ -4222,96 +4248,24 @@ async fn process_response(
             }
 
             parallel_submitted.push((planned.id.clone(), planned.name.clone()));
-            let tc_id = planned.id.clone();
-            let tc_name = planned.name.clone();
-            let tc_args = planned.arguments.clone();
-            let reg = dctx.registry.clone();
-            let cancel_token = dctx.cancel.clone();
-            let state = dctx.state_db.clone();
-            let plat = dctx.platform;
-            let proc_table = Arc::clone(&dctx.process_table);
-            let prov = dctx.provider.clone();
-            let gateway_sender = dctx.gateway_sender.clone();
-            let sar = dctx.sub_agent_runner.clone();
-            let clarify = dctx.clarify_tx.clone();
-            let approval = dctx.approval_tx.clone();
-            let args_for_done = planned.arguments.clone();
-            let origin = dctx.origin_chat.clone();
-            let app_cfg_ref = dctx.app_config_ref.clone();
-            let conv_sess_id = dctx.conversation_session_id.clone();
-            let todo_store_clone = dctx.todo_store.clone();
-            let capability_suppressions = dctx.capability_suppressions.clone();
-            let dispatch_cwd = dctx.cwd.clone();
-            let discovered_plugins = dctx.discovered_plugins.clone();
-            let spill_seq = dctx.spill_seq.clone();
-            let context_engine = dctx.context_engine.clone();
-            let engine_tool_names = dctx.engine_tool_names.clone();
-            let mutation_turn = Arc::clone(&dctx.mutation_turn);
-            let lsp_gate = dctx.lsp_gate.clone();
-            let tool_progress_tx = dctx.tool_progress_tx.clone();
-            let watch_notification_tx = dctx.watch_notification_tx.clone();
-            let delegate_ctx = dctx.delegate_ctx.clone();
-            let kanban_task_id = dctx.kanban_task_id.clone();
-            let materialized_tools = dctx.materialized_tools.clone();
-            let subdirectory_hints = dctx.subdirectory_hints.clone();
-            let skills_zone_dirty = dctx.skills_zone_dirty.clone();
-            let sem = Arc::clone(&parallel_sem);
-
-            parallel_tasks.spawn(async move {
-                // Cap concurrency (EDGECRAB_TOOL_PARALLEL_MAX / default 32).
-                let _permit = match sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return (
-                            tc_id,
-                            tc_name,
-                            args_for_done,
-                            (
-                                "Tool batch concurrency semaphore closed".to_string(),
-                                Vec::new(),
-                            ),
-                            0u64,
-                        );
-                    }
-                };
-                let started = std::time::Instant::now();
-                let inner = DispatchContext {
-                    cwd: dispatch_cwd,
-                    registry: reg,
-                    cancel: cancel_token,
-                    state_db: state,
-                    platform: plat,
-                    process_table: proc_table,
-                    provider: prov,
-                    gateway_sender,
-                    sub_agent_runner: sar,
-                    event_tx: None, // ToolExec event already sent before dispatch
-                    delegation_event_tx: None,
-                    clarify_tx: clarify,
-                    approval_tx: approval,
-                    origin_chat: origin,
-                    app_config_ref: app_cfg_ref,
-                    conversation_session_id: conv_sess_id,
-                    todo_store: todo_store_clone,
-                    capability_suppressions,
-                    discovered_plugins,
-                    spill_seq,
-                    context_engine,
-                    engine_tool_names,
-                    mutation_turn,
-                    lsp_gate,
-                    tool_progress_tx,
-                    watch_notification_tx,
-                    delegate_ctx,
-                    kanban_task_id,
-                    materialized_tools,
-                    subdirectory_hints,
-                    skills_zone_dirty,
-                };
-                let result = dispatch_single_tool(&tc_id, &tc_name, &tc_args, &inner).await;
-                let duration_ms = started.elapsed().as_millis() as u64;
-                (tc_id, tc_name, args_for_done, result, duration_ms)
-            });
+            let call = planned.clone();
+            let task_call = call.clone();
+            let mut inner = dctx.clone();
+            inner.event_tx = None; // ToolExec event already sent before dispatch.
+            inner.delegation_event_tx = None;
+            crate::tool_batch::ToolBatchDispatch::dispatch(
+                &mut parallel_tasks,
+                call,
+                Box::pin(async move {
+                    dispatch_single_tool(
+                        &task_call.id,
+                        &task_call.name,
+                        &task_call.arguments,
+                        &inner,
+                    )
+                    .await
+                }),
+            );
         }
 
         // Sequential tools — map back to edgequake_llm::ToolCall refs for existing path
@@ -4339,71 +4293,86 @@ async fn process_response(
         let mut received_parallel_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         while let Some(join_result) = parallel_tasks.join_next().await {
-            match join_result {
-                Ok((tc_id, tc_name, args_json, (tool_result, injected_messages), duration_ms)) => {
-                    let tool_result = apply_guardrail_result(
-                        &mut trackers.tool_guardrail,
-                        &tc_name,
-                        &args_json,
-                        &tool_result,
-                        is_tool_error(&tool_result),
-                    );
-                    let is_error = is_tool_error(&tool_result);
-                    trackers.record_tool_outcome(&tc_name, &args_json, &tool_result, is_error);
-                    emit_tool_done(
-                        dctx.event_tx.as_ref(),
-                        &tc_id,
-                        &tc_name,
-                        &args_json,
-                        &tool_result,
-                        duration_ms,
-                        is_error,
-                    );
-                    if is_error {
-                        remember_tool_suppression(
-                            &dctx.capability_suppressions,
-                            &tc_name,
-                            &args_json,
-                            &tool_result,
-                        );
-                        tool_errors.push(edgecrab_types::ToolErrorRecord {
-                            turn: session.api_call_count,
-                            tool_name: tc_name.clone(),
-                            arguments: args_json.clone(),
-                            error: extract_tool_error_text(&tool_result),
-                            tool_result: tool_result.clone(),
-                        });
-                        if let Some(payload) = parse_tool_error_response(&tool_result)
-                            && is_suppressed_argument_retry(&payload)
-                        {
-                            argument_loop_blocked = true;
-                        }
-                        if should_count_failure_for_escalation(&tool_result) {
-                            trackers
-                                .failure
-                                .record_failure(&extract_tool_error_text(&tool_result));
-                        } else {
-                            trackers.failure.record_success();
-                        }
-                    } else {
-                        trackers.failure.record_success();
+            let task = match join_result {
+                Ok(crate::tool_batch::ToolBatchTaskOutcome::Completed(task)) => task,
+                Ok(crate::tool_batch::ToolBatchTaskOutcome::ConcurrencyGateClosed(call)) => {
+                    crate::tool_batch::ToolBatchTask {
+                        call,
+                        output: (
+                            "Tool batch concurrency semaphore closed".to_string(),
+                            Vec::new(),
+                        ),
+                        duration_ms: 0,
                     }
-                    received_parallel_ids.insert(tc_id.clone());
-                    // Record for duplicate detection (FP11)
-                    trackers.dedup.record(&tc_name, &args_json, &tool_result);
-                    append_tool_result_to_session(session, dctx, &tc_id, &tc_name, &tool_result);
-                    crate::compression::maybe_prune_computer_use_screenshots(
-                        &mut session.messages,
-                        dctx.app_config_ref.computer_use_keep_last_n_screenshots,
-                    );
-                    session.messages.extend(injected_messages);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "parallel tool task panicked");
                     // The panicked task's id/name is unknown at this point —
                     // we will inject error results for all missing IDs below.
+                    continue;
                 }
+            };
+            let tc_id = task.call.id;
+            let tc_name = task.call.name;
+            let args_json = task.call.arguments;
+            let (tool_result, injected_messages) = task.output;
+            let duration_ms = task.duration_ms;
+            let tool_result = apply_guardrail_result(
+                &mut trackers.tool_guardrail,
+                &tc_name,
+                &args_json,
+                &tool_result,
+                is_tool_error(&tool_result),
+            );
+            let is_error = is_tool_error(&tool_result);
+            trackers.record_tool_outcome(&tc_name, &args_json, &tool_result, is_error);
+            emit_tool_done(
+                dctx.event_tx.as_ref(),
+                &tc_id,
+                &tc_name,
+                &args_json,
+                &tool_result,
+                duration_ms,
+                is_error,
+            );
+            if is_error {
+                remember_tool_suppression(
+                    &dctx.capability_suppressions,
+                    &tc_name,
+                    &args_json,
+                    &tool_result,
+                );
+                tool_errors.push(edgecrab_types::ToolErrorRecord {
+                    turn: session.api_call_count,
+                    tool_name: tc_name.clone(),
+                    arguments: args_json.clone(),
+                    error: extract_tool_error_text(&tool_result),
+                    tool_result: tool_result.clone(),
+                });
+                if let Some(payload) = parse_tool_error_response(&tool_result)
+                    && is_suppressed_argument_retry(&payload)
+                {
+                    argument_loop_blocked = true;
+                }
+                if should_count_failure_for_escalation(&tool_result) {
+                    trackers
+                        .failure
+                        .record_failure(&extract_tool_error_text(&tool_result));
+                } else {
+                    trackers.failure.record_success();
+                }
+            } else {
+                trackers.failure.record_success();
             }
+            received_parallel_ids.insert(tc_id.clone());
+            // Record for duplicate detection (FP11)
+            trackers.dedup.record(&tc_name, &args_json, &tool_result);
+            append_tool_result_to_session(session, dctx, &tc_id, &tc_name, &tool_result);
+            crate::compression::maybe_prune_computer_use_screenshots(
+                &mut session.messages,
+                dctx.app_config_ref.computer_use_keep_last_n_screenshots,
+            );
+            session.messages.extend(injected_messages);
         }
 
         // Inject synthetic error results for any parallel tasks that panicked.
@@ -4718,6 +4687,7 @@ async fn dispatch_single_tool(
         name,
         &dctx.conversation_session_id,
         dctx.platform,
+        dctx.capability_grants,
     );
     async { dispatch_single_tool_impl(tool_call_id, name, args_json, dctx).await }
         .instrument(span)
@@ -4761,11 +4731,15 @@ async fn dispatch_single_tool_impl(
         })
     };
     if let Some(prior) = prior {
-        return (
-            serde_json::to_string(&suppressed_retry_response(&lookup_name, args_json, &prior))
-                .expect("suppressed retry payload serializes"),
-            Vec::new(),
-        );
+        // Deferred wire-gate failures are meant to be retried after `tool_search`
+        // materializes the tool — do not suppress that recovery path.
+        if prior.code != "tool_unavailable" {
+            return (
+                serde_json::to_string(&suppressed_retry_response(&lookup_name, args_json, &prior))
+                    .expect("suppressed retry payload serializes"),
+                Vec::new(),
+            );
+        }
     }
 
     if dctx.app_config_ref.tool_schema_mode == ToolSchemaMode::Indexed
@@ -4877,6 +4851,7 @@ async fn dispatch_single_tool_impl(
         &dctx.cancel,
         &dctx.state_db,
         dctx.platform,
+        dctx.capability_grants,
         &dctx.process_table,
         dctx.provider.clone(),
         dctx.registry.clone(), // Pass registry so execute_code can dispatch RPC tool calls
@@ -5139,6 +5114,7 @@ struct BackgroundReflectionCtx {
     cancel: CancellationToken,
     state_db: Option<Arc<edgecrab_state::SessionDb>>,
     platform: edgecrab_types::Platform,
+    capability_grants: Option<edgecrab_tools::CapabilityGrants>,
     process_table: Arc<edgecrab_tools::ProcessTable>,
     provider: Arc<dyn edgequake_llm::LLMProvider>,
     gateway_sender: Option<Arc<dyn edgecrab_tools::registry::GatewaySender>>,
@@ -5167,6 +5143,7 @@ async fn run_learning_reflection_bg(ctx: BackgroundReflectionCtx) {
         cancel: ctx.cancel.clone(),
         state_db: ctx.state_db.clone(),
         platform: ctx.platform,
+        capability_grants: ctx.capability_grants,
         process_table: ctx.process_table.clone(),
         provider: Some(Arc::clone(&ctx.provider)),
         gateway_sender: ctx.gateway_sender.clone(),
@@ -7796,6 +7773,7 @@ def register(ctx):
             cancel: cancel.clone(),
             state_db: state_db.clone(),
             platform: edgecrab_types::Platform::Cli,
+            capability_grants: None,
             process_table: Arc::clone(process_table),
             provider: None,
             gateway_sender: None,

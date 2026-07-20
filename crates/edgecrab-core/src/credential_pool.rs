@@ -166,6 +166,46 @@ pub fn global_mark_exhausted_and_rotate(provider: &str) -> Option<String> {
     guard.as_mut()?.mark_exhausted_and_rotate(provider)
 }
 
+/// Environment variable consumed when rebuilding a provider after rotation.
+pub fn provider_api_key_env(provider: &str) -> Option<String> {
+    if let Ok(explicit) = std::env::var("EDGECRAB_API_KEY_POOL_ENV")
+        && !explicit.trim().is_empty()
+    {
+        return Some(explicit);
+    }
+    default_provider_api_key_env(provider).map(str::to_string)
+}
+
+fn default_provider_api_key_env(provider: &str) -> Option<&'static str> {
+    Some(match provider {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" | "openai-compatible" => "OPENAI_API_KEY",
+        "xai" => "XAI_API_KEY",
+        "google" | "gemini" => "GOOGLE_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "mistral" => "MISTRAL_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "together" => "TOGETHER_API_KEY",
+        "fireworks" => "FIREWORKS_API_KEY",
+        _ => return None,
+    })
+}
+
+/// Install a rotated token for the next provider construction.
+pub fn apply_rotated_token(provider: &str, token: &str) -> Result<&'static str, String> {
+    let env_key = provider_api_key_env(provider)
+        .ok_or_else(|| format!("no API-key environment mapping for provider '{provider}'"))?;
+    // SAFETY: this is called only after the failed provider future has ended,
+    // immediately before constructing its replacement.
+    unsafe {
+        std::env::set_var(&env_key, token);
+    }
+    // Return a static status rather than the key name/value so callers cannot
+    // accidentally put credential details in logs.
+    Ok("applied")
+}
+
 /// Test helper: replace global pool.
 #[cfg(test)]
 pub fn global_pool_install_for_test(pool: CredentialPool) {
@@ -194,5 +234,18 @@ mod tests {
     fn empty_pool_rotate_none() {
         let mut pool = CredentialPool::new();
         assert!(pool.mark_exhausted_and_rotate("x").is_none());
+    }
+
+    #[test]
+    fn provider_key_environment_mapping_covers_primary_providers() {
+        assert_eq!(
+            default_provider_api_key_env("anthropic"),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(
+            default_provider_api_key_env("openai"),
+            Some("OPENAI_API_KEY")
+        );
+        assert!(default_provider_api_key_env("unknown-provider").is_none());
     }
 }

@@ -1,0 +1,18 @@
+{
+  "name": "prebuilt_latch_done",
+  "config": {
+    "verify_tool_budget": 4,
+    "thrash_fingerprint_limit": 2,
+    "heal_budget": 1
+  },
+  "prebuilt_files": ["index.html", "js/game.js"],
+  "actions": [
+    {"type": "seed_prebuilt"},
+    {"type": "preview", "port": 8000},
+    {"type": "perceive", "tool": "browser_snapshot", "class": "ok"}
+  ],
+  "expected_phases": ["verify", "verify", "latched_done"],
+  "expected_decision": "completed",
+  "expected_exit": "model_returned_final_text",
+  "max_verify_tools": 2
+}

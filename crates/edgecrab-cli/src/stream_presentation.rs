@@ -655,7 +655,10 @@ impl StreamPresentation {
 
     /// Shared phase label for shelf title + status chrome (026 A5).
     pub fn phase_activity_label(&self, tool_generating: bool) -> String {
-        phase_activity_label(self.chrome_phase_hint(tool_generating), self.active_tool_name())
+        phase_activity_label(
+            self.chrome_phase_hint(tool_generating),
+            self.active_tool_name(),
+        )
     }
 
     pub fn active_tool_name(&self) -> Option<&str> {
@@ -667,10 +670,8 @@ impl StreamPresentation {
 
     /// True when chrome should show a turn-status row (non-idle turn).
     pub fn turn_status_visible(&self) -> bool {
-        !matches!(
-            self.chrome_phase_hint(false),
-            ChromePhaseHint::Idle
-        ) || !self.tools.is_empty()
+        !matches!(self.chrome_phase_hint(false), ChromePhaseHint::Idle)
+            || !self.tools.is_empty()
             || self.thinking.is_active()
     }
 }
@@ -783,10 +784,7 @@ mod tests {
         assert!(body.body.contains("line two"));
         assert_eq!(p.tools_completed, 1);
         assert_eq!(p.tool_usage.edit, 1);
-        assert_eq!(
-            p.tool_usage_caption().as_deref(),
-            Some("Edit 1")
-        );
+        assert_eq!(p.tool_usage_caption().as_deref(), Some("Edit 1"));
         assert_eq!(
             p.chrome_phase_hint(false),
             ChromePhaseHint::AwaitingFirstToken

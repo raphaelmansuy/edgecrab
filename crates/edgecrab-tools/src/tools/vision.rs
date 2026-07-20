@@ -970,6 +970,7 @@ mod tests {
             },
             state_db: None,
             platform: edgecrab_types::Platform::Cli,
+            capability_grants: None,
             process_table: None,
             provider: None,
             tool_registry: None,

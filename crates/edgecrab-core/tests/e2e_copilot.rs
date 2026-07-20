@@ -349,6 +349,7 @@ async fn e2e_agent_streaming_with_copilot() {
             StreamEvent::BackgroundProcessTail { .. } => {} // bg process tail — ignore
             StreamEvent::BackgroundProcessFinished { .. } => {} // bg process exit — ignore
             StreamEvent::ModelTransferComplete { .. } => {} // handoff — not relevant in this test
+            StreamEvent::McpOAuthRequired { .. } => {} // oauth prompt — not relevant in this test
             StreamEvent::Footer(text) => accumulated.push_str(&text),
         }
     }

@@ -174,10 +174,7 @@ impl RenderEntry {
 
     pub fn set_mode(&mut self, mode: DisplayMode) {
         self.mode = mode;
-        if let RenderEntryKind::Tool {
-            status, muted, ..
-        } = &mut self.kind
-        {
+        if let RenderEntryKind::Tool { status, muted, .. } = &mut self.kind {
             *muted = !self.is_error
                 && matches!(*status, CardStatus::Success)
                 && matches!(mode, DisplayMode::Collapsed);

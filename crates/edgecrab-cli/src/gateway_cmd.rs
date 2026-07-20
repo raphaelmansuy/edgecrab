@@ -341,6 +341,9 @@ async fn run_foreground(args: &CliArgs) -> anyhow::Result<()> {
         webhook_enabled: runtime.config.gateway.webhook_enabled,
         group_policy: runtime.config.gateway.group_policy,
         unauthorized_dm_behavior: runtime.config.gateway.unauthorized_dm_behavior,
+        circuit_breaker_failure_threshold: runtime.config.gateway.circuit_breaker_failure_threshold,
+        drain_timeout_secs: runtime.config.gateway.drain_timeout_secs,
+        capability_grants: runtime.config.gateway.capability_grants,
         ..Default::default()
     };
     let cancel = CancellationToken::new();

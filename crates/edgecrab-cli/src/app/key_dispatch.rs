@@ -19,6 +19,51 @@ impl App {
             return;
         }
 
+        // MCP add wizard is modal — paste/clipboard must not fall through to chat.
+        if self.mcp_add.active {
+            if matches!(
+                (key.modifiers, key.code),
+                (m, KeyCode::Char('v' | 'V'))
+                    if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT)
+            ) {
+                self.load_mcp_add_clipboard();
+                return;
+            }
+            let action = self.mcp_add.handle_key(key);
+            match action {
+                crate::mcp_add_tui::McpAddAction::Close => {
+                    self.mcp_add.close();
+                    self.needs_redraw = true;
+                }
+                crate::mcp_add_tui::McpAddAction::Redraw => self.needs_redraw = true,
+                crate::mcp_add_tui::McpAddAction::LoadClipboard => {
+                    self.load_mcp_add_clipboard();
+                }
+                crate::mcp_add_tui::McpAddAction::StartDiscover => {
+                    self.start_mcp_add_discovery();
+                    self.needs_redraw = true;
+                }
+                crate::mcp_add_tui::McpAddAction::Save => {
+                    self.save_mcp_add_wizard(false);
+                }
+                crate::mcp_add_tui::McpAddAction::SaveAndLogin => {
+                    self.save_mcp_add_wizard(true);
+                }
+                crate::mcp_add_tui::McpAddAction::Login => {
+                    let name = self
+                        .mcp_add
+                        .saved_name
+                        .clone()
+                        .unwrap_or_else(|| self.mcp_add.name.clone());
+                    self.mcp_add.close();
+                    self.start_mcp_login(&name);
+                    self.needs_redraw = true;
+                }
+                crate::mcp_add_tui::McpAddAction::None => {}
+            }
+            return;
+        }
+
         if matches!(
             self.model_selector_stage,
             ModelPickerStage::ExpensiveConfirm { .. }

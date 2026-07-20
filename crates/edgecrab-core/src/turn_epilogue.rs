@@ -360,6 +360,10 @@ pub async fn synthesize_budget_exhausted_message(
     used: u32,
     max: u32,
 ) -> String {
+    // Gate fired before any provider call — nothing to summarize.
+    if used == 0 {
+        return budget_exhausted_fallback_message(used, max);
+    }
     let nudge = format!(
         "[System: iteration budget exhausted ({used}/{max}). \
          Summarize what was accomplished, what remains blocked, and suggested next steps \

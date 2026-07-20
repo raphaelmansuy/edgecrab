@@ -80,6 +80,7 @@ pub mod turn_completion;
 pub mod turn_dispatch;
 pub mod turn_dispatch_policy;
 pub mod turn_epilogue;
+pub mod turn_phase;
 pub mod turn_prologue;
 
 pub use agent::{
@@ -205,7 +206,11 @@ pub use steering::{
     SteeringEvent, SteeringKind, SteeringReceiver, SteeringSender, drain_pending_steers,
     steering_channel,
 };
-pub use tool_batch::{PlannedToolCall, ToolBatchPlan, parallel_max_workers, plan_tool_batch};
+pub use tool_batch::{
+    JoinSetToolBatch, PlannedToolCall, ToolBatchDispatch, ToolBatchPlan, ToolBatchTask,
+    ToolBatchTaskOutcome, parallel_max_workers, plan_tool_batch,
+};
+pub use turn_phase::{TurnPhase, TurnPhaseTracker};
 pub use turn_prologue::{
     TurnPrologueState, compression_made_progress, should_run_preflight_estimate,
 };

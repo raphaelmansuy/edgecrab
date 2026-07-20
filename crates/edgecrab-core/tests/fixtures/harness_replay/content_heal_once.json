@@ -1,0 +1,20 @@
+{
+  "name": "content_heal_once",
+  "config": {
+    "verify_tool_budget": 6,
+    "thrash_fingerprint_limit": 3,
+    "heal_budget": 1
+  },
+  "prebuilt_files": [],
+  "actions": [
+    {"type": "artifact", "path": "index.html"},
+    {"type": "preview", "port": 8000},
+    {"type": "perceive", "tool": "browser_navigate", "class": "http_error_page"},
+    {"type": "preview", "port": 8000},
+    {"type": "perceive", "tool": "browser_snapshot", "class": "ok"}
+  ],
+  "expected_phases": ["create", "verify", "heal", "verify", "latched_done"],
+  "expected_decision": "completed",
+  "expected_exit": "model_returned_final_text",
+  "max_verify_tools": 4
+}

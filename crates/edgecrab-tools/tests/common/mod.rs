@@ -39,10 +39,27 @@ pub fn searxng_result_count(base_url: &str, query: &str) -> Option<usize> {
 }
 
 /// Reset backend registry and return an exclusive lock for the duration of a test.
-pub fn registry_guard() -> std::sync::MutexGuard<'static, ()> {
+///
+/// Also points `EDGECRAB_HOME` at an empty temp dir (no `config.yaml`) so the
+/// developer's `~/.edgecrab/config.yaml` cannot override session `web_search`
+/// via [`effective_web_search_config`].
+pub struct RegistryGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _home: EdgecrabHomeGuard,
+    /// Keeps the isolated home directory alive while the guard is held.
+    _dir: tempfile::TempDir,
+}
+
+pub fn registry_guard() -> RegistryGuard {
     let lock = test_registry_lock();
     reset_registry_for_tests();
-    lock
+    let dir = tempfile::TempDir::new().expect("isolated EDGECRAB_HOME");
+    let home = EdgecrabHomeGuard::set(dir.path());
+    RegistryGuard {
+        _lock: lock,
+        _home: home,
+        _dir: dir,
+    }
 }
 
 pub fn test_ctx() -> ToolContext {
@@ -55,6 +72,7 @@ pub fn test_ctx() -> ToolContext {
         config: AppConfigRef::default(),
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: None,
         tool_registry: None,

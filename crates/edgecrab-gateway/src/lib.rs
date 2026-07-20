@@ -35,6 +35,7 @@ pub mod config;
 pub mod delivery;
 pub mod dingtalk;
 pub mod discord;
+pub mod drain;
 pub mod email;
 pub mod event_processor;
 pub mod feishu;

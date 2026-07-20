@@ -107,8 +107,20 @@ fn game002_session_port_grounds_navigate_url() {
     let blob = serde_json::to_string(&recovery.suggestions).expect("json");
     assert!(blob.contains("detected_http_server_ports"));
     assert!(blob.contains("http://127.0.0.1:8000/"));
-    assert!(
-        !blob.contains("5050"),
+    // REQUEST_USER_GRANT may name the failed URL/port; known-port grounding must not.
+    let grounded = recovery
+        .suggestions
+        .iter()
+        .find_map(|s| {
+            s.parameters
+                .get("detected_http_server_ports")
+                .and_then(|v| v.as_array())
+                .map(|ports| ports.clone())
+        })
+        .expect("detected_http_server_ports suggestion");
+    assert_eq!(
+        grounded,
+        vec![serde_json::json!(8000)],
         "known ports must not advertise the failed guess: {blob}"
     );
 }
@@ -152,6 +164,7 @@ fn game002_visual_ux_materializes_browser_verify_tools() {
         },
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: None,
         tool_registry: None,

@@ -580,6 +580,7 @@ impl ToolHandler for DelegateTaskToolReal {
                     config: ctx.config.clone(),
                     state_db: ctx.state_db.clone(),
                     platform,
+                    capability_grants: ctx.capability_grants,
                     process_table: ctx.process_table.clone(),
                     provider: None,
                     tool_registry: None,

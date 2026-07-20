@@ -3,6 +3,7 @@
 //! Complements edgequake GenAI spans (LLM) with tool lifecycle spans (OTel-shaped fields).
 
 use crate::observability::TARGET_HARNESS;
+use edgecrab_tools::CapabilityGrants;
 use edgecrab_types::Platform;
 
 /// Span for a single tool dispatch (pairs with [`log_tool_done`]).
@@ -11,6 +12,7 @@ pub fn tool_execution_span(
     tool_name: &str,
     session_id: &str,
     platform: Platform,
+    capability_grants: Option<CapabilityGrants>,
 ) -> tracing::Span {
     tracing::info!(
         target: TARGET_HARNESS,
@@ -18,6 +20,9 @@ pub fn tool_execution_span(
         tool_name,
         session_id,
         platform = %platform,
+        capability_file = capability_grants.map(|grants| grants.file),
+        capability_net = capability_grants.map(|grants| grants.net),
+        capability_mcp = capability_grants.map(|grants| grants.mcp),
         "harness: tool start"
     );
     tracing::info_span!(
@@ -27,6 +32,9 @@ pub fn tool_execution_span(
         tool_name,
         session_id,
         platform = %platform,
+        capability_file = capability_grants.map(|grants| grants.file),
+        capability_net = capability_grants.map(|grants| grants.net),
+        capability_mcp = capability_grants.map(|grants| grants.mcp),
     )
 }
 
@@ -59,6 +67,6 @@ mod tests {
 
     #[test]
     fn tool_execution_span_constructible() {
-        let _span = tool_execution_span("call-1", "read_file", "sess-a", Platform::Cli);
+        let _span = tool_execution_span("call-1", "read_file", "sess-a", Platform::Cli, None);
     }
 }

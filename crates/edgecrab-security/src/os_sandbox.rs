@@ -107,9 +107,7 @@ fn wrap_seatbelt(cmd: &str, cwd: &Path, deny_network: bool, deny_default: bool) 
         p.push_str("(allow sysctl-read)\n");
         p.push_str("(allow mach-lookup)\n");
         p.push_str("(allow file-read*)\n");
-        p.push_str(&format!(
-            "(allow file-write* (subpath \"{cwd_str}\"))\n"
-        ));
+        p.push_str(&format!("(allow file-write* (subpath \"{cwd_str}\"))\n"));
         if !deny_network {
             p.push_str("(allow network*)\n");
         }
@@ -240,7 +238,13 @@ mod tests {
 
     #[test]
     fn wrap_off_passthrough() {
-        let w = wrap_command(OsSandboxMode::Off, "echo hi", Path::new("/tmp"), false, false);
+        let w = wrap_command(
+            OsSandboxMode::Off,
+            "echo hi",
+            Path::new("/tmp"),
+            false,
+            false,
+        );
         assert!(w.passthrough);
         assert_eq!(w.program, "sh");
         assert_eq!(w.args, vec!["-c", "echo hi"]);
@@ -276,7 +280,11 @@ mod tests {
             true,
         );
         assert!(!w.passthrough);
-        let profile = w.args.iter().find(|a| a.contains("(deny default)")).cloned();
+        let profile = w
+            .args
+            .iter()
+            .find(|a| a.contains("(deny default)"))
+            .cloned();
         assert!(
             profile.is_some(),
             "deny_default Seatbelt profile must include (deny default)"

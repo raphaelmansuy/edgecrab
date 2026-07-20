@@ -19,6 +19,7 @@ fn ctx_in(workspace: &std::path::Path, edgecrab_home: &std::path::Path) -> ToolC
         },
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: None,
         tool_registry: None,

@@ -73,8 +73,8 @@ lsp-types = { version = "0.97.0", features = ["proposed"] }
 regex = "1"
 url = "2"
 
-# LLM backend — path to latest edgequake-llm (0.10.2). Publish crates.io then switch to version pin.
-edgequake-llm = { path = "../edgequake-llm", version = "0.10.2", features = ["bedrock", "otel"] }
+# LLM backend — crates.io pin (publish edgequake-llm before cutting EdgeCrab).
+edgequake-llm = { version = "0.10.2", features = ["bedrock", "otel"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

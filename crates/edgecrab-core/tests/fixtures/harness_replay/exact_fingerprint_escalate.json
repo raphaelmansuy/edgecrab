@@ -1,0 +1,19 @@
+{
+  "name": "exact_fingerprint_escalate",
+  "config": {
+    "verify_tool_budget": 5,
+    "thrash_fingerprint_limit": 3,
+    "heal_budget": 0
+  },
+  "prebuilt_files": [],
+  "actions": [
+    {"type": "artifact", "path": "index.html"},
+    {"type": "fingerprint", "tool": "browser_navigate", "class": "http_error_page", "shape": "http://127.0.0.1:8000/?a=1"},
+    {"type": "fingerprint", "tool": "browser_navigate", "class": "http_error_page", "shape": "http://127.0.0.1:8000/?a=2"},
+    {"type": "fingerprint", "tool": "browser_navigate", "class": "http_error_page", "shape": "http://127.0.0.1:8000/?a=3"}
+  ],
+  "expected_phases": ["create", "verify", "verify", "escalated"],
+  "expected_decision": "failed",
+  "expected_exit": "guardrail_halt",
+  "max_verify_tools": 3
+}

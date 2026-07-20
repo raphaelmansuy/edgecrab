@@ -125,6 +125,7 @@ async fn browser_advantage_tools_dispatch_through_registry_with_edge_case_valida
         config: AppConfigRef::default(),
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: None,
         tool_registry: None,

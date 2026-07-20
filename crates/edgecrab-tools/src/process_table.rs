@@ -1121,19 +1121,35 @@ mod tests {
     async fn ha26_http_server_ready_emits_watch_event() {
         use tokio::sync::mpsc;
 
+        // Ready notice requires a real TCP listen probe (018 F3).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let cmd = format!("python3 -m http.server {port}");
+
         let table = ProcessTable::new();
-        let id = table.register("python3 -m http.server 8000", "/tmp", "");
+        let id = table.register(&cmd, "/tmp", "");
         let (tx, mut rx) = mpsc::unbounded_channel();
         table.set_watch_sink(&id, tx).await;
         table
             .append_output(
                 &id,
-                vec!["Serving HTTP on :: port 8000 (http://[::]:8000/) ...".into()],
+                vec![format!(
+                    "Serving HTTP on 127.0.0.1 port {port} (http://127.0.0.1:{port}/) ..."
+                )],
             )
             .await;
         let event = rx.try_recv().expect("ready notice");
-        assert!(event.matched_output.contains("8000"));
-        assert!(event.matched_output.contains("preview"));
+        assert!(
+            event.matched_output.contains(&port.to_string()),
+            "got: {}",
+            event.matched_output
+        );
+        assert!(
+            event.matched_output.contains("preview"),
+            "got: {}",
+            event.matched_output
+        );
+        drop(listener);
     }
 
     #[tokio::test]

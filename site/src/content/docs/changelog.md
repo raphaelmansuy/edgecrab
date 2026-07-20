@@ -8,11 +8,31 @@ sidebar:
 All notable changes to EdgeCrab are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-Last updated: 2026-06-13
+Last updated: 2026-07-20
 
 ---
 
 ## [Unreleased]
+
+## [0.11.0] — 2026-07-20
+
+### Added
+
+- **MCP URL OAuth** — RFC 9728 / AS discovery + DCR, `/mcp add` TUI wizard, session-isolated MCP pool.
+- **Harness replay e2e**, **TurnPhase** observability, **gateway drain**, **tool contracts** (SideEffect / deadlines / CapabilityGrants).
+- **Non-flaky harness waves**, **skills hub browse**, **kanban/fleet**, **local LLM harness**, **TUI follow/density/edit** polish.
+
+### Changed
+
+- Conversation / prologue / tool-batch modularization; CI offline MCP + harness gates; `edgequake-llm` 0.10.2; npm OIDC publishing.
+
+### Verification
+
+| Check | Result |
+|--------|--------|
+| `./scripts/release-version.sh check` | **passed** (0.10.0 pre-bump) |
+| `cargo clippy --workspace -- -D warnings` | **passed** |
+| `cargo test --workspace -- --test-threads=1` | **4555 passed**, 0 failed, 57 ignored |
 
 ## [0.10.0] — 2026-06-13
 

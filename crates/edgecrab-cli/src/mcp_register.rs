@@ -1,20 +1,23 @@
 //! MCP server registration control plane (spec 022/014 WS-A).
 //!
-//! DRY: CLI `edgecrab mcp add` and TUI `/mcp add` both call [`register_mcp_server`].
+//! DRY: CLI `edgecrab mcp add` and TUI `/mcp add` both call [`register_mcp_server`]
+//! (and [`prepare_and_register_mcp_url`] for URL OAuth discovery).
 //! SOLID: this module builds + validates + persists config only — interactive OAuth
-//! login stays in [`crate::mcp_oauth`]; transport/probe stay in `mcp_client`.
+//! login stays in [`crate::mcp_oauth`]; transport/probe stay in `mcp_client`;
+//! RFC 9728 discovery stays in `edgecrab_tools::mcp_auth`.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use edgecrab_core::config::{AppConfig, McpOauthConfig, McpServerConfig};
 use edgecrab_security::url_safety::{is_preview_loopback_url, is_safe_url};
+use edgecrab_tools::mcp_auth::{DiscoverOpts, DiscoveredMcpOauth, discover_mcp_oauth};
 use edgecrab_tools::tools::mcp_client::{reload_mcp_connections, write_mcp_token};
 
 /// How an HTTP MCP server authenticates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpAuthKind {
-    /// Infer: oauth if oauth fields set, bearer if token provided, else none.
+    /// Infer: oauth if oauth fields set, bearer if token provided, else try discovery.
     #[default]
     Auto,
     OAuth,
@@ -66,6 +69,16 @@ pub struct RegisterMcpRequest {
     /// When true (default false), allow loopback/private URLs via existing SSRF policy.
     /// Also honored when `EDGECRAB_E2E_SSRF_ALLOW_LOCALHOST=1` (security crate).
     pub allow_loopback: bool,
+    /// Force/disable OAuth discovery. `None` = auto (discover when OAuth incomplete).
+    pub discover: Option<bool>,
+    /// RFC 8707 resource indicator (filled by discovery).
+    pub resource: Option<String>,
+    /// AS issuer (RFC 9207).
+    pub issuer: Option<String>,
+    pub iss_parameter_supported: Option<bool>,
+    pub auth_method: Option<String>,
+    pub grant_type: Option<String>,
+    pub use_pkce: Option<bool>,
 }
 
 impl RegisterMcpRequest {
@@ -87,6 +100,7 @@ impl RegisterMcpRequest {
         redirect_url: Option<String>,
         scopes: Vec<String>,
         allow_loopback: bool,
+        discover: Option<bool>,
     ) -> Result<Self, String> {
         let mut command = command;
         let mut args = args;
@@ -119,7 +133,126 @@ impl RegisterMcpRequest {
             redirect_url,
             scopes,
             allow_loopback,
+            discover,
+            resource: None,
+            issuer: None,
+            iss_parameter_supported: None,
+            auth_method: None,
+            grant_type: None,
+            use_pkce: None,
         })
+    }
+
+    /// Whether this HTTP request still needs RFC 9728 discovery to complete OAuth.
+    pub fn needs_discovery(&self) -> bool {
+        let has_url = self.url.as_ref().is_some_and(|u| !u.trim().is_empty());
+        if !has_url {
+            return false;
+        }
+        if matches!(self.auth, McpAuthKind::Bearer | McpAuthKind::None) {
+            return false;
+        }
+        if self.discover == Some(false) {
+            return false;
+        }
+        if self.discover == Some(true) {
+            return true;
+        }
+        // Manual OAuth is complete when token_url + client_id + an interactive
+        // endpoint (authorization_code or device_code) are present.
+        let has_token_url = self
+            .token_url
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_client_id = self
+            .client_id
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_interactive = self
+            .authorization_url
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || self
+                .device_authorization_url
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty());
+        let oauth_complete = has_token_url && has_client_id && has_interactive;
+        match self.auth {
+            McpAuthKind::OAuth => !oauth_complete,
+            McpAuthKind::Auto => {
+                // Discover unless bearer token provided or fully manual oauth.
+                if self.token.as_ref().is_some_and(|t| !t.is_empty()) {
+                    false
+                } else {
+                    !oauth_complete
+                }
+            }
+            McpAuthKind::Bearer | McpAuthKind::None => false,
+        }
+    }
+
+    /// Merge discovered OAuth settings into this request (manual flags win).
+    pub fn apply_discovery(&mut self, discovered: &DiscoveredMcpOauth) {
+        self.auth = McpAuthKind::OAuth;
+        if self.token_url.as_ref().is_none_or(|s| s.trim().is_empty()) {
+            self.token_url = Some(discovered.token_url.clone());
+        }
+        if self
+            .authorization_url
+            .as_ref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            self.authorization_url = Some(discovered.authorization_url.clone());
+        }
+        if self
+            .device_authorization_url
+            .as_ref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            self.device_authorization_url = discovered.device_authorization_url.clone();
+        }
+        if self
+            .redirect_url
+            .as_ref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            self.redirect_url = Some(discovered.redirect_url.clone());
+        }
+        if self.client_id.as_ref().is_none_or(|s| s.trim().is_empty()) {
+            self.client_id = discovered.client_id.clone();
+        }
+        if self
+            .client_secret
+            .as_ref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            self.client_secret = discovered.client_secret.clone();
+        }
+        if self.scopes.is_empty() {
+            self.scopes = discovered.scopes.clone();
+        }
+        if self.resource.as_ref().is_none_or(|s| s.trim().is_empty()) {
+            self.resource = Some(discovered.resource.clone());
+        }
+        if self.issuer.as_ref().is_none_or(|s| s.trim().is_empty()) {
+            self.issuer = Some(discovered.issuer.clone());
+        }
+        if self.iss_parameter_supported.is_none() {
+            self.iss_parameter_supported = Some(discovered.iss_parameter_supported);
+        }
+        if self
+            .auth_method
+            .as_ref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            self.auth_method = Some(discovered.auth_method.clone());
+        }
+        if self.grant_type.as_ref().is_none_or(|s| s.trim().is_empty()) {
+            self.grant_type = Some(discovered.grant_type.clone());
+        }
+        if self.use_pkce.is_none() {
+            self.use_pkce = Some(discovered.use_pkce);
+        }
     }
 }
 
@@ -192,13 +325,19 @@ fn validate_server_name(name: &str) -> Result<(), String> {
 pub fn build_mcp_server_config(req: &RegisterMcpRequest) -> Result<McpServerConfig, String> {
     validate_server_name(&req.name)?;
 
-    let has_url = req
-        .url
-        .as_ref()
-        .map(|u| !u.trim().is_empty())
-        .unwrap_or(false);
-    let has_command = req
-        .command
+    // Legacy `mcp add NAME https://…` stored the URL in `command`. Coerce early.
+    let mut url = req.url.clone();
+    let mut command = req.command.clone();
+    if url.as_ref().is_none_or(|u| u.trim().is_empty())
+        && command
+            .as_ref()
+            .is_some_and(|c| edgecrab_tools::tools::mcp_client::looks_like_http_mcp_url(c))
+    {
+        url = command.take();
+    }
+
+    let has_url = url.as_ref().map(|u| !u.trim().is_empty()).unwrap_or(false);
+    let has_command = command
         .as_ref()
         .map(|c| !c.trim().is_empty())
         .unwrap_or(false);
@@ -214,11 +353,11 @@ pub fn build_mcp_server_config(req: &RegisterMcpRequest) -> Result<McpServerConf
     }
 
     if has_url {
-        let url = req.url.as_ref().map(|u| u.trim().to_string()).unwrap();
+        let url = url.as_ref().map(|u| u.trim().to_string()).unwrap();
         validate_mcp_http_url(&url, req.allow_loopback)?;
 
         let mut cfg = McpServerConfig {
-            url: Some(url),
+            url: Some(url.clone()),
             enabled: true,
             command: String::new(),
             args: Vec::new(),
@@ -231,6 +370,7 @@ pub fn build_mcp_server_config(req: &RegisterMcpRequest) -> Result<McpServerConf
                     || req.client_id.is_some()
                     || req.device_authorization_url.is_some()
                     || req.authorization_url.is_some()
+                    || req.resource.is_some()
                 {
                     McpAuthKind::OAuth
                 } else if req.token.as_ref().is_some_and(|t| !t.is_empty()) {
@@ -249,19 +389,31 @@ pub fn build_mcp_server_config(req: &RegisterMcpRequest) -> Result<McpServerConf
                     .clone()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_default();
+                if token_url.is_empty() {
+                    return Err(
+                        "oauth requires token_url (run with discovery, or pass --token-url)".into(),
+                    );
+                }
                 cfg.oauth = Some(McpOauthConfig {
                     token_url,
-                    grant_type: Some("auto".into()),
+                    grant_type: req
+                        .grant_type
+                        .clone()
+                        .or_else(|| Some("authorization_code".into())),
                     client_id: req.client_id.clone(),
                     client_secret: req.client_secret.clone(),
-                    auth_method: None,
+                    auth_method: req.auth_method.clone().or_else(|| Some("none".into())),
                     device_authorization_url: req.device_authorization_url.clone(),
                     authorization_url: req.authorization_url.clone(),
-                    redirect_url: req.redirect_url.clone(),
-                    use_pkce: Some(true),
+                    redirect_url: req.redirect_url.clone().or_else(|| {
+                        Some(edgecrab_tools::mcp_auth::DEFAULT_MCP_REDIRECT_URL.into())
+                    }),
+                    use_pkce: Some(req.use_pkce.unwrap_or(true)),
                     scopes: req.scopes.clone(),
                     audience: None,
-                    resource: None,
+                    resource: req.resource.clone().or_else(|| Some(url.clone())),
+                    issuer: req.issuer.clone(),
+                    iss_parameter_supported: req.iss_parameter_supported,
                     refresh_token: None,
                     authorization_params: HashMap::new(),
                     extra_params: HashMap::new(),
@@ -279,7 +431,11 @@ pub fn build_mcp_server_config(req: &RegisterMcpRequest) -> Result<McpServerConf
     }
 
     // stdio
-    let command = req.command.as_ref().map(|c| c.trim().to_string()).unwrap();
+    let command = command
+        .as_ref()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| "stdio MCP requires a non-empty --command".to_string())?;
     Ok(McpServerConfig {
         command,
         args: req.args.clone(),
@@ -363,6 +519,16 @@ pub fn register_mcp_server(
     if persist_cfg.oauth.is_none() && req.token.as_ref().is_some_and(|t| !t.is_empty()) {
         persist_cfg.bearer_token = None;
     }
+    // Never persist client_secret in yaml when empty; keep when DCR returned one
+    // only if operator explicitly configured it (still prefer env in production).
+    if let Some(oauth) = persist_cfg.oauth.as_mut()
+        && oauth
+            .client_secret
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty())
+    {
+        oauth.client_secret = None;
+    }
 
     config.mcp_servers.insert(name.clone(), persist_cfg.clone());
     config
@@ -378,6 +544,59 @@ pub fn register_mcp_server(
         next_steps,
         needs_oauth_login,
     })
+}
+
+/// Discover OAuth (when needed) then persist — shared by CLI and TUI wizard.
+pub async fn prepare_and_register_mcp_url(
+    config: &mut AppConfig,
+    config_path: &Path,
+    mut req: RegisterMcpRequest,
+) -> Result<RegisterMcpResult, String> {
+    if req.needs_discovery() {
+        let url = req
+            .url
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "discovery requires --url".to_string())?;
+        validate_mcp_http_url(&url, req.allow_loopback)?;
+
+        let force_oauth = matches!(req.auth, McpAuthKind::OAuth) || req.discover == Some(true);
+        match discover_mcp_oauth(
+            &url,
+            DiscoverOpts {
+                allow_loopback: req.allow_loopback,
+                client_id: req.client_id.clone(),
+                client_secret: req.client_secret.clone(),
+                scopes: req.scopes.clone(),
+                skip_dcr: req.client_id.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                prefer_offline_access: true,
+                ..DiscoverOpts::default()
+            },
+        )
+        .await
+        {
+            Ok(discovered) => req.apply_discovery(&discovered),
+            Err(err) if !force_oauth => {
+                // Auto: public MCP or non-OAuth 401 → register without oauth.
+                tracing::info!(
+                    %url,
+                    error = %err,
+                    "MCP OAuth discovery skipped; registering as public HTTP"
+                );
+                req.auth = McpAuthKind::None;
+            }
+            Err(err) => return Err(format!("OAuth discovery failed: {err}")),
+        }
+    } else if matches!(req.auth, McpAuthKind::Auto)
+        && req.url.is_some()
+        && req.token.as_ref().is_none_or(|t| t.is_empty())
+        && req.token_url.as_ref().is_none_or(|s| s.trim().is_empty())
+    {
+        req.auth = McpAuthKind::None;
+    }
+
+    register_mcp_server(config, config_path, req)
 }
 
 /// Parse TUI `/mcp add …` tokens (already quote-split by `parse_inline_command_tokens`).
@@ -404,6 +623,7 @@ pub fn parse_mcp_add_tokens(tokens: &[String]) -> Result<RegisterMcpRequest, Str
     let mut redirect_url = None;
     let mut scopes = Vec::new();
     let mut allow_loopback = false;
+    let mut discover: Option<bool> = None;
 
     let mut i = 1;
     while i < tokens.len() {
@@ -515,6 +735,12 @@ pub fn parse_mcp_add_tokens(tokens: &[String]) -> Result<RegisterMcpRequest, Str
             "--allow-loopback" => {
                 allow_loopback = true;
             }
+            "--discover" => {
+                discover = Some(true);
+            }
+            "--no-discover" => {
+                discover = Some(false);
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown flag '{other}'"));
             }
@@ -542,6 +768,7 @@ pub fn parse_mcp_add_tokens(tokens: &[String]) -> Result<RegisterMcpRequest, Str
         redirect_url,
         scopes,
         allow_loopback,
+        discover,
     )
 }
 
@@ -582,6 +809,13 @@ mod tests {
             redirect_url: None,
             scopes: vec!["mcp".into()],
             allow_loopback: false,
+            discover: Some(false),
+            resource: Some("https://mcp.example.com/mcp".into()),
+            issuer: Some("https://auth.example.com".into()),
+            iss_parameter_supported: Some(true),
+            auth_method: Some("none".into()),
+            grant_type: Some("authorization_code".into()),
+            use_pkce: Some(true),
         };
         let cfg = build_mcp_server_config(&req).expect("build");
         assert_eq!(cfg.url.as_deref(), Some("https://mcp.example.com/mcp"));
@@ -589,6 +823,11 @@ mod tests {
         assert_eq!(oauth.token_url, "https://auth.example.com/token");
         assert_eq!(oauth.client_id.as_deref(), Some("cid"));
         assert_eq!(oauth.scopes, vec!["mcp".to_string()]);
+        assert_eq!(
+            oauth.resource.as_deref(),
+            Some("https://mcp.example.com/mcp")
+        );
+        assert_eq!(oauth.issuer.as_deref(), Some("https://auth.example.com"));
     }
 
     #[test]
@@ -613,6 +852,7 @@ mod tests {
             None,
             vec![],
             false,
+            None,
         )
         .expect("legacy");
         let cfg = build_mcp_server_config(&req).expect("build");
@@ -652,6 +892,13 @@ mod tests {
             redirect_url: None,
             scopes: vec![],
             allow_loopback: false,
+            discover: Some(false),
+            resource: None,
+            issuer: None,
+            iss_parameter_supported: None,
+            auth_method: None,
+            grant_type: None,
+            use_pkce: None,
         };
         let result = register_mcp_server(&mut config, &path, req).expect("register");
         assert_eq!(result.name, "acme");

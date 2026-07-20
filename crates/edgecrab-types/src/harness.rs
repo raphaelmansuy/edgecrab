@@ -130,9 +130,7 @@ impl ExitReason {
     /// Exit-specific headline when more precise than [`CompletionDecision::headline`].
     pub fn headline(self) -> Option<&'static str> {
         match self {
-            Self::InvalidToolBudget => {
-                Some("Failed — invalid tool call retry budget exhausted.")
-            }
+            Self::InvalidToolBudget => Some("Failed — invalid tool call retry budget exhausted."),
             _ => None,
         }
     }
@@ -366,10 +364,7 @@ mod tests {
             outcome.headline(),
             "Failed — invalid tool call retry budget exhausted."
         );
-        assert!(outcome
-            .operator_hint()
-            .unwrap()
-            .contains("exact tool name"));
+        assert!(outcome.operator_hint().unwrap().contains("exact tool name"));
         assert!(outcome.emoji_headline().starts_with('❌'));
     }
 

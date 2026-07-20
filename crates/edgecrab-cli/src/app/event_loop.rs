@@ -99,6 +99,7 @@ pub(super) fn run_event_loop(
         app.poll_remote_skill_search();
         app.poll_remote_plugin_search();
         app.poll_remote_mcp_search();
+        app.poll_mcp_add_discovery();
         app.refresh_log_follow_if_due_at(Instant::now());
 
         let now_elapsed = last_tick.elapsed();

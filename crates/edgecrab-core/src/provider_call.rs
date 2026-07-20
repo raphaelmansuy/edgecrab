@@ -427,6 +427,7 @@ fn is_retryable_stream_tool_assembly_error(error: &edgequake_llm::LlmError) -> b
     normalized.contains("streamed tool call")
         && (normalized.contains("without arguments")
             || normalized.contains("without a function name")
+            || normalized.contains("missing function name")
             || normalized.contains("invalid json arguments")
             || normalized.contains("arguments must be a json object"))
 }
@@ -1234,6 +1235,8 @@ pub async fn api_call_with_retry(
     // iteration's backoff instead of the fixed BASE_BACKOFF.
     let mut rate_limit_delay: Option<Duration> = None;
     let mut stream_assembly_retries: u32 = 0;
+    let mut image_shrink_retried = false;
+    let mut recovered_messages: Option<Vec<edgequake_llm::ChatMessage>> = None;
     const MAX_STREAM_ASSEMBLY_RETRIES: u32 = 2;
     const MAX_COPILOT_STREAM_ASSEMBLY_RETRIES: u32 = 5;
     let mut last_failed_attempt = 0u32;
@@ -1273,9 +1276,11 @@ pub async fn api_call_with_retry(
 
         loop {
             let tokens_sent = std::sync::atomic::AtomicBool::new(false);
-            invoke_pre_api_request_hooks(&ctx, provider, messages, tool_defs, attempt).await;
+            let request_messages = recovered_messages.as_deref().unwrap_or(messages);
+            invoke_pre_api_request_hooks(&ctx, provider, request_messages, tool_defs, attempt)
+                .await;
             let request_started_at = std::time::Instant::now();
-            let prompt_tokens_est = estimate_stream_prompt_tokens(messages, tool_defs);
+            let prompt_tokens_est = estimate_stream_prompt_tokens(request_messages, tool_defs);
             let http_timeout_secs =
                 crate::local_provider_policy::local_http_timeout_secs(provider.name());
             let tool_choice = crate::local_provider_policy::local_tool_choice(
@@ -1325,7 +1330,7 @@ pub async fn api_call_with_retry(
                             .expect("native streaming requires event channel");
                         api_call_streaming(
                             provider,
-                            messages,
+                            request_messages,
                             tool_defs,
                             tool_choice.clone(),
                             ctx.options,
@@ -1335,10 +1340,10 @@ pub async fn api_call_with_retry(
                         )
                         .await
                     } else if tool_defs.is_empty() {
-                        provider.chat(messages, ctx.options).await
+                        provider.chat(request_messages, ctx.options).await
                     } else {
                         provider
-                            .chat_with_tools(messages, tool_defs, tool_choice, ctx.options)
+                            .chat_with_tools(request_messages, tool_defs, tool_choice, ctx.options)
                             .await
                     }
                 })
@@ -1385,7 +1390,7 @@ pub async fn api_call_with_retry(
                     invoke_post_api_request_hooks(
                         &ctx,
                         provider,
-                        messages,
+                        request_messages,
                         tool_defs,
                         &response,
                         attempt,
@@ -1433,6 +1438,7 @@ pub async fn api_call_with_retry(
                     return Ok(ApiCallOutcome {
                         response,
                         disabled_native_tool_streaming,
+                        provider_replacement: None,
                     });
                 }
                 Err(e) => {
@@ -1445,6 +1451,28 @@ pub async fn api_call_with_retry(
                         elapsed_ms,
                         &e.to_string(),
                     );
+                    let visible_output_sent =
+                        tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
+                    if !image_shrink_retried
+                        && !visible_output_sent
+                        && (crate::compression::is_image_too_large_error(&e)
+                            || (crate::compression::is_payload_too_large_error(&e)
+                                && crate::compression::provider_messages_have_images(
+                                    request_messages,
+                                )))
+                    {
+                        let mut shrunk = request_messages.to_vec();
+                        image_shrink_retried = true;
+                        if crate::compression::shrink_provider_images_for_retry(&mut shrunk) {
+                            tracing::warn!(
+                                provider = provider.name(),
+                                model = provider.model(),
+                                "provider rejected oversized image; retrying once with shrunken payload"
+                            );
+                            recovered_messages = Some(shrunk);
+                            continue;
+                        }
+                    }
                     if crate::local_provider_policy::blocks_transport_retry(provider.as_ref(), &e) {
                         crate::local_provider_policy::log_local_llm_transport_failure(
                             provider.as_ref(),
@@ -1462,8 +1490,6 @@ pub async fn api_call_with_retry(
                             && is_transport_retry_error(&e);
 
                     if use_native_streaming_this_attempt {
-                        let visible_output_sent =
-                            tokens_sent.load(std::sync::atomic::Ordering::Relaxed);
                         // Fail fast on 401/403 — do not burn retries while the shelf
                         // shows "awaiting first token".
                         if !visible_output_sent && is_permanent_auth_or_permission_error(&e) {
@@ -1588,11 +1614,20 @@ pub async fn api_call_with_retry(
                                     provider.name(),
                                 )
                             {
+                                let replacement = crate::credential_pool::apply_rotated_token(
+                                    provider.name(),
+                                    &new_key,
+                                )
+                                .and_then(|_| {
+                                    edgecrab_tools::create_provider_for_model(
+                                        provider.name(),
+                                        provider.model(),
+                                    )
+                                });
                                 tracing::warn!(
                                     provider = provider.name(),
-                                    key_prefix = %new_key.chars().take(6).collect::<String>(),
-                                    "credential pool rotated after rate limit — \
-                                     rebuild provider / restart session to pick up key"
+                                    rebuilt = replacement.is_ok(),
+                                    "credential pool rotated after rate limit"
                                 );
                                 if let Some(tx) = ctx.event_tx {
                                     let _ = tx.send(crate::StreamEvent::HookEvent {
@@ -1602,6 +1637,23 @@ pub async fn api_call_with_retry(
                                             provider.name()
                                         ),
                                     });
+                                }
+                                if let Ok(replacement) = replacement {
+                                    // The failed request future has completed and emitted no
+                                    // visible output. Re-enter through a freshly constructed
+                                    // provider so the next attempt uses the rotated key.
+                                    let mut outcome = Box::pin(api_call_with_retry(
+                                        &replacement,
+                                        messages,
+                                        tool_defs,
+                                        max_retries.saturating_sub(attempt),
+                                        ctx,
+                                    ))
+                                    .await?;
+                                    if outcome.provider_replacement.is_none() {
+                                        outcome.provider_replacement = Some(replacement);
+                                    }
+                                    return Ok(outcome);
                                 }
                             }
                         } else if matches!(
@@ -1685,8 +1737,25 @@ pub async fn api_call_with_retry(
     Err(AgentError::Llm(final_err_msg))
 }
 
-#[derive(Debug)]
 pub struct ApiCallOutcome {
     pub response: edgequake_llm::LLMResponse,
     pub disabled_native_tool_streaming: bool,
+    /// Fresh provider constructed after credential rotation at a request boundary.
+    pub provider_replacement: Option<Arc<dyn LLMProvider>>,
+}
+
+impl std::fmt::Debug for ApiCallOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiCallOutcome")
+            .field("response", &self.response)
+            .field(
+                "disabled_native_tool_streaming",
+                &self.disabled_native_tool_streaming,
+            )
+            .field(
+                "provider_replacement",
+                &self.provider_replacement.as_ref().map(|_| "<provider>"),
+            )
+            .finish()
+    }
 }

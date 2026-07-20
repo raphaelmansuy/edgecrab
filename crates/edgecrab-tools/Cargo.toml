@@ -60,6 +60,7 @@ tar = { workspace = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 which = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 libc = { workspace = true }
 bollard = { workspace = true }
 portable-pty = { workspace = true }

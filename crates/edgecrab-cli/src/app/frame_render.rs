@@ -28,7 +28,7 @@ impl App {
                 Constraint::Min(1), // output area
                 Constraint::Length(shelf_height),
                 Constraint::Length(turn_status_h), // 026 turn-status row
-                Constraint::Length(1), // separator
+                Constraint::Length(1),             // separator
                 Constraint::Length(if self.show_status_bar { 1 } else { 0 }), // status bar
                 Constraint::Length(queue_height),
                 Constraint::Length(textarea_height), // input area (dynamic height)
@@ -302,6 +302,10 @@ impl App {
 
         if self.proxy_setup.active {
             self.render_proxy_setup_tui(frame, frame.area());
+        }
+
+        if self.mcp_add.active {
+            self.render_mcp_add_tui(frame, frame.area());
         }
 
         if self.grok_auth.active {

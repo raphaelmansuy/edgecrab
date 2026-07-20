@@ -53,8 +53,7 @@ impl SessionPreviewGrants {
 
     /// Grant host:port for the rest of the process lifetime.
     pub fn grant_session(&mut self, host: &str, port: u16) {
-        self.session
-            .insert((Self::normalize_host(host), port));
+        self.session.insert((Self::normalize_host(host), port));
     }
 
     /// Grant host:port for a single subsequent allow check.
@@ -128,10 +127,13 @@ static PREVIEW_TEST_SERIAL: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock
 /// Serialize tests that mutate or assert on the global preview policy.
 #[doc(hidden)]
 pub fn preview_policy_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    PREVIEW_TEST_SERIAL
+    match PREVIEW_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("preview test serial lock")
+    {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn active_preview_policy() -> Option<PreviewPolicy> {

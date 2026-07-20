@@ -348,6 +348,7 @@ mod tests {
             },
             state_db: None,
             platform: Platform::Cli,
+            capability_grants: None,
             process_table: None,
             provider: None,
             tool_registry: None,

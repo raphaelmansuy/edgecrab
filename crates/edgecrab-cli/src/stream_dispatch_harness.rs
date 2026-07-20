@@ -620,9 +620,7 @@ mod tests {
             running: false,
             items: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
         });
-        assert!(
-            render_entry_plain(&group, RenderOpts::default()).starts_with("Read 3 files")
-        );
+        assert!(render_entry_plain(&group, RenderOpts::default()).starts_with("Read 3 files"));
 
         let edit = RenderEntry::tool(crate::presentation::entries::ToolEntryArgs {
             name: "write_file".into(),

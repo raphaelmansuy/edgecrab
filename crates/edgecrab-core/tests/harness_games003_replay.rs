@@ -94,6 +94,7 @@ fn games003_preview_enabled_allows_localhost_navigate() {
         config: AppConfigRef::default(),
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: None,
         tool_registry: None,

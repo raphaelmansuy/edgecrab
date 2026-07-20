@@ -45,8 +45,7 @@ impl SecretResolver {
 
     /// Convenience: resolve and return plain String (callers must not log it).
     pub fn resolve_string(&self, name: &str) -> Option<String> {
-        self.resolve(name)
-            .map(|s| s.expose_secret().to_string())
+        self.resolve(name).map(|s| s.expose_secret().to_string())
     }
 
     /// Store via the first writable backend (keychain / file). Env backend is read-only.

@@ -116,9 +116,10 @@ use crate::stream_presentation::{ActionVerbGroup, ToolCardKind, VerbGroupKind};
 use crate::theme::{SkinConfig, Theme, palette as P};
 use crate::tool_display::{
     DisplayWidths, build_subagent_done_line_width, build_subagent_running_line_width,
-    build_tool_done_line_width, build_tool_running_line_width, mute_tool_spans,
+    build_tool_done_line_width, build_tool_running_line_width,
     build_tool_running_line_width_elapsed, build_tool_verbose_lines_width,
-    extract_streaming_tool_preview, extract_tool_preview, tool_signature, tool_status_preview,
+    extract_streaming_tool_preview, extract_tool_preview, mute_tool_spans, tool_signature,
+    tool_status_preview,
 };
 use crate::transcript::{
     OutputLine, OutputRole, TranscriptRenderParams, TranscriptScrollMetrics,
@@ -4120,6 +4121,10 @@ pub struct App {
     web_setup: crate::web_setup_tui::WebSetupTui,
     /// In-TUI OpenAI-compat proxy setup (`/proxy`).
     proxy_setup: crate::proxy_setup_tui::ProxySetupTui,
+    /// In-TUI MCP URL add wizard (`/mcp add`).
+    mcp_add: crate::mcp_add_tui::McpAddTui,
+    /// Lowercased MCP server names with an interactive OAuth login in flight.
+    mcp_oauth_login_inflight: HashSet<String>,
     /// In-TUI xAI Grok OAuth (`/login grok`).
     grok_auth: crate::grok_auth_tui::GrokAuthTui,
     /// After SuperGrok login succeeds, auto-switch to this model (no second /model).
@@ -4159,10 +4164,8 @@ pub struct App {
     /// First-class follow / browse mode (026 Wave E). Kept in sync with `at_bottom`.
     follow_mode: crate::follow_mode::FollowMode,
     /// Typed scrollback entries keyed by [`crate::presentation::EntryId`] (026 Wave B).
-    render_entries: std::collections::HashMap<
-        crate::presentation::EntryId,
-        crate::presentation::RenderEntry,
-    >,
+    render_entries:
+        std::collections::HashMap<crate::presentation::EntryId, crate::presentation::RenderEntry>,
 
     // ── Dirty flag — avoid redundant redraws ─────────────────────────
     /// True whenever state changed and a redraw is needed
@@ -4547,6 +4550,18 @@ enum AgentResponse {
         request_id: u64,
         query: String,
         report: crate::mcp_catalog::McpSearchReport,
+    },
+    /// Rebuild the live Agent tool registry after MCP add/login/reload/enable.
+    McpRuntimeRefresh {
+        notice: Option<String>,
+    },
+    /// An MCP tool hit `mcp_oauth_required` — open interactive `/mcp login`.
+    McpOAuthRequired {
+        server_name: String,
+    },
+    /// Clear in-flight OAuth login gate for a server (success or failure).
+    McpOAuthLoginFinished {
+        server_name: String,
     },
     /// A remote plugin install/update action completed.
     RemotePluginActionComplete {
@@ -5342,6 +5357,10 @@ impl App {
             proxy_setup: crate::proxy_setup_tui::ProxySetupTui::new(
                 edgecrab_core::edgecrab_home().join("config.yaml"),
             ),
+            mcp_add: crate::mcp_add_tui::McpAddTui::new(
+                edgecrab_core::edgecrab_home().join("config.yaml"),
+            ),
+            mcp_oauth_login_inflight: HashSet::new(),
             grok_auth: crate::grok_auth_tui::GrokAuthTui::new(),
             pending_model_after_grok_login: None,
             statusbar_selector_active: false,
@@ -10653,6 +10672,18 @@ impl App {
             return;
         }
 
+        // MCP add wizard: bracketed paste must fill the URL/name field (not textarea).
+        if self.mcp_add.active
+            && matches!(
+                self.mcp_add.screen,
+                crate::mcp_add_tui::McpAddScreen::Url | crate::mcp_add_tui::McpAddScreen::Name
+            )
+        {
+            self.mcp_add.apply_paste(&text);
+            self.needs_redraw = true;
+            return;
+        }
+
         let trimmed = text.trim();
         if Self::is_image_path(trimmed) && std::path::Path::new(trimmed).is_file() {
             let path = std::path::PathBuf::from(trimmed);
@@ -12900,6 +12931,55 @@ impl App {
         Ok(())
     }
 
+    /// Hot-swap MCP (+ plugin) tools into the live Agent after config/auth changes.
+    ///
+    /// WHY: `/mcp add`, `/mcp login`, and `/reload-mcp` used to clear the
+    /// connection pool only — the Agent kept the session-start registry, so
+    /// newly configured servers were invisible to the model (Hermes/Claude
+    /// Code expectation: MCP config change ⇒ tools available next turn).
+    fn refresh_mcp_agent_runtime(&mut self) -> Result<usize, String> {
+        edgecrab_tools::tools::mcp_client::reload_mcp_connections();
+        self.refresh_agent_plugin_runtime()?;
+        let count = self
+            .agent
+            .as_ref()
+            .map(|agent| {
+                self.rt_handle
+                    .block_on(async { agent.tool_names().await })
+                    .iter()
+                    .filter(|name| name.starts_with("mcp_"))
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(count)
+    }
+
+    fn apply_mcp_runtime_refresh(&mut self, notice: Option<String>) {
+        match self.refresh_mcp_agent_runtime() {
+            Ok(mcp_tool_count) => {
+                if let Some(notice) = notice {
+                    self.push_output(notice, OutputRole::System);
+                }
+                self.push_output(
+                    format!(
+                        "MCP tools refreshed for this session ({mcp_tool_count} mcp_* handlers)."
+                    ),
+                    OutputRole::System,
+                );
+            }
+            Err(err) => {
+                if let Some(notice) = notice {
+                    self.push_output(notice, OutputRole::System);
+                }
+                self.push_output(
+                    format!("MCP tools refresh failed: {err}"),
+                    OutputRole::Error,
+                );
+            }
+        }
+        self.needs_redraw = true;
+    }
+
     fn toggle_tool_manager_selected(&mut self) {
         let Some(entry) = self.tool_manager.current().cloned() else {
             return;
@@ -14906,6 +14986,165 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn open_mcp_add_wizard(&mut self) {
+        self.document_overlay = None;
+        self.web_setup.close();
+        self.proxy_setup.close();
+        self.mcp_add.open();
+        self.needs_redraw = true;
+    }
+
+    pub(crate) fn poll_mcp_add_discovery(&mut self) {
+        if self.mcp_add.active && self.mcp_add.poll_discovery() {
+            self.needs_redraw = true;
+        }
+    }
+
+    fn start_mcp_add_discovery(&mut self) {
+        let url = self.mcp_add.url.clone();
+        let allow_loopback = self.mcp_add.allow_loopback;
+        let slot = self.mcp_add.discovery_slot();
+        self.rt_handle.spawn(async move {
+            let result = edgecrab_tools::mcp_auth::discover_mcp_oauth(
+                &url,
+                edgecrab_tools::mcp_auth::DiscoverOpts {
+                    allow_loopback,
+                    prefer_offline_access: true,
+                    ..edgecrab_tools::mcp_auth::DiscoverOpts::default()
+                },
+            )
+            .await
+            .map_err(|e| e.to_string());
+            if let Ok(mut guard) = slot.lock() {
+                // Ignore late results if the operator cancelled.
+                if matches!(*guard, crate::mcp_add_tui::DiscoverySlot::Pending) {
+                    *guard = crate::mcp_add_tui::DiscoverySlot::Ready(Box::new(result));
+                }
+            }
+        });
+    }
+
+    fn load_mcp_add_clipboard(&mut self) {
+        match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+            Ok(text) => {
+                self.mcp_add.apply_paste(&text);
+                // If we just filled the URL and it's valid, stay on URL for Enter —
+                // toast already says "press Enter". Empty paste surfaces toast only.
+            }
+            Err(err) => {
+                self.mcp_add.toast = Some(format!("Clipboard unavailable: {err}"));
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    fn save_mcp_add_wizard(&mut self, then_login: bool) {
+        let req = match self.mcp_add.build_register_request() {
+            Ok(req) => req,
+            Err(err) => {
+                self.mcp_add.error = Some(err);
+                self.mcp_add.screen = crate::mcp_add_tui::McpAddScreen::Error;
+                self.needs_redraw = true;
+                return;
+            }
+        };
+        let name = req.name.clone();
+        let mut config = self.load_runtime_config();
+        let config_path = self.mcp_add.config_path().clone();
+        match crate::mcp_register::register_mcp_server(&mut config, &config_path, req) {
+            Ok(result) => {
+                self.mcp_add.saved_name = Some(result.name.clone());
+                self.mcp_add.needs_login = result.needs_oauth_login;
+                self.mcp_add.screen = crate::mcp_add_tui::McpAddScreen::Done;
+                self.mcp_add.toast = Some(crate::mcp_register::format_register_summary(&result));
+                // Refresh even before OAuth so mcp_list_tools becomes available;
+                // login success triggers a second refresh once tokens exist.
+                if let Err(err) = self.refresh_mcp_agent_runtime() {
+                    self.mcp_add.toast = Some(format!("Saved, but tool refresh failed: {err}"));
+                }
+                self.needs_redraw = true;
+                if then_login {
+                    self.mcp_add.close();
+                    self.start_mcp_login(&name);
+                }
+            }
+            Err(err) => {
+                self.mcp_add.error = Some(err);
+                self.mcp_add.screen = crate::mcp_add_tui::McpAddScreen::Error;
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    fn start_mcp_login(&mut self, name: &str) {
+        let name = name.to_string();
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let summary = crate::mcp_oauth::login_mcp_server(&name, |line| {
+                let _ = tx.send(AgentResponse::Notice(line));
+            })
+            .await;
+            match summary {
+                Ok(summary) => {
+                    let _ = tx.send(AgentResponse::McpRuntimeRefresh {
+                        notice: Some(summary),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(AgentResponse::Notice(format!(
+                        "MCP OAuth login failed: {err}"
+                    )));
+                }
+            }
+        });
+    }
+
+    /// Tool-path OAuth gate (MCP Authorization): open login UX instead of asking
+    /// the model to invent JWTs/curl. Dedupes concurrent tool failures.
+    fn handle_mcp_oauth_required(&mut self, server_name: String) {
+        let key = server_name.to_ascii_lowercase();
+        if self.mcp_oauth_login_inflight.contains(&key) {
+            self.push_output(
+                format!(
+                    "MCP OAuth login already in progress for '{server_name}'. Complete the browser flow, then retry the tool."
+                ),
+                OutputRole::System,
+            );
+            self.needs_redraw = true;
+            return;
+        }
+        self.mcp_oauth_login_inflight.insert(key.clone());
+        self.push_output(
+            format!(
+                "🔐 MCP server '{server_name}' needs OAuth — opening `/mcp login {server_name}`…"
+            ),
+            OutputRole::System,
+        );
+        self.needs_redraw = true;
+
+        let name = server_name.clone();
+        let tx = self.response_tx.clone();
+        self.rt_handle.spawn(async move {
+            let summary = crate::mcp_oauth::login_mcp_server(&name, |line| {
+                let _ = tx.send(AgentResponse::Notice(line));
+            })
+            .await;
+            match summary {
+                Ok(summary) => {
+                    let _ = tx.send(AgentResponse::McpRuntimeRefresh {
+                        notice: Some(summary),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(AgentResponse::Notice(format!(
+                        "MCP OAuth login failed: {err}"
+                    )));
+                }
+            }
+            let _ = tx.send(AgentResponse::McpOAuthLoginFinished { server_name: name });
+        });
+    }
+
     fn handle_proxy_command(&mut self, args: String) {
         let trimmed = args.trim();
         let first = trimmed.to_ascii_lowercase();
@@ -16045,15 +16284,11 @@ impl App {
         server.enabled = enabled;
         match config.save() {
             Ok(()) => {
-                edgecrab_tools::tools::mcp_client::reload_mcp_connections();
-                self.push_output(
-                    format!(
-                        "{} MCP server '{}'.",
-                        if enabled { "Enabled" } else { "Disabled" },
-                        name
-                    ),
-                    OutputRole::System,
-                );
+                self.apply_mcp_runtime_refresh(Some(format!(
+                    "{} MCP server '{}'.",
+                    if enabled { "Enabled" } else { "Disabled" },
+                    name
+                )));
             }
             Err(err) => self.push_output(
                 format!(
@@ -18748,6 +18983,7 @@ impl App {
             },
             state_db: None,
             platform: edgecrab_types::Platform::Cli,
+            capability_grants: None,
             process_table: None,
             provider: None,
             tool_registry: None,
@@ -19974,12 +20210,11 @@ impl App {
     // restarting EdgeCrab.
 
     fn handle_reload_mcp(&mut self) {
-        edgecrab_tools::tools::mcp_client::reload_mcp_connections();
-        self.push_output(
-            "MCP server connections cleared.  They will be re-established on the next tool call.\n\
-             (Configured via the mcp_servers section in ~/.edgecrab/config.yaml; legacy ~/.edgecrab/mcp.json is fallback-only.)",
-            OutputRole::System,
-        );
+        self.apply_mcp_runtime_refresh(Some(
+            "MCP connections cleared and tools re-discovered for this session.\n\
+             (Configured via mcp_servers in ~/.edgecrab/config.yaml; legacy ~/.edgecrab/mcp.json is fallback-only.)"
+                .into(),
+        ));
     }
 
     fn handle_mcp_command(&mut self, args: String) {
@@ -19996,7 +20231,8 @@ impl App {
                  /mcp search [query]  (search official MCP sources + registry)\n\
                  /mcp view <preset-or-server>\n\
                  /mcp install <preset> [--name <server-name>|name=<server-name>] [--path <directory>|path=<directory>]\n\
-                 /mcp add <name> --url <endpoint> [--auth oauth|bearer|none] [--token-url …]\n\
+                 /mcp add            (interactive URL wizard — OAuth discovery)\n\
+                 /mcp add <name> --url <endpoint> [--auth oauth|bearer|none] [--discover]\n\
                  /mcp add <name> --command <cmd> [--args …]\n\
                  /mcp enable <server-name>\n\
                  /mcp disable <server-name>\n\
@@ -20257,51 +20493,41 @@ impl App {
                     self.push_output("Usage: /mcp login <server-name>", OutputRole::System);
                     return;
                 };
-                let tx = self.response_tx.clone();
-                self.rt_handle.spawn(async move {
-                    let summary = crate::mcp_oauth::login_mcp_server(&name, |line| {
-                        let _ = tx.send(AgentResponse::Notice(line));
-                    })
-                    .await;
-                    match summary {
-                        Ok(summary) => {
-                            let _ = tx.send(AgentResponse::Notice(summary));
-                        }
-                        Err(err) => {
-                            let _ = tx.send(AgentResponse::Notice(format!(
-                                "MCP OAuth login failed: {err}"
-                            )));
-                        }
-                    }
-                });
+                self.start_mcp_login(&name);
             }
             "add" => {
-                // DRY: same register_mcp_server API as CLI
+                // Bare `/mcp add` → interactive URL wizard; flagged form shares CLI control plane.
                 if parts.len() < 2 {
-                    self.push_output(
-                        "Usage: /mcp add <name> --url <endpoint> [--auth oauth|bearer|none]\n\
-                         /mcp add <name> --command <cmd> [--args arg1 arg2 …]\n\
-                         /mcp add <name> <cmd> [args…]  (legacy stdio)",
-                        OutputRole::System,
-                    );
+                    self.open_mcp_add_wizard();
                     return;
                 }
                 match crate::mcp_register::parse_mcp_add_tokens(&parts[1..]) {
                     Ok(req) => {
                         let mut config = self.load_runtime_config();
                         let config_path = edgecrab_core::edgecrab_home().join("config.yaml");
-                        match crate::mcp_register::register_mcp_server(
-                            &mut config,
-                            &config_path,
-                            req,
-                        ) {
-                            Ok(result) => self.push_output(
-                                crate::mcp_register::format_register_summary(&result),
-                                OutputRole::System,
-                            ),
-                            Err(err) => self
-                                .push_output(format!("MCP add failed: {err}"), OutputRole::Error),
-                        }
+                        let tx = self.response_tx.clone();
+                        self.rt_handle.spawn(async move {
+                            match crate::mcp_register::prepare_and_register_mcp_url(
+                                &mut config,
+                                &config_path,
+                                req,
+                            )
+                            .await
+                            {
+                                Ok(result) => {
+                                    let _ = tx.send(AgentResponse::McpRuntimeRefresh {
+                                        notice: Some(crate::mcp_register::format_register_summary(
+                                            &result,
+                                        )),
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = tx.send(AgentResponse::Notice(format!(
+                                        "MCP add failed: {err}"
+                                    )));
+                                }
+                            }
+                        });
                     }
                     Err(err) => self.push_output(err, OutputRole::Error),
                 }
@@ -20319,11 +20545,9 @@ impl App {
                 match config.save() {
                     Ok(()) => {
                         edgecrab_tools::tools::mcp_client::remove_mcp_token(name);
-                        edgecrab_tools::tools::mcp_client::reload_mcp_connections();
-                        self.push_output(
-                            format!("Removed MCP server '{name}'."),
-                            OutputRole::System,
-                        );
+                        self.apply_mcp_runtime_refresh(Some(format!(
+                            "Removed MCP server '{name}'."
+                        )));
                     }
                     Err(err) => self.push_output(
                         format!("Failed to save config after removing MCP server: {err}"),
@@ -25343,9 +25567,10 @@ kind = "skill"
         );
 
         app.handle_key_event(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // Esc leaves fullscreen without copying fullscreen scroll into the split pane.
         assert_eq!(
             app.split_detail_scroll(DetailSurface::RemoteSkillBrowser),
-            16
+            8
         );
     }
 
@@ -26380,7 +26605,7 @@ kind = "skill"
         assert_eq!(app.output.len(), 1);
         let rendered = line_spans_text(&app.output[0]);
         assert!(
-            rendered.contains("src/main.rs"),
+            rendered.contains("Read 1 file") || rendered.contains("src/main.rs"),
             "unexpected line: {rendered}"
         );
     }

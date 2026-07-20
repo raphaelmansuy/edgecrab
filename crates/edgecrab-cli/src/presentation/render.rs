@@ -147,7 +147,11 @@ fn first_n_lines(s: &str, max: usize) -> String {
     if lines.len() <= max {
         return s.to_string();
     }
-    format!("{}\n…({} more lines)", lines[..max].join("\n"), lines.len() - max)
+    format!(
+        "{}\n…({} more lines)",
+        lines[..max].join("\n"),
+        lines.len() - max
+    )
 }
 
 #[cfg(test)]
@@ -159,7 +163,10 @@ mod tests {
 
     #[test]
     fn truncated_shows_last_n() {
-        let body = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let body = (1..=10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let e = RenderEntry::tool(crate::presentation::entries::ToolEntryArgs {
             name: "terminal".into(),
             kind: ToolCardKind::Execute,
@@ -170,7 +177,13 @@ mod tests {
             duration: None,
             is_error: false,
         });
-        let plain = render_entry_plain(&e, RenderOpts { trunc_lines: 3, ..Default::default() });
+        let plain = render_entry_plain(
+            &e,
+            RenderOpts {
+                trunc_lines: 3,
+                ..Default::default()
+            },
+        );
         assert!(plain.contains("line10"));
         assert!(plain.contains('…'));
         assert!(!plain.contains("line1\n"));
@@ -188,9 +201,6 @@ mod tests {
             duration: Some(Duration::from_millis(10)),
             is_error: false,
         });
-        assert_eq!(
-            render_entry_plain(&e, RenderOpts::default()),
-            "⊙ Read a.rs"
-        );
+        assert_eq!(render_entry_plain(&e, RenderOpts::default()), "⊙ Read a.rs");
     }
 }

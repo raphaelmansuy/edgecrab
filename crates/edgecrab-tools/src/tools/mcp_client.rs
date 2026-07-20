@@ -100,11 +100,27 @@ fn write_mcp_token_record(server_name: &str, token: &StoredMcpToken) -> std::io:
     std::fs::create_dir_all(&dir)?;
     let file = dir.join(format!("{}.json", sanitize_server_name(server_name)));
     let payload = serde_json::to_vec(token)?;
-    std::fs::write(&file, payload)?;
+    // Atomic replace: write temp in the same directory, then rename.
+    let tmp = dir.join(format!(
+        ".{}.json.tmp-{}",
+        sanitize_server_name(server_name),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, &payload)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    if let Err(err) = std::fs::rename(&tmp, &file) {
+        // Fallback for platforms where rename can't replace: write then chmod.
+        std::fs::write(&file, &payload).map_err(|_| err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
     Ok(())
 }
@@ -198,15 +214,115 @@ pub fn remove_mcp_token(server_name: &str) {
 
 // ─── HTTP MCP connection ─────────────────────────────────────────────────────
 
-/// An MCP connection backed by HTTP POST (JSON-RPC over HTTP).
+/// Streamable HTTP Accept (MCP 2025-03-26 / 2025-06-18 transports).
 ///
-/// Supports HTTP MCP servers such as those running Streamable HTTP transport
-/// (formerly SSE transport). Sends requests as JSON-RPC 2.0 POST bodies and
-/// reads the response body directly.
+/// Servers that enforce the spec return HTTP 406 when either media type is missing
+/// (observed with GPS / gpsglobal and Claude Code issue #45368).
+const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
+
+/// Default protocol version advertised on initialize + `MCP-Protocol-Version`.
+const MCP_HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push('…');
+    out
+}
+
+/// Heuristic when Content-Type is missing/wrong but the body is clearly SSE.
+fn looks_like_sse_body(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    trimmed.starts_with("event:")
+        || trimmed.starts_with("data:")
+        || trimmed.starts_with("id:")
+        || trimmed.starts_with("retry:")
+        || trimmed.contains("\nevent:")
+        || trimmed.contains("\ndata:")
+}
+
+/// Parse a Streamable HTTP SSE body into a single JSON-RPC response object.
 ///
-/// Authentication: Bearer token injected from config or ~/.edgecrab/mcp-tokens/.
-/// Custom headers: any additional headers from the `headers` config map are
-/// forwarded verbatim, allowing custom auth schemes.
+/// Prefers the last `data:` JSON payload that looks like a JSON-RPC response
+/// (`result` / `error` / matching `jsonrpc`). Multi-line `data:` fields are
+/// joined with `\n` per the SSE spec.
+fn parse_mcp_sse_jsonrpc(body: &str) -> Result<serde_json::Value, String> {
+    let mut events: Vec<(Option<String>, String)> = Vec::new();
+    let mut event_name: Option<String> = None;
+    let mut data_lines: Vec<String> = Vec::new();
+
+    let flush = |event_name: &mut Option<String>,
+                 data_lines: &mut Vec<String>,
+                 events: &mut Vec<(Option<String>, String)>| {
+        if data_lines.is_empty() {
+            *event_name = None;
+            return;
+        }
+        let data = data_lines.join("\n");
+        data_lines.clear();
+        events.push((event_name.take(), data));
+    };
+
+    for raw_line in body.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            flush(&mut event_name, &mut data_lines, &mut events);
+            continue;
+        }
+        if line.starts_with(':') {
+            continue; // comment
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_name = Some(rest.trim_start().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            // One optional leading space after the colon (SSE).
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            data_lines.push(payload.to_string());
+            continue;
+        }
+        // Ignore id:/retry: and unknown fields for response extraction.
+    }
+    flush(&mut event_name, &mut data_lines, &mut events);
+
+    let mut last_rpc: Option<serde_json::Value> = None;
+    for (_name, data) in events {
+        let trimmed = data.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let is_rpc = val.get("jsonrpc").is_some()
+            || val.get("result").is_some()
+            || val.get("error").is_some();
+        if !is_rpc {
+            continue;
+        }
+        // Keep the latest JSON-RPC payload (covers `event: message` and bare data:).
+        last_rpc = Some(val);
+    }
+
+    last_rpc.ok_or_else(|| {
+        format!(
+            "no JSON-RPC payload found in SSE body ({})",
+            truncate_chars(body, 160)
+        )
+    })
+}
+
+/// An MCP connection backed by HTTP POST (JSON-RPC over Streamable HTTP).
+///
+/// Spec (2025-06-18 transports):
+/// - POST with `Accept: application/json, text/event-stream`
+/// - Response may be `application/json` **or** `text/event-stream` (SSE)
+/// - Optional `Mcp-Session-Id` / `MCP-Protocol-Version` headers
+///
+/// Authentication: Bearer token from config or `~/.edgecrab/mcp-tokens/`.
 struct HttpMcpConnection {
     server_name: String,
     url: String,
@@ -214,6 +330,10 @@ struct HttpMcpConnection {
     /// Extra headers sent with every request (e.g. `X-Custom-Auth`).
     headers: std::collections::HashMap<String, String>,
     client: reqwest::Client,
+    /// Session id from `Mcp-Session-Id` response header (when the server uses sessions).
+    session_id: Option<String>,
+    /// Negotiated / advertised protocol version for subsequent requests.
+    protocol_version: String,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +350,8 @@ pub struct OAuthConfig {
     scopes: Vec<String>,
     audience: Option<String>,
     resource: Option<String>,
+    issuer: Option<String>,
+    iss_parameter_supported: Option<bool>,
     refresh_token: Option<String>,
     authorization_params: HashMap<String, String>,
     extra_params: HashMap<String, String>,
@@ -312,6 +434,14 @@ impl OAuthConfig {
         self.resource.as_deref()
     }
 
+    pub fn issuer(&self) -> Option<&str> {
+        self.issuer.as_deref()
+    }
+
+    pub fn iss_parameter_supported(&self) -> bool {
+        self.iss_parameter_supported.unwrap_or(false)
+    }
+
     pub fn authorization_params(&self) -> &HashMap<String, String> {
         &self.authorization_params
     }
@@ -356,8 +486,29 @@ enum HttpAuthState {
 }
 
 impl HttpAuthState {
-    fn can_refresh(&self) -> bool {
+    fn is_oauth(&self) -> bool {
         matches!(self, Self::OAuth { .. })
+    }
+
+    /// Silent refresh is possible only with a refresh_token or client_credentials.
+    ///
+    /// Authorization-code / device-code servers without a refresh token must
+    /// open interactive `/mcp login` (MCP Authorization 2025-11-25 / 2026-07-28).
+    fn can_refresh(&self) -> bool {
+        match self {
+            Self::OAuth { config, token } => {
+                let has_refresh = token
+                    .as_ref()
+                    .and_then(|t| t.refresh_token.as_ref())
+                    .is_some_and(|t| !t.trim().is_empty())
+                    || config
+                        .refresh_token
+                        .as_ref()
+                        .is_some_and(|t| !t.trim().is_empty());
+                has_refresh || matches!(config.grant_type, OAuthGrantType::ClientCredentials)
+            }
+            _ => false,
+        }
     }
 
     fn invalidate_access_token(&mut self) {
@@ -368,6 +519,69 @@ impl HttpAuthState {
             token.expires_at_epoch_secs = Some(0);
         }
     }
+
+    /// Pick up tokens written by a concurrent `/mcp login` (disk is source of truth).
+    fn reload_oauth_token_from_disk(&mut self, server_name: &str) {
+        if let Self::OAuth { token, .. } = self
+            && let Some(disk) = read_mcp_token_record(server_name)
+        {
+            *token = Some(disk);
+        }
+    }
+}
+
+/// Machine-readable code for MCP OAuth interactive login (suppress_retry).
+pub const MCP_OAUTH_REQUIRED_CODE: &str = "mcp_oauth_required";
+
+/// Structured auth-required error — TUI opens `/mcp login`; model must not invent JWTs.
+pub fn mcp_oauth_required_error(tool: &str, server_name: &str) -> ToolError {
+    ToolError::capability_denied(
+        tool,
+        MCP_OAUTH_REQUIRED_CODE,
+        format!(
+            "MCP server '{server_name}' requires an interactive OAuth login \
+             (access token missing, expired, or rejected with HTTP 401). \
+             Complete `/mcp login {server_name}` (EdgeCrab opens the browser when available), \
+             then retry this MCP tool. Do NOT invent JWT tokens, curl sign-in scripts, \
+             Docker lookups, or local CLI workarounds."
+        ),
+    )
+    .with_suppression_key(format!("mcp_oauth:{server_name}"))
+    .with_suggested_action(format!("/mcp login {server_name}"))
+}
+
+/// Extract server name from a tool-result JSON carrying [`MCP_OAUTH_REQUIRED_CODE`].
+pub fn parse_mcp_oauth_required_server(tool_result: &str) -> Option<String> {
+    let payload: edgecrab_types::ToolErrorResponse = serde_json::from_str(tool_result).ok()?;
+    if payload.code != MCP_OAUTH_REQUIRED_CODE {
+        return None;
+    }
+    if let Some(action) = payload.suggested_action.as_deref() {
+        let trimmed = action.trim();
+        if let Some(name) = trimmed
+            .strip_prefix("/mcp login ")
+            .or_else(|| trimmed.strip_prefix("edgecrab mcp login "))
+        {
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    payload
+        .suppression_key
+        .as_deref()
+        .and_then(|key| key.strip_prefix("mcp_oauth:"))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn tool_error_is_http_401(err: &ToolError) -> bool {
+    matches!(
+        err,
+        ToolError::ExecutionFailed { message, .. }
+            if message.contains("status 401") || message.contains("401 Unauthorized")
+    )
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -406,15 +620,17 @@ impl HttpMcpConnection {
             auth,
             headers,
             client,
+            session_id: None,
+            protocol_version: MCP_HTTP_PROTOCOL_VERSION.to_string(),
         };
 
-        // Perform JSON-RPC initialize handshake
+        // Perform JSON-RPC initialize handshake (Streamable HTTP).
         let init_req = json!({
             "jsonrpc": "2.0",
             "id": next_request_id(),
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": MCP_HTTP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {
                     "name": "edgecrab",
@@ -423,7 +639,21 @@ impl HttpMcpConnection {
             }
         });
         let mut conn = conn;
-        conn.post_rpc(init_req).await?;
+        let init_result = conn.post_rpc(init_req).await?;
+        if let Some(negotiated) = init_result
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+        {
+            conn.protocol_version = negotiated.to_string();
+        }
+        // Spec: client MUST send notifications/initialized after initialize.
+        let _ = conn
+            .post_rpc(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .await;
 
         Ok(conn)
     }
@@ -437,7 +667,13 @@ impl HttpMcpConnection {
             .client
             .post(&self.url)
             .header("Content-Type", "application/json")
+            // Mandatory Streamable HTTP Accept (missing → HTTP 406 on strict servers).
+            .header("Accept", MCP_STREAMABLE_ACCEPT)
+            .header("MCP-Protocol-Version", self.protocol_version.as_str())
             .json(&body);
+        if let Some(session_id) = &self.session_id {
+            req = req.header("Mcp-Session-Id", session_id.as_str());
+        }
         if let Some(token) = bearer_token {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
@@ -451,12 +687,41 @@ impl HttpMcpConnection {
     async fn post_rpc(&mut self, body: serde_json::Value) -> Result<serde_json::Value, ToolError> {
         match self.post_rpc_once(body.clone()).await {
             Ok(value) => Ok(value),
-            Err(err)
-                if matches!(&err, ToolError::ExecutionFailed { message, .. } if message.contains("status 401"))
-                    && self.auth.can_refresh() =>
-            {
-                self.auth.invalidate_access_token();
-                self.post_rpc_once(body).await
+            Err(err) if tool_error_is_http_401(&err) => {
+                // MCP Authorization: 401 → silent refresh when possible, else interactive login.
+                if self.auth.can_refresh() {
+                    self.auth.invalidate_access_token();
+                    self.auth.reload_oauth_token_from_disk(&self.server_name);
+                    match self.post_rpc_once(body).await {
+                        Ok(value) => Ok(value),
+                        Err(retry_err)
+                            if tool_error_is_http_401(&retry_err)
+                                || matches!(
+                                    &retry_err,
+                                    ToolError::CapabilityDenied { code, .. }
+                                        if code == MCP_OAUTH_REQUIRED_CODE
+                                ) =>
+                        {
+                            Err(mcp_oauth_required_error("mcp_client", &self.server_name))
+                        }
+                        Err(retry_err) => Err(retry_err),
+                    }
+                } else if self.auth.is_oauth() {
+                    Err(mcp_oauth_required_error("mcp_client", &self.server_name))
+                } else {
+                    Err(ToolError::capability_denied(
+                        "mcp_client",
+                        MCP_OAUTH_REQUIRED_CODE,
+                        format!(
+                            "MCP server '{}' returned HTTP 401 Unauthorized and has no OAuth \
+                             refresh path configured. Add OAuth (`/mcp login {}`) or a bearer \
+                             token (`/mcp-token set {} <token>`), then retry. Do NOT invent JWTs.",
+                            self.server_name, self.server_name, self.server_name
+                        ),
+                    )
+                    .with_suppression_key(format!("mcp_oauth:{}", self.server_name))
+                    .with_suggested_action(format!("/mcp login {}", self.server_name)))
+                }
             }
             Err(err) => Err(err),
         }
@@ -466,6 +731,7 @@ impl HttpMcpConnection {
         &mut self,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
+        let is_notification = body.get("id").is_none();
         let bearer_token = self.ensure_bearer_token().await?;
         let resp = self
             .request_builder(body, bearer_token.as_deref())
@@ -476,18 +742,67 @@ impl HttpMcpConnection {
                 message: format!("HTTP MCP request failed: {e}"),
             })?;
 
+        if let Some(session) = resp
+            .headers()
+            .get("mcp-session-id")
+            .or_else(|| resp.headers().get("Mcp-Session-Id"))
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.session_id = Some(session.to_string());
+        }
+
         let status = resp.status();
+        // Notifications: 202 Accepted with empty body is success.
+        if status.as_u16() == 202 {
+            return Ok(json!(null));
+        }
         if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            let detail = if body_text.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", truncate_chars(&body_text, 240))
+            };
             return Err(ToolError::ExecutionFailed {
                 tool: "mcp_client".into(),
-                message: format!("HTTP MCP server returned status {status}"),
+                message: format!("HTTP MCP server returned status {status}{detail}"),
             });
         }
 
-        let val: serde_json::Value = resp.json().await.map_err(|e| ToolError::ExecutionFailed {
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let body_text = resp.text().await.map_err(|e| ToolError::ExecutionFailed {
             tool: "mcp_client".into(),
-            message: format!("Invalid JSON from HTTP MCP server: {e}"),
+            message: format!("Failed to read HTTP MCP response body: {e}"),
         })?;
+
+        if body_text.trim().is_empty() {
+            if is_notification {
+                return Ok(json!(null));
+            }
+            return Err(ToolError::ExecutionFailed {
+                tool: "mcp_client".into(),
+                message: "HTTP MCP server returned an empty success body".into(),
+            });
+        }
+
+        let val = if content_type.contains("text/event-stream") || looks_like_sse_body(&body_text) {
+            parse_mcp_sse_jsonrpc(&body_text).map_err(|e| ToolError::ExecutionFailed {
+                tool: "mcp_client".into(),
+                message: format!("Invalid SSE from HTTP MCP server: {e}"),
+            })?
+        } else {
+            serde_json::from_str(&body_text).map_err(|e| ToolError::ExecutionFailed {
+                tool: "mcp_client".into(),
+                message: format!("Invalid JSON from HTTP MCP server: {e}"),
+            })?
+        };
 
         if let Some(err) = val.get("error") {
             let msg = err
@@ -500,7 +815,11 @@ impl HttpMcpConnection {
             });
         }
 
-        Ok(val.get("result").cloned().unwrap_or(json!(null)))
+        // Full JSON-RPC response → result; bare result object (rare) passes through.
+        Ok(val
+            .get("result")
+            .cloned()
+            .unwrap_or(if is_notification { json!(null) } else { val }))
     }
 
     async fn rpc_call(
@@ -518,6 +837,9 @@ impl HttpMcpConnection {
     }
 
     async fn ensure_bearer_token(&mut self) -> Result<Option<String>, ToolError> {
+        if matches!(self.auth, HttpAuthState::OAuth { .. }) {
+            self.auth.reload_oauth_token_from_disk(&self.server_name);
+        }
         match &mut self.auth {
             HttpAuthState::None => Ok(None),
             HttpAuthState::StaticBearer(token) => Ok(token.clone()),
@@ -558,6 +880,11 @@ async fn fetch_oauth_token(
         OAuthGrantType::Auto => {
             if refresh_token.is_some() {
                 OAuthGrantType::RefreshToken
+            } else if config.authorization_url.is_some()
+                || config.device_authorization_url.is_some()
+            {
+                // Interactive AS — never fall through to client_credentials.
+                return Err(mcp_oauth_required_error("mcp_client", server_name));
             } else {
                 OAuthGrantType::ClientCredentials
             }
@@ -566,12 +893,7 @@ async fn fetch_oauth_token(
             if refresh_token.is_some() {
                 OAuthGrantType::RefreshToken
             } else {
-                return Err(ToolError::ExecutionFailed {
-                    tool: "mcp_client".into(),
-                    message: format!(
-                        "OAuth server '{server_name}' requires an interactive login before EdgeCrab can obtain an access token. Run `edgecrab mcp login {server_name}` or `/mcp login {server_name}`."
-                    ),
-                });
+                return Err(mcp_oauth_required_error("mcp_client", server_name));
             }
         }
         other => other,
@@ -588,12 +910,8 @@ async fn fetch_oauth_token(
             params.push(("grant_type".into(), "client_credentials".into()));
         }
         OAuthGrantType::RefreshToken => {
-            let refresh_token = refresh_token.ok_or_else(|| ToolError::ExecutionFailed {
-                tool: "mcp_client".into(),
-                message: format!(
-                    "OAuth refresh_token grant requested for server '{server_name}' but no refresh token is available"
-                ),
-            })?;
+            let refresh_token =
+                refresh_token.ok_or_else(|| mcp_oauth_required_error("mcp_client", server_name))?;
             params.push(("grant_type".into(), "refresh_token".into()));
             params.push(("refresh_token".into(), refresh_token));
         }
@@ -646,6 +964,10 @@ async fn fetch_oauth_token(
         })?;
     let status = response.status();
     if !status.is_success() {
+        // invalid_grant / expired refresh → interactive re-auth (MCP OAuth).
+        if status.as_u16() == 400 || status.as_u16() == 401 {
+            return Err(mcp_oauth_required_error("mcp_client", server_name));
+        }
         return Err(ToolError::ExecutionFailed {
             tool: "mcp_client".into(),
             message: format!(
@@ -722,6 +1044,10 @@ use edgecrab_types::{ToolError, ToolSchema};
 
 /// Global connection pool for MCP server connections (stdio or HTTP).
 ///
+/// Keys are `{profile_home}::{server_name}::{isolation_id}` so distinct
+/// EdgeCrab sessions / gateway users never share an HTTP `Mcp-Session-Id`
+/// (AE7 / Wave-1 session truth).
+///
 /// WHY DashMap: Multiple tool calls may arrive concurrently from parallel
 /// tool execution. DashMap provides lock-free concurrent reads and
 /// fine-grained write locks per shard.
@@ -729,6 +1055,49 @@ static MCP_CONNECTIONS: OnceLock<DashMap<String, Mutex<McpConnectionKind>>> = On
 
 fn connections() -> &'static DashMap<String, Mutex<McpConnectionKind>> {
     MCP_CONNECTIONS.get_or_init(DashMap::new)
+}
+
+/// Operator / CLI probe isolation when no conversation session exists.
+pub const MCP_OPERATOR_ISOLATION: &str = "operator";
+
+/// Build a pool key from profile home, server name, and isolation id.
+pub fn mcp_pool_key(server_name: &str, isolation_id: &str) -> String {
+    let home = resolve_edgecrab_home();
+    let iso = isolation_id.trim();
+    let iso = if iso.is_empty() { "default" } else { iso };
+    format!("{}::{server_name}::{iso}", home.display())
+}
+
+fn isolation_from_ctx(ctx: &ToolContext) -> String {
+    let id = ctx.session_id.trim();
+    if id.is_empty() {
+        MCP_OPERATOR_ISOLATION.to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+fn drop_pooled_connection(server_name: &str, isolation_id: &str) {
+    let key = mcp_pool_key(server_name, isolation_id);
+    connections().remove(&key);
+}
+
+fn is_stale_mcp_transport_error(err: &ToolError) -> bool {
+    match err {
+        ToolError::ExecutionFailed { message, .. } => {
+            let m = message.to_ascii_lowercase();
+            m.contains("closed connection")
+                || m.contains("connection reset")
+                || m.contains("broken pipe")
+                || m.contains("connection refused")
+                || m.contains("session not found")
+                || m.contains("session expired")
+                || m.contains("invalid session")
+                || m.contains("status 404")
+                || m.contains("status 410")
+        }
+        _ => false,
+    }
 }
 
 /// Monotonically increasing JSON-RPC request ID.
@@ -915,6 +1284,7 @@ impl McpConnection {
 }
 
 /// Configuration for a single MCP server (unified stdio + HTTP).
+#[derive(Clone)]
 struct McpServerConfig {
     /// HTTP URL for HTTP-based servers (takes precedence over command).
     url: Option<String>,
@@ -935,10 +1305,15 @@ struct McpServerConfig {
     connect_timeout: Option<u64>,
 }
 
-/// Get or create a connection to the named MCP server.
-async fn get_or_connect(server_name: &str, cfg: McpServerConfig) -> Result<(), ToolError> {
+/// Get or create a connection to the named MCP server for one isolation scope.
+async fn get_or_connect(
+    server_name: &str,
+    cfg: McpServerConfig,
+    isolation_id: &str,
+) -> Result<(), ToolError> {
+    let key = mcp_pool_key(server_name, isolation_id);
     let pool = connections();
-    if pool.contains_key(server_name) {
+    if pool.contains_key(&key) {
         return Ok(());
     }
 
@@ -977,8 +1352,61 @@ async fn get_or_connect(server_name: &str, cfg: McpServerConfig) -> Result<(), T
         McpConnectionKind::Stdio(Box::new(conn))
     };
 
-    pool.insert(server_name.to_string(), Mutex::new(kind));
+    pool.insert(key, Mutex::new(kind));
     Ok(())
+}
+
+/// JSON-RPC against a pooled connection with one stale-transport reconnect.
+async fn mcp_rpc_call(
+    server_name: &str,
+    isolation_id: &str,
+    cfg: McpServerConfig,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ToolError> {
+    get_or_connect(server_name, cfg.clone(), isolation_id).await?;
+    match mcp_rpc_once(server_name, isolation_id, method, params.clone()).await {
+        Ok(value) => Ok(value),
+        Err(err) if is_stale_mcp_transport_error(&err) => {
+            tracing::warn!(
+                server = server_name,
+                isolation = isolation_id,
+                "MCP transport stale; dropping pool entry and reconnecting once"
+            );
+            drop_pooled_connection(server_name, isolation_id);
+            get_or_connect(server_name, cfg, isolation_id).await?;
+            mcp_rpc_once(server_name, isolation_id, method, params).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn mcp_rpc_once(
+    server_name: &str,
+    isolation_id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ToolError> {
+    let key = mcp_pool_key(server_name, isolation_id);
+    let pool = connections();
+    let conn_mutex = pool.get(&key).ok_or_else(|| ToolError::ExecutionFailed {
+        tool: "mcp_client".into(),
+        message: format!("Connection to '{server_name}' not found after connect"),
+    })?;
+    let mut conn = conn_mutex.value().lock().await;
+    conn.rpc_call(method, params).await
+}
+
+/// HTTP `Mcp-Session-Id` for a pooled connection (tests / diagnostics).
+pub async fn pooled_http_session_id(server_name: &str, isolation_id: &str) -> Option<String> {
+    let key = mcp_pool_key(server_name, isolation_id);
+    let pool = connections();
+    let conn_mutex = pool.get(&key)?;
+    let conn = conn_mutex.value().lock().await;
+    match &*conn {
+        McpConnectionKind::Http(http) => http.session_id.clone(),
+        McpConnectionKind::Stdio(_) => None,
+    }
 }
 
 /// Legacy MCP config path used for compatibility imports.
@@ -1199,6 +1627,13 @@ fn parse_oauth_config(value: Option<&serde_json::Value>) -> Option<OAuthConfig> 
             .get("resource")
             .and_then(|value| value.as_str())
             .map(expand_config_string),
+        issuer: oauth
+            .get("issuer")
+            .and_then(|value| value.as_str())
+            .map(expand_config_string),
+        iss_parameter_supported: oauth
+            .get("iss_parameter_supported")
+            .and_then(|value| value.as_bool()),
         refresh_token: oauth
             .get("refresh_token")
             .and_then(|value| value.as_str())
@@ -1236,16 +1671,22 @@ fn parse_oauth_config(value: Option<&serde_json::Value>) -> Option<OAuthConfig> 
 
 fn parse_configured_server(name: &str, server_config: &serde_json::Value) -> ConfiguredMcpServer {
     let token_from_store = read_mcp_token(name).is_some();
+    let mut url = parse_expanded_string(server_config.get("url"));
+    let mut command = parse_expanded_string(server_config.get("command")).unwrap_or_default();
+    if url.is_none() && looks_like_http_mcp_url(&command) {
+        url = Some(command.trim().to_string());
+        command.clear();
+    }
     ConfiguredMcpServer {
         name: name.to_string(),
         enabled: server_config
             .get("enabled")
             .and_then(|value| value.as_bool())
             .unwrap_or(true),
-        url: parse_expanded_string(server_config.get("url")),
+        url,
         bearer_token: parse_expanded_string(server_config.get("bearer_token")),
         oauth: parse_oauth_config(server_config.get("oauth")),
-        command: parse_expanded_string(server_config.get("command")).unwrap_or_default(),
+        command,
         args: parse_string_array(server_config.get("args")),
         cwd: parse_expanded_path(server_config.get("cwd")),
         env: parse_string_map(server_config.get("env")),
@@ -1428,6 +1869,14 @@ pub fn configured_servers_with_disabled() -> Result<Vec<ConfiguredMcpServer>, To
 }
 
 pub async fn probe_configured_server(server_name: &str) -> Result<McpProbeResult, ToolError> {
+    probe_configured_server_with_isolation(server_name, MCP_OPERATOR_ISOLATION).await
+}
+
+/// Probe a configured MCP server using an explicit isolation id (Wave-1 session truth).
+pub async fn probe_configured_server_with_isolation(
+    server_name: &str,
+    isolation_id: &str,
+) -> Result<McpProbeResult, ToolError> {
     let server = configured_servers_with_disabled()?
         .into_iter()
         .find(|server| server.name == server_name)
@@ -1443,18 +1892,14 @@ pub async fn probe_configured_server(server_name: &str) -> Result<McpProbeResult
         });
     }
 
-    get_or_connect(server_name, to_runtime_server_config(&server)).await?;
-
-    let pool = connections();
-    let conn_mutex = pool
-        .get(server_name)
-        .ok_or_else(|| ToolError::ExecutionFailed {
-            tool: "mcp_client".into(),
-            message: format!("Connection to '{server_name}' not found after connect"),
-        })?;
-
-    let mut conn = conn_mutex.value().lock().await;
-    let result = conn.rpc_call("tools/list", json!({})).await?;
+    let result = mcp_rpc_call(
+        server_name,
+        isolation_id,
+        to_runtime_server_config(&server),
+        "tools/list",
+        json!({}),
+    )
+    .await?;
     let tools: Vec<(String, String)> = result
         .get("tools")
         .and_then(|t| t.as_array())
@@ -1477,6 +1922,13 @@ pub async fn probe_configured_server(server_name: &str) -> Result<McpProbeResult
                 .collect()
         })
         .unwrap_or_default();
+
+    if tools.is_empty() && (!server.include.is_empty() || !server.exclude.is_empty()) {
+        tracing::warn!(
+            server = server_name,
+            "MCP probe returned zero tools after include/exclude filters — check tools.include"
+        );
+    }
 
     Ok(McpProbeResult {
         server_name: server.name,
@@ -1519,8 +1971,10 @@ impl ToolHandler for McpListToolsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "mcp_list_tools".into(),
-            description:
-                "List available tools from connected MCP (Model Context Protocol) servers.".into(),
+            description: "List tools from configured MCP (Model Context Protocol) servers \
+                 (remote integrations in config — e.g. a server named GPS). \
+                 Prefer this over shell/grep when the user names an MCP server."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1565,26 +2019,28 @@ impl ToolHandler for McpListToolsTool {
                 return Err(ToolError::Other("Cancelled".into()));
             }
 
-            get_or_connect(&server.name, to_runtime_server_config(&server)).await?;
+            let isolation = isolation_from_ctx(ctx);
+            let result = mcp_rpc_call(
+                &server.name,
+                &isolation,
+                to_runtime_server_config(&server),
+                "tools/list",
+                json!({}),
+            )
+            .await?;
 
-            let pool = connections();
-            if let Some(conn_mutex) = pool.get(&server.name) {
-                let mut conn = conn_mutex.value().lock().await;
-                let result = conn.rpc_call("tools/list", json!({})).await?;
-
-                if let Some(raw_tools) = result.get("tools").and_then(|t| t.as_array()) {
-                    let filtered = apply_tool_filter(raw_tools, &server.include, &server.exclude);
-                    for tool in &filtered {
-                        let tool_name = tool
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("unknown");
-                        let tool_desc = tool
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("");
-                        all_tools.push(format!("[{}] {tool_name}: {tool_desc}", server.name));
-                    }
+            if let Some(raw_tools) = result.get("tools").and_then(|t| t.as_array()) {
+                let filtered = apply_tool_filter(raw_tools, &server.include, &server.exclude);
+                for tool in &filtered {
+                    let tool_name = tool
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown");
+                    let tool_desc = tool
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
+                    all_tools.push(format!("[{}] {tool_name}: {tool_desc}", server.name));
                 }
             }
         }
@@ -1636,9 +2092,10 @@ impl ToolHandler for McpCallToolTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "mcp_call_tool".into(),
-            description:
-                "Call an MCP tool by name on a specific server. Use mcp_list_tools to discover available tools first."
-                    .into(),
+            description: "Call a tool on a configured MCP server by server name + tool_name. \
+                 Use when the user refers to a remote MCP integration (not a local CLI). \
+                 Prefer mcp_list_tools first if you do not know the tool name."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1708,24 +2165,20 @@ impl ToolHandler for McpCallToolTool {
         // Extract env vars from config so they reach the subprocess
         let cmd_envs = parse_string_map(server_config.get("env"));
 
-        get_or_connect(
-            &args.server,
-            McpServerConfig {
-                url,
-                bearer_token,
-                oauth: parse_oauth_config(server_config.get("oauth")),
-                headers: parse_string_map(server_config.get("headers")),
-                command,
-                args: cmd_args,
-                cwd: parse_expanded_path(server_config.get("cwd")),
-                envs: cmd_envs,
-                timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
-                connect_timeout: server_config
-                    .get("connect_timeout")
-                    .and_then(|t| t.as_u64()),
-            },
-        )
-        .await?;
+        let cfg = McpServerConfig {
+            url,
+            bearer_token,
+            oauth: parse_oauth_config(server_config.get("oauth")),
+            headers: parse_string_map(server_config.get("headers")),
+            command,
+            args: cmd_args,
+            cwd: parse_expanded_path(server_config.get("cwd")),
+            envs: cmd_envs,
+            timeout: server_config.get("timeout").and_then(|t| t.as_u64()),
+            connect_timeout: server_config
+                .get("connect_timeout")
+                .and_then(|t| t.as_u64()),
+        };
 
         // Validate that the requested tool is not excluded by the filter
         {
@@ -1753,24 +2206,18 @@ impl ToolHandler for McpCallToolTool {
             return Err(ToolError::Other("Cancelled".into()));
         }
 
-        let pool = connections();
-        let conn_mutex = pool
-            .get(&args.server)
-            .ok_or_else(|| ToolError::ExecutionFailed {
-                tool: "mcp_call_tool".into(),
-                message: format!("Connection to '{}' not found", args.server),
-            })?;
-
-        let mut conn = conn_mutex.value().lock().await;
-        let result = conn
-            .rpc_call(
-                "tools/call",
-                json!({
-                    "name": args.tool_name,
-                    "arguments": args.arguments
-                }),
-            )
-            .await?;
+        let isolation = isolation_from_ctx(ctx);
+        let result = mcp_rpc_call(
+            &args.server,
+            &isolation,
+            cfg,
+            "tools/call",
+            json!({
+                "name": args.tool_name,
+                "arguments": args.arguments
+            }),
+        )
+        .await?;
 
         // Extract text content from MCP tool response
         if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
@@ -1806,6 +2253,117 @@ inventory::submit!(&McpCallToolTool as &dyn ToolHandler);
 /// on the next `mcp_list_tools` / `mcp_call_tool` invocation.
 pub fn reload_mcp_connections() {
     connections().clear();
+}
+
+/// True when a stdio `command` field is actually an HTTP(S) MCP endpoint.
+///
+/// Operators sometimes run `mcp add NAME https://…` (legacy positional) which
+/// stores the URL in `command`. Discover must coerce that to HTTP transport.
+pub fn looks_like_http_mcp_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && trimmed.contains('.')
+        && !trimmed.contains(' ')
+}
+
+/// Ephemeral API-only context (goal-block pattern): lists configured MCP servers
+/// so the model does not treat names like `GPS` as local CLI/Docker targets.
+///
+/// Empty when no enabled servers are configured. Not persisted in session history
+/// — callers append to `messages_for_api` only (Anthropic cache-safe).
+pub fn render_mcp_api_context(user_text: &str) -> String {
+    let servers = match configured_servers() {
+        Ok(servers) if !servers.is_empty() => servers,
+        _ => return String::new(),
+    };
+
+    let mut lines = vec![
+        "[MCP CONTEXT — configured remote tool servers]".to_string(),
+        "These are Model Context Protocol integrations from EdgeCrab config — \
+         not local CLI binaries, Docker containers, or workspace folders."
+            .to_string(),
+        "When the user names one of these servers, call `mcp_list_tools` / \
+         `mcp_call_tool` or the matching `mcp_<server>_*` tools. Do not use \
+         shell (`which`, `find`, `docker`, `kubectl`) to discover them."
+            .to_string(),
+    ];
+    for server in &servers {
+        let transport = if server.url.is_some() {
+            "http"
+        } else {
+            "stdio"
+        };
+        lines.push(format!("- {} ({transport})", server.name));
+    }
+
+    let lower = user_text.to_ascii_lowercase();
+    let mentioned: Vec<&str> = servers
+        .iter()
+        .filter(|server| {
+            let name = server.name.to_ascii_lowercase();
+            lower
+                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                .any(|tok| tok == name)
+                || lower.contains(&name)
+        })
+        .map(|server| server.name.as_str())
+        .collect();
+    if !mentioned.is_empty() {
+        lines.push(format!(
+            "User mentioned: {}. Use MCP tools for {} now (start with mcp_list_tools if unsure of tool names).",
+            mentioned.join(", "),
+            mentioned.join(", ")
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Deferred-schema names to materialize when the user text references a
+/// configured MCP server (Indexed mode turn-start prefetch).
+pub fn mcp_tool_names_for_user_text(
+    user_text: &str,
+    schemas: &[edgecrab_types::ToolSchema],
+) -> Vec<String> {
+    let servers = match configured_servers() {
+        Ok(servers) if !servers.is_empty() => servers,
+        _ => return Vec::new(),
+    };
+    let lower = user_text.to_ascii_lowercase();
+    let mut matched_servers = Vec::new();
+    for server in &servers {
+        let name = server.name.to_ascii_lowercase();
+        let hit = lower
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .any(|tok| tok == name)
+            || lower.contains(&name);
+        if hit {
+            matched_servers.push(server.name.clone());
+        }
+    }
+    if matched_servers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for meta in ["mcp_list_tools", "mcp_call_tool"] {
+        if schemas.iter().any(|schema| schema.name == meta) {
+            out.push(meta.to_string());
+        }
+    }
+    for server in &matched_servers {
+        let prefix = format!(
+            "mcp_{}_",
+            sanitize_to_identifier(server).to_ascii_lowercase()
+        );
+        for schema in schemas {
+            let name_l = schema.name.to_ascii_lowercase();
+            if name_l.starts_with(&prefix) && !out.iter().any(|existing| existing == &schema.name) {
+                out.push(schema.name.clone());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -2010,27 +2568,36 @@ impl ToolHandler for McpDynamicTool {
             return Err(ToolError::Other("Cancelled".into()));
         }
 
-        let pool = connections();
-        let conn_mutex = pool
-            .get(&self.server_name)
-            .ok_or_else(|| ToolError::ExecutionFailed {
+        let isolation = isolation_from_ctx(ctx);
+        ensure_server_connected(&self.server_name, &isolation).await?;
+        let result = mcp_rpc_call(
+            &self.server_name,
+            &isolation,
+            // ensure_server_connected already opened; cfg reload for stale retry
+            {
+                let server = configured_servers()?
+                    .into_iter()
+                    .find(|s| s.name == self.server_name)
+                    .ok_or_else(|| ToolError::InvalidArgs {
+                        tool: self.name_static.to_string(),
+                        message: format!("Unknown MCP server '{}'", self.server_name),
+                    })?;
+                to_runtime_server_config(&server)
+            },
+            "tools/call",
+            json!({
+                "name": self.original_name,
+                "arguments": args
+            }),
+        )
+        .await
+        .map_err(|e| match e {
+            ToolError::ExecutionFailed { message, .. } => ToolError::ExecutionFailed {
                 tool: self.name_static.to_string(),
-                message: format!(
-                    "No connection to MCP server '{}'. Try running `/reload-mcp`.",
-                    self.server_name
-                ),
-            })?;
-
-        let mut conn = conn_mutex.value().lock().await;
-        let result = conn
-            .rpc_call(
-                "tools/call",
-                json!({
-                    "name": self.original_name,
-                    "arguments": args
-                }),
-            )
-            .await?;
+                message,
+            },
+            other => other,
+        })?;
 
         // Extract text content from MCP tool response
         if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
@@ -2079,9 +2646,19 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
     };
 
     for (server_name, server_config) in &servers {
-        let command = parse_expanded_string(server_config.get("command")).unwrap_or_default();
+        let mut command = parse_expanded_string(server_config.get("command")).unwrap_or_default();
 
-        let url = parse_expanded_string(server_config.get("url"));
+        let mut url = parse_expanded_string(server_config.get("url"));
+
+        // Coerce legacy mis-config: URL stored in `command` with null `url`.
+        if url.is_none() && looks_like_http_mcp_url(&command) {
+            tracing::warn!(
+                "MCP server '{server_name}' has an HTTP URL in `command` — treating as HTTP transport \
+                 (prefer `url:` in config.yaml)"
+            );
+            url = Some(command.trim().to_string());
+            command.clear();
+        }
 
         let bearer_token = parse_expanded_string(server_config.get("bearer_token"));
 
@@ -2102,43 +2679,32 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
             continue;
         }
 
-        // Connect (or reuse existing connection)
-        if let Err(e) = get_or_connect(
+        let discover_cfg = McpServerConfig {
+            url,
+            bearer_token,
+            oauth: parse_oauth_config(server_config.get("oauth")),
+            headers,
+            command,
+            args: cmd_args,
+            cwd: parse_expanded_path(server_config.get("cwd")),
+            envs: cmd_envs,
+            timeout,
+            connect_timeout,
+        };
+
+        // Discover uses operator isolation; runtime tool calls use session isolation.
+        let tools_value = match mcp_rpc_call(
             server_name,
-            McpServerConfig {
-                url,
-                bearer_token,
-                oauth: parse_oauth_config(server_config.get("oauth")),
-                headers,
-                command,
-                args: cmd_args,
-                cwd: parse_expanded_path(server_config.get("cwd")),
-                envs: cmd_envs,
-                timeout,
-                connect_timeout,
-            },
+            MCP_OPERATOR_ISOLATION,
+            discover_cfg,
+            "tools/list",
+            json!({}),
         )
         .await
         {
-            tracing::warn!("Failed to connect to MCP server '{server_name}': {e}");
-            continue;
-        }
-
-        // Fetch tool list from server
-        let tools_result = {
-            let pool = connections();
-            let conn_mutex = match pool.get(server_name.as_str()) {
-                Some(c) => c,
-                None => continue,
-            };
-            let mut conn = conn_mutex.value().lock().await;
-            conn.rpc_call("tools/list", json!({})).await
-        };
-
-        let tools_value = match tools_result {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("tools/list failed for MCP server '{server_name}': {e}");
+                tracing::warn!("Failed to connect/list MCP server '{server_name}': {e}");
                 continue;
             }
         };
@@ -2151,6 +2717,16 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
 
         let (include, exclude) = extract_tool_filter(server_config);
         let filtered = apply_tool_filter(raw_tools, &include, &exclude);
+        if filtered.is_empty()
+            && !raw_tools.is_empty()
+            && (!include.is_empty() || !exclude.is_empty())
+        {
+            tracing::warn!(
+                "MCP server '{server_name}' returned {} tool(s) but filters hid all of them \
+                 (include={include:?} exclude={exclude:?})",
+                raw_tools.len()
+            );
+        }
 
         let mut registered = 0usize;
         for tool in &filtered {
@@ -2199,15 +2775,13 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
 
         // Probe resources capability with a benign resources/list call
         if resources_enabled {
-            let probe = {
-                let pool = connections();
-                let conn_mutex = match pool.get(server_name.as_str()) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let mut conn = conn_mutex.value().lock().await;
-                conn.rpc_call("resources/list", json!({})).await
-            };
+            let probe = mcp_rpc_once(
+                server_name,
+                MCP_OPERATOR_ISOLATION,
+                "resources/list",
+                json!({}),
+            )
+            .await;
             if probe.is_ok() {
                 let lr = McpDynamicTool::new(
                     server_name,
@@ -2234,15 +2808,13 @@ pub async fn discover_and_register_mcp_tools(registry: &mut crate::registry::Too
         }
 
         if prompts_enabled {
-            let probe = {
-                let pool = connections();
-                let conn_mutex = match pool.get(server_name.as_str()) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let mut conn = conn_mutex.value().lock().await;
-                conn.rpc_call("prompts/list", json!({})).await
-            };
+            let probe = mcp_rpc_once(
+                server_name,
+                MCP_OPERATOR_ISOLATION,
+                "prompts/list",
+                json!({}),
+            )
+            .await;
             if probe.is_ok() {
                 let lp = McpDynamicTool::new(
                     server_name,
@@ -2335,17 +2907,22 @@ impl ToolHandler for McpListResourcesTool {
             return Err(ToolError::Other("Cancelled".into()));
         }
 
-        ensure_server_connected(&a.server).await?;
-
-        let pool = connections();
-        let conn_mutex = pool
-            .get(&a.server)
-            .ok_or_else(|| ToolError::ExecutionFailed {
+        let isolation = isolation_from_ctx(ctx);
+        let server = configured_servers()?
+            .into_iter()
+            .find(|s| s.name == a.server)
+            .ok_or_else(|| ToolError::InvalidArgs {
                 tool: "mcp_list_resources".into(),
-                message: format!("Not connected to server '{}'", a.server),
+                message: format!("Unknown MCP server '{}'", a.server),
             })?;
-        let mut conn = conn_mutex.value().lock().await;
-        let result = conn.rpc_call("resources/list", json!({})).await?;
+        let result = mcp_rpc_call(
+            &a.server,
+            &isolation,
+            to_runtime_server_config(&server),
+            "resources/list",
+            json!({}),
+        )
+        .await?;
         Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
     }
 }
@@ -2406,19 +2983,22 @@ impl ToolHandler for McpReadResourceTool {
             return Err(ToolError::Other("Cancelled".into()));
         }
 
-        ensure_server_connected(&a.server).await?;
-
-        let pool = connections();
-        let conn_mutex = pool
-            .get(&a.server)
-            .ok_or_else(|| ToolError::ExecutionFailed {
+        let isolation = isolation_from_ctx(ctx);
+        let server = configured_servers()?
+            .into_iter()
+            .find(|s| s.name == a.server)
+            .ok_or_else(|| ToolError::InvalidArgs {
                 tool: "mcp_read_resource".into(),
-                message: format!("Not connected to server '{}'", a.server),
+                message: format!("Unknown MCP server '{}'", a.server),
             })?;
-        let mut conn = conn_mutex.value().lock().await;
-        let result = conn
-            .rpc_call("resources/read", json!({"uri": a.uri}))
-            .await?;
+        let result = mcp_rpc_call(
+            &a.server,
+            &isolation,
+            to_runtime_server_config(&server),
+            "resources/read",
+            json!({"uri": a.uri}),
+        )
+        .await?;
         Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
     }
 }
@@ -2477,17 +3057,22 @@ impl ToolHandler for McpListPromptsTool {
             return Err(ToolError::Other("Cancelled".into()));
         }
 
-        ensure_server_connected(&a.server).await?;
-
-        let pool = connections();
-        let conn_mutex = pool
-            .get(&a.server)
-            .ok_or_else(|| ToolError::ExecutionFailed {
+        let isolation = isolation_from_ctx(ctx);
+        let server = configured_servers()?
+            .into_iter()
+            .find(|s| s.name == a.server)
+            .ok_or_else(|| ToolError::InvalidArgs {
                 tool: "mcp_list_prompts".into(),
-                message: format!("Not connected to server '{}'", a.server),
+                message: format!("Unknown MCP server '{}'", a.server),
             })?;
-        let mut conn = conn_mutex.value().lock().await;
-        let result = conn.rpc_call("prompts/list", json!({})).await?;
+        let result = mcp_rpc_call(
+            &a.server,
+            &isolation,
+            to_runtime_server_config(&server),
+            "prompts/list",
+            json!({}),
+        )
+        .await?;
         Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
     }
 }
@@ -2560,22 +3145,22 @@ impl ToolHandler for McpGetPromptTool {
             return Err(ToolError::Other("Cancelled".into()));
         }
 
-        ensure_server_connected(&a.server).await?;
-
-        let pool = connections();
-        let conn_mutex = pool
-            .get(&a.server)
-            .ok_or_else(|| ToolError::ExecutionFailed {
+        let isolation = isolation_from_ctx(ctx);
+        let server = configured_servers()?
+            .into_iter()
+            .find(|s| s.name == a.server)
+            .ok_or_else(|| ToolError::InvalidArgs {
                 tool: "mcp_get_prompt".into(),
-                message: format!("Not connected to server '{}'", a.server),
+                message: format!("Unknown MCP server '{}'", a.server),
             })?;
-        let mut conn = conn_mutex.value().lock().await;
-        let result = conn
-            .rpc_call(
-                "prompts/get",
-                json!({"name": a.name, "arguments": a.arguments}),
-            )
-            .await?;
+        let result = mcp_rpc_call(
+            &a.server,
+            &isolation,
+            to_runtime_server_config(&server),
+            "prompts/get",
+            json!({"name": a.name, "arguments": a.arguments}),
+        )
+        .await?;
         Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
     }
 }
@@ -2586,8 +3171,9 @@ inventory::submit!(&McpGetPromptTool as &dyn ToolHandler);
 ///
 /// Uses `load_mcp_config()` to look up the server by name and calls
 /// `get_or_connect()`. Returns an error if the server is not found in config.
-async fn ensure_server_connected(server_name: &str) -> Result<(), ToolError> {
-    if connections().contains_key(server_name) {
+async fn ensure_server_connected(server_name: &str, isolation_id: &str) -> Result<(), ToolError> {
+    let key = mcp_pool_key(server_name, isolation_id);
+    if connections().contains_key(&key) {
         return Ok(());
     }
     let server = configured_servers()?
@@ -2598,7 +3184,7 @@ async fn ensure_server_connected(server_name: &str) -> Result<(), ToolError> {
             message: format!("Unknown MCP server '{server_name}'"),
         })?;
 
-    get_or_connect(server_name, to_runtime_server_config(&server)).await
+    get_or_connect(server_name, to_runtime_server_config(&server), isolation_id).await
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -2635,6 +3221,81 @@ mod tests {
     }
 
     #[test]
+    fn parse_mcp_sse_jsonrpc_extracts_message_event() {
+        let body = "\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"tools\":[]}}\n\
+\n";
+        let val = parse_mcp_sse_jsonrpc(body).expect("sse");
+        assert_eq!(val["result"]["protocolVersion"], "2025-03-26");
+    }
+
+    #[test]
+    fn parse_mcp_sse_jsonrpc_joins_multiline_data() {
+        // SSE joins consecutive data: lines with \n before JSON parse.
+        let body = "\
+data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":\n\
+data: {\"ok\":true}}\n\
+\n";
+        let val = parse_mcp_sse_jsonrpc(body).expect("sse");
+        assert_eq!(val["result"]["ok"], true);
+    }
+
+    #[test]
+    fn parse_mcp_sse_jsonrpc_prefers_error_payload() {
+        let body = "\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"nope\"}}\n\
+\n";
+        let val = parse_mcp_sse_jsonrpc(body).expect("sse");
+        assert_eq!(val["error"]["message"], "nope");
+    }
+
+    #[test]
+    fn looks_like_sse_body_detects_event_prefix() {
+        assert!(looks_like_sse_body("event: message\ndata: {}\n\n"));
+        assert!(looks_like_sse_body("data: {\"jsonrpc\":\"2.0\"}\n\n"));
+        assert!(!looks_like_sse_body(
+            "{\"jsonrpc\":\"2.0\",\"result\":null}"
+        ));
+    }
+
+    #[test]
+    fn streamable_accept_header_includes_both_media_types() {
+        assert!(MCP_STREAMABLE_ACCEPT.contains("application/json"));
+        assert!(MCP_STREAMABLE_ACCEPT.contains("text/event-stream"));
+    }
+
+    #[test]
+    fn mcp_pool_key_includes_home_server_and_isolation() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        let key_a = mcp_pool_key("GPS", "session-a");
+        let key_b = mcp_pool_key("GPS", "session-b");
+        assert_ne!(key_a, key_b);
+        assert!(key_a.contains("GPS"));
+        assert!(key_a.contains("session-a"));
+        assert!(key_a.contains(&home.path().display().to_string()));
+    }
+
+    #[test]
+    fn write_mcp_token_record_is_atomic_readable() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let _home = TestEdgecrabHome::new();
+        write_mcp_token_record(
+            "gps",
+            &StoredMcpToken {
+                access_token: "tok-1".into(),
+                token_type: Some("Bearer".into()),
+                refresh_token: Some("ref-1".into()),
+                expires_at_epoch_secs: None,
+            },
+        )
+        .expect("write");
+        assert_eq!(read_mcp_token("gps").as_deref(), Some("tok-1"));
+    }
+
+    #[test]
     fn connections_pool_is_singleton() {
         let pool1 = connections();
         let pool2 = connections();
@@ -2646,6 +3307,96 @@ mod tests {
         if let Some(path) = mcp_config_path() {
             assert!(path.ends_with("mcp.json"));
         }
+    }
+
+    #[test]
+    fn mcp_oauth_required_error_is_suppress_retry_with_login_action() {
+        let err = mcp_oauth_required_error("mcp_list_tools", "GPS");
+        assert!(err.should_suppress_retry());
+        assert_eq!(err.code(), MCP_OAUTH_REQUIRED_CODE);
+        assert_eq!(err.suggested_action(), Some("/mcp login GPS"));
+        let json = serde_json::to_string(&err.to_llm_payload()).expect("json");
+        assert_eq!(
+            parse_mcp_oauth_required_server(&json).as_deref(),
+            Some("GPS")
+        );
+        assert!(json.contains("Do NOT invent JWT"));
+    }
+
+    #[test]
+    fn oauth_can_refresh_requires_refresh_token_or_client_credentials() {
+        let mut auth = HttpAuthState::OAuth {
+            config: Box::new(OAuthConfig {
+                token_url: "https://example.com/token".into(),
+                grant_type: OAuthGrantType::AuthorizationCode,
+                client_id: Some("cid".into()),
+                client_secret: None,
+                auth_method: OAuthClientAuthMethod::None,
+                device_authorization_url: None,
+                authorization_url: Some("https://example.com/authorize".into()),
+                redirect_url: Some("http://localhost:0/callback".into()),
+                use_pkce: Some(true),
+                scopes: vec!["mcp:read".into()],
+                audience: None,
+                resource: None,
+                issuer: None,
+                iss_parameter_supported: None,
+                refresh_token: None,
+                authorization_params: HashMap::new(),
+                extra_params: HashMap::new(),
+            }),
+            token: Some(StoredMcpToken {
+                access_token: "expired".into(),
+                token_type: Some("Bearer".into()),
+                refresh_token: None,
+                expires_at_epoch_secs: Some(0),
+            }),
+        };
+        assert!(!auth.can_refresh());
+        if let HttpAuthState::OAuth {
+            token: Some(token), ..
+        } = &mut auth
+        {
+            token.refresh_token = Some("rt".into());
+        }
+        assert!(auth.can_refresh());
+    }
+
+    #[test]
+    fn looks_like_http_mcp_url_detects_endpoints() {
+        assert!(looks_like_http_mcp_url("https://lp.gpsglobal.ai/mcp"));
+        assert!(looks_like_http_mcp_url("http://mcp.example.com/v1"));
+        assert!(!looks_like_http_mcp_url("npx"));
+        assert!(!looks_like_http_mcp_url(
+            "https://example.com/mcp with spaces"
+        ));
+    }
+
+    #[test]
+    fn render_mcp_api_context_mentions_named_server() {
+        let _guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+        let home = TestEdgecrabHome::new();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mcp_servers:\n  GPS:\n    url: https://mcp.example.com/mcp\n    enabled: true\n",
+        )
+        .expect("write");
+        let block = render_mcp_api_context("List Fund in GPS");
+        assert!(block.contains("[MCP CONTEXT"));
+        assert!(block.contains("GPS"));
+        assert!(block.contains("mcp_list_tools"));
+        assert!(block.contains("not local CLI"));
+    }
+
+    #[test]
+    fn parse_configured_server_coerces_url_stored_in_command() {
+        let value = serde_json::json!({
+            "command": "https://lp.gpsglobal.ai/mcp",
+            "enabled": true,
+        });
+        let server = parse_configured_server("gps", &value);
+        assert_eq!(server.url.as_deref(), Some("https://lp.gpsglobal.ai/mcp"));
+        assert!(server.command.is_empty());
     }
 
     #[test]

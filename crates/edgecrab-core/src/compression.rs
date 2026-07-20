@@ -109,6 +109,100 @@ pub const FIRST_COMPRESSION_NOTE: &str = concat!(
 pub const HANDOFF_COMPRESSION_NOTE: &str =
     "[Note: Earlier turns were auto-compressed for the target model's context window.]";
 
+/// Provider errors that indicate an image payload should be shrunk and retried.
+pub fn is_image_too_large_error(error: &edgequake_llm::LlmError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    (message.contains("image")
+        && (message.contains("too large")
+            || message.contains("maximum image")
+            || message.contains("max image")
+            || message.contains("image size")
+            || message.contains("image dimensions")))
+        || message.contains("imagetoolarge")
+}
+
+pub fn is_payload_too_large_error(error: &edgequake_llm::LlmError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("413")
+        || message.contains("payload too large")
+        || message.contains("request entity too large")
+}
+
+pub fn provider_messages_have_images(messages: &[edgequake_llm::ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+    })
+}
+
+/// Shrink all base64 images in provider messages for one recovery attempt.
+///
+/// Session messages remain untouched; only the transient API payload is
+/// rewritten. Undecodable images are omitted so a malformed oversized image
+/// cannot make the retry identical to the failed request.
+pub fn shrink_provider_images_for_retry(messages: &mut [edgequake_llm::ChatMessage]) -> bool {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    const MAX_DIMENSION: u32 = 768;
+    const JPEG_QUALITY: u8 = 70;
+
+    let mut changed = false;
+    for message in messages {
+        let Some(images) = message.images.take() else {
+            continue;
+        };
+        let mut recovered = Vec::with_capacity(images.len());
+        for mut image_data in images {
+            let decoded = STANDARD.decode(&image_data.data);
+            let resized = decoded.ok().and_then(|bytes| {
+                ImageReader::new(Cursor::new(bytes))
+                    .with_guessed_format()
+                    .ok()?
+                    .decode()
+                    .ok()
+            });
+            let Some(decoded) = resized else {
+                changed = true;
+                continue;
+            };
+            let resized = decoded.resize(
+                MAX_DIMENSION,
+                MAX_DIMENSION,
+                image::imageops::FilterType::Triangle,
+            );
+            let mut jpeg = Vec::new();
+            let encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY);
+            if resized.write_with_encoder(encoder).is_ok() && !jpeg.is_empty() {
+                image_data.data = STANDARD.encode(jpeg);
+                image_data.mime_type = "image/jpeg".into();
+                image_data.detail = Some("low".into());
+                recovered.push(image_data);
+                changed = true;
+            } else {
+                changed = true;
+            }
+        }
+        if recovered.is_empty() {
+            if !message
+                .content
+                .contains("image omitted after provider size rejection")
+            {
+                message
+                    .content
+                    .push_str("\n[image omitted after provider size rejection]");
+            }
+        } else {
+            message.images = Some(recovered);
+        }
+    }
+    changed
+}
+
 /// Re-inject active todos after compression (Hermes `todo_snapshot` parity, HA-19).
 ///
 /// Returns a synthetic user message when pending/in-progress items exist; completed
@@ -1654,6 +1748,42 @@ async fn llm_summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_too_large_recovery_shrinks_provider_payload() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+        use std::io::Cursor;
+
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(1200, 900, |x, y| {
+            Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+        }));
+        let mut png = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .expect("png");
+        let original_b64 = STANDARD.encode(&png);
+        let mut messages = vec![edgequake_llm::ChatMessage::user_with_images(
+            "inspect",
+            vec![edgequake_llm::ImageData::new(&original_b64, "image/png")],
+        )];
+
+        assert!(shrink_provider_images_for_retry(&mut messages));
+        let recovered = &messages[0].images.as_ref().expect("image retained")[0];
+        assert_eq!(recovered.mime_type, "image/jpeg");
+        assert_eq!(recovered.detail.as_deref(), Some("low"));
+        assert!(recovered.data.len() < original_b64.len());
+    }
+
+    #[test]
+    fn detects_image_too_large_provider_errors() {
+        let error = edgequake_llm::LlmError::InvalidRequest("maximum image size exceeded".into());
+        assert!(is_image_too_large_error(&error));
+        let unrelated = edgequake_llm::LlmError::InvalidRequest("invalid temperature".into());
+        assert!(!is_image_too_large_error(&unrelated));
+        let payload = edgequake_llm::LlmError::ApiError("HTTP 413 Request Entity Too Large".into());
+        assert!(is_payload_too_large_error(&payload));
+    }
 
     fn make_messages(n: usize) -> Vec<Message> {
         (0..n)

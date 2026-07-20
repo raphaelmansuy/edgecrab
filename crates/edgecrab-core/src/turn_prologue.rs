@@ -39,6 +39,28 @@ impl TurnPrologueState {
         self.preflight_evaluated = true;
         self.preflight_ran = ran;
     }
+
+    /// Capture the first request estimate exactly once.
+    pub fn observe_opening_tokens(&mut self, rough_tokens: usize) {
+        self.opening_rough_tokens.get_or_insert(rough_tokens);
+    }
+
+    /// Reset dispatch-local guardrails at the start of a tool-call response.
+    pub fn reset_tool_dispatch(trackers: &mut TurnDispatchTrackers) {
+        trackers.tool_guardrail.reset_for_turn();
+    }
+
+    /// Emit the common preflight observability fields from their owning state.
+    pub fn trace_preflight(&self, gate: bool, disposition: &'static str) {
+        tracing::debug!(
+            opening_rough_tokens = ?self.opening_rough_tokens,
+            preflight_evaluated = self.preflight_evaluated,
+            preflight_ran = self.preflight_ran,
+            preflight_gate = gate,
+            disposition,
+            "prologue preflight metrics"
+        );
+    }
 }
 
 /// Hermes `_should_run_preflight_estimate` parity (issue few-but-huge).
@@ -81,11 +103,17 @@ mod tests {
 
     #[test]
     fn ha55_prologue_initializes_trackers() {
-        let state = TurnPrologueState::begin(&HarnessConfig::default());
+        let mut state = TurnPrologueState::begin(&HarnessConfig::default());
         assert!(!state.trackers.guardrail_halt);
         assert_eq!(state.compression_llm_failures, 0);
         assert!(!state.pressure_warned);
         assert!(!state.preflight_evaluated);
+        state.observe_opening_tokens(42);
+        state.observe_opening_tokens(99);
+        state.note_preflight(true);
+        assert_eq!(state.opening_rough_tokens, Some(42));
+        assert!(state.preflight_evaluated);
+        assert!(state.preflight_ran);
     }
 
     #[test]

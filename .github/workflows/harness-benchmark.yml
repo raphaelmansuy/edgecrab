@@ -34,6 +34,10 @@ jobs:
       - name: harness_failover_matrix
         run: cargo test -p edgecrab-core --test harness_failover_matrix
 
+      # Wave 0 / 027: offline evidence-latch e2e (required; no network, no sleeps, no LLM)
+      - name: harness_nonflaky_e2e
+        run: cargo test -p edgecrab-core --test harness_nonflaky_e2e
+
       - name: dry-solid harness gates (018)
         run: |
           cargo test -p edgecrab-core --lib turn_dispatch_policy

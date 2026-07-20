@@ -62,19 +62,10 @@ impl GatewaySender for GatewaySenderBridge {
             ..Default::default()
         };
 
-        let platform_key = format!("{p:?}");
-        match self.router.deliver(message, p, &metadata).await {
-            Ok(()) => {
-                crate::circuit_breaker::PlatformCircuitBreaker::global()
-                    .record_success(&platform_key);
-                Ok(())
-            }
-            Err(e) => {
-                crate::circuit_breaker::PlatformCircuitBreaker::global()
-                    .record_failure(&platform_key);
-                Err(e.to_string())
-            }
-        }?;
+        self.router
+            .deliver(message, p, &metadata)
+            .await
+            .map_err(|e| e.to_string())?;
 
         if let Some(db) = &self.state_db {
             let _ = mirror_to_session(

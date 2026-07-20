@@ -1,7 +1,7 @@
 # 022 — First-Principles Gap Analysis: EdgeCrab vs Hermes Agent
 
 **Status:** Living cross-ref — **code is law**  
-**Re-assessed:** 2026-07-19 (full dual-tree audit + July 2026 agent-engineering rubric)  
+**Re-assessed:** 2026-07-20 (full dual-tree audit + July 2026 agent-engineering rubric + 027 Waves 0–5)  
 **Hermes tree:** `/Users/raphaelmansuy/Github/03-working/hermes-agent`  
 **EdgeCrab tree:** this repo
 
@@ -35,8 +35,8 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
 | AE6 Classify → recover | failover 21 reasons | classifier 23 + credential_pool |
 | AE7 Mediated I/O | security crate + preview grants | distributed; global private URL footgun |
 | AE8 Human sovereignty | typed steer | interrupt + app UX |
-| AE9 Observability | harness_analyzer + OTEL | plugins + trajectory |
-| AE10 Extend | **SDK embed** | **plugin gravity** |
+| AE9 Observability | harness_analyzer + OTEL + TurnPhase | plugins + trajectory |
+| AE10 Extend | **SDK embed** + MCP discovery/DCR | **plugin gravity** |
 
 ---
 
@@ -45,8 +45,8 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
 | Metric | EdgeCrab | Hermes |
 |--------|----------|--------|
 | Loop entry | `conversation.rs:364` `execute_loop` | `conversation_loop.run_conversation` |
-| Loop LOC | **8051** | **5562** (+ run_agent 6247) |
-| Prologue | **39** LOC stub | **623** LOC real |
+| Loop LOC | **8194** | **5562** (+ run_agent 6247) |
+| Prologue | **139** LOC (`turn_prologue.rs`) | **623** LOC real |
 | Epilogue | 734 LOC | 546 LOC |
 | FailoverReason | **21** / failover.rs 854 | **23** / classifier 1621 |
 | Hard-stop default | **ON** | **OFF** |
@@ -55,7 +55,7 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
 | Platforms | **17** adapters | **20** plugin platforms + specialties |
 | Slash commands | **88** | **82** |
 | parent_session_id | **yes** | **yes** |
-| MCP OAuth | multi-grant OAuthConfig | OAuth manager depth |
+| MCP OAuth | discovery + DCR + multi-grant OAuthConfig | OAuth manager depth |
 | Client surfaces | ratatui + multi-SDK | CLI + Ink + desktop + web |
 
 ---
@@ -78,24 +78,20 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
 | [011](011-master-gap-matrix.md) | All-lens matrix | Synthesis |
 | [012](012-borrow-reject-priority.md) | P0–P3 plan | Action |
 | [013](013-cross-ref-index.md) | Anchors | Nav |
+| **[014](014-improvement-plan.md)** | **Improvement plan + assessment** | **✅ MCP URL/OAuth · multi-tool · harness wave-2** |
+| [015](015-grok-build-tui-code-display.md) | Grok Build vs EC code-edit display | TUI ref |
+| [016](016-tui-edit-display-plan.md) | Edit hunks plan (A–C landed) | TUI |
 | [017](017-session-forensics-2026-07-19.md) | Day forensics (pinguin/hyperframe) | Evidence |
 | [018](018-non-flaky-harness-best-practices-2026-07.md) | Non-flaky practices | Research |
 | [019](019-non-flaky-harness-improvement-plan.md) | Waves A–D latches (shipped plumbing) | Plan |
-| [015](015-grok-build-tui-code-display.md) | Grok Build vs EC code-edit display | TUI ref |
-| [016](016-tui-edit-display-plan.md) | Edit hunks plan (A–C landed) | TUI |
+| [020](020-grok-xai-oauth-agent-plan.md) | Grok/xAI OAuth agent plan | SuperGrok · edgequake-llm · TUI · e2e |
 | [021](021-chess-verification-forensics-and-plan-2026-07-19.md) | SuperGrok 3D chess verify RCA | Evidence |
 | [022](022-session-roadblock-4f94111e-harness-deadlock.md) | Harness deadlock RCA + Heal SM | Harness |
 | [023](023-first-principles-browser-localhost-2026-07-19.md) | Browser localhost / CDP / proxy | Browser |
 | [024](024-tui-stream-ux-from-grok-build.md) | TUI stream UX: thinking · tools · files | W1–W3 + light W4 landed |
 | [025](025-harness-balance-reopen-cap-2026-07-20.md) | **Harness balance: reopen cap · prebuilt latch** | **Shipped 2026-07-20** |
-| [026](026-tui-polish-density-follow-blocks.md) | **TUI polish: density · follow · typed blocks** | **Active plan** |
-| **[014](014-improvement-plan.md)** | **Improvement plan + assessment** | **✅ MCP URL/OAuth · multi-tool · harness wave-2** |
-| **[015](015-grok-build-tui-code-display.md)** | **Grok Build TUI analysis** | Code edit/update display first principles |
-| **[016](016-tui-edit-display-plan.md)** | **TUI edit display plan** | DRY/SOLID borrow plan from Grok Build |
-| **[017](017-session-forensics-2026-07-19.md)** | **Live session forensics** | Pinguin + Hyperframe thrash · AC-V1…V8 |
-| **[018](018-non-flaky-harness-best-practices-2026-07.md)** | **Non-flaky harness practices** | July 2026 SOTA · sessions · code · BP-01…17 |
-| **[019](019-non-flaky-harness-improvement-plan.md)** | **Non-flaky harness plan** | DRY/SOLID · e2e · no flaky heuristics · Waves A–D |
-| **[020](020-grok-xai-oauth-agent-plan.md)** | **Grok/xAI OAuth agent plan** | SuperGrok OAuth · edgequake-llm path · TUI · e2e |
+| [026](026-tui-polish-density-follow-blocks.md) | **TUI polish: density · follow · typed blocks** | **Shipped** |
+| **[027](027-agent-engineering-roadmap-2026-07.md)** | **Agent engineering roadmap (AE1–AE10)** | **✅ Waves 0–5 implemented** |
 
 ---
 
@@ -103,13 +99,13 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
 
 | Audience | Path |
 |----------|------|
-| **Engineer** | 000 → 003 → **014** → 012 |
-| **Implementer (MCP / multi-tool)** | **014** (primary) · [specs/mcp/](../mcp/) |
+| **Engineer** | 000 → 003 → **027** → **014** → 012 |
+| **Implementer (MCP / multi-tool)** | **014** · [specs/mcp/](../mcp/) (Current State: URL OAuth + DCR shipped) |
 | **TUI / code-edit UX** | **015** → **016** → **024** → **026** · `stream_presentation.rs` / `presentation/` |
-| **Harness / visual_ux thrash** | **017** → **018** → **019** · `harness_gates.rs` · `completion_assessor.rs` |
+| **Harness / visual_ux thrash** | **017** → **018** → **019** → **025** · `harness_gates.rs` · `completion_assessor.rs` |
 | **PM / exec** | 000 skim → 001 → 004 → 011 → 014 |
 | **Platform** | 000 → 002 → 007 → 009 → 014 WS-A |
-| **Full** | 000…020 |
+| **Full** | 000…027 + [specs/mcp/](../mcp/) |
 
 ---
 
@@ -123,6 +119,8 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
   Strategy = selective BORROW of residual gaps — not feature parity.
   Several prior “EC missing X” claims were FALSE (failover, spill maturity,
   parent_session_id, learning reflection, MCP OAuth grants, parallel tools).
+  027 Waves 0–5 landed: CI tiers, MCP isolation/discovery, replay e2e,
+  TurnPhase, tool contracts, gateway drain.
 ```
 
 ---
@@ -135,7 +133,7 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
 | EC spill thin | 913 LOC + turn budget + blind-write block |
 | EC no parent_session_id | column in session_db |
 | EC no learning reflection | bg `run_learning_reflection` |
-| EC MCP bearer-only | multi-grant OAuthConfig |
+| EC MCP bearer-only | multi-grant OAuthConfig + discovery/DCR |
 | EC no parallel tools | JoinSet path in process_response |
 
 Full errata: [000 §13](000-code-is-law.md).

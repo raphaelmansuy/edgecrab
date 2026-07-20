@@ -7,6 +7,49 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-07-20
+
+### Added
+
+- **MCP URL OAuth control plane** — RFC 9728 Protected Resource Metadata + RFC 8414 / OIDC AS discovery and Dynamic Client Registration (RFC 7591) in `edgecrab-tools/src/mcp_auth/`; session-isolated MCP pool with OAuth refresh; CLI `edgecrab mcp add … --auth oauth` and TUI `/mcp add` URL wizard (`mcp_add_tui.rs`); e2e coverage (`mcp_oauth_discover_e2e`, `mcp_agent_visibility_e2e`).
+- **Deterministic harness replay** — fixture-driven `harness_replay_e2e` (NF-E10–E12: content heal, exact-fingerprint escalate, prebuilt latch done) under `crates/edgecrab-core/tests/fixtures/harness_replay/`.
+- **Typed `TurnPhase` observability** — `turn_phase.rs` with OTEL wiring for ReAct loop phases.
+- **Gateway graceful drain** — `DrainController` (`drain.rs`) coordinated with circuit breaker and delivery paths.
+- **Tool contracts** — schema validation, per-tool deadlines, `SideEffect`, and `CapabilityGrants` on the registry.
+- **Non-flaky harness waves** — Document Done latch, create-evidence, reopen cap / prebuilt latch (specs 017–019, 025); minimum-context core profile; loop epilogue / failover / replay gates.
+- **Skills hub** — marketplace TUI browse with per-source catalog paging; guard trust TUI; unified skills module.
+- **Kanban / fleet ops** — Hermes-parity profiles, guards, handoff, and dashboard.
+- **Local LLM harness** — tool-call pipeline hardening and provider-aware UX; SuperGrok / browser diagnostics for visual verify.
+- **TUI stream polish** — follow mode, edit syntax highlighting, density / typed blocks (specs 024 / 026); activity shelf thinking + edit ledger; foreground tool live output.
+
+### Changed
+
+- **Conversation loop modularization** — tool batch, turn prologue, and stream observability extracted; conversation still the ReAct entry (~8194 LOC).
+- **Activity shelf / stream presentation** — denser thinking/tool/file rendering via `stream_presentation.rs` and `presentation/`.
+- **CI offline gates** — heuristic checker + `harness_nonflaky` + MCP e2e in `ci.yml` / `harness-benchmark.yml`.
+- **`edgequake-llm` v0.10.2** — pinned from crates.io (drops local path dependency).
+- **npm release publishing** — OIDC trusted publishing (drop `NPM_TOKEN`).
+
+### Fixed
+
+- **LM Studio local harness** — flat patch schema fixes GEN=0 stalls.
+- **Harness thrash** — heal state machine, balance reopen cap, and related visual_ux / geometry e2e hardening.
+- **Test isolation** — web_search e2e `registry_guard` isolates `EDGECRAB_HOME`; Docker Alpine tmp share uses shell (no python3); gateway history isolation ignores LLM-wait status; preview port grounding tolerates grant URLs.
+
+### Documentation
+
+- Specs: `027-agent-engineering-roadmap-2026-07.md` (Waves 0–5); 022 gap README refreshed; MCP OAuth Current State in `specs/mcp/`.
+- Product README restored; MCP OAuth notes in site configuration guide.
+- Release notes mirrored to `site/src/content/docs/changelog.md`.
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `./scripts/release-version.sh check` | **passed** (0.10.0 pre-bump) |
+| `cargo clippy --workspace -- -D warnings` | **passed** |
+| `cargo test --workspace -- --test-threads=1` | **4555 passed**, 0 failed, 57 ignored |
+
 ## [0.10.0] — 2026-06-13
 
 ### Added

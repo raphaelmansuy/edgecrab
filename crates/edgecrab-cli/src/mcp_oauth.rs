@@ -110,11 +110,12 @@ where
         login_with_authorization_code(server_name, oauth, &client, &mut notify).await?
     } else if oauth.device_authorization_url().is_some() {
         login_with_device_code(server_name, oauth, &client, &mut notify).await?
-    } else if oauth.authorization_url().is_some() && oauth.redirect_url().is_some() {
+    } else if oauth.authorization_url().is_some() {
+        // redirect_url defaults to loopback when omitted (discovery / URL-only add)
         login_with_authorization_code(server_name, oauth, &client, &mut notify).await?
     } else {
         bail!(
-            "MCP server '{server_name}' does not expose an interactive OAuth flow. Configure `oauth.device_authorization_url` for device flow or `oauth.authorization_url` + `oauth.redirect_url` for browser login."
+            "MCP server '{server_name}' does not expose an interactive OAuth flow. Configure `oauth.device_authorization_url` for device flow or `oauth.authorization_url` for browser login."
         );
     };
 
@@ -246,9 +247,11 @@ where
     let authorization_url = oauth
         .authorization_url()
         .ok_or_else(|| anyhow!("MCP server '{server_name}' is missing oauth.authorization_url"))?;
+    // Default loopback redirect when discovery omitted an explicit value.
     let redirect_url = oauth
         .redirect_url()
-        .ok_or_else(|| anyhow!("MCP server '{server_name}' is missing oauth.redirect_url"))?;
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(edgecrab_tools::mcp_auth::DEFAULT_MCP_REDIRECT_URL);
     let callback = LoopbackCallback::bind(redirect_url)
         .await
         .with_context(|| format!("redirect_url is invalid for '{server_name}'"))?;
@@ -256,6 +259,9 @@ where
 
     let state = random_urlsafe(24);
     let code_verifier = oauth.uses_pkce().then(|| random_urlsafe(48));
+    // RFC 9207: record expected issuer before redirecting the user-agent.
+    let expected_issuer = oauth.issuer().map(str::to_string);
+    let require_iss = oauth.iss_parameter_supported();
     let auth_url = build_authorization_url(
         authorization_url,
         oauth,
@@ -302,6 +308,13 @@ where
         bail!("OAuth callback state mismatch for '{server_name}'");
     }
 
+    validate_authorization_response_iss(
+        server_name,
+        expected_issuer.as_deref(),
+        require_iss,
+        payload.values.get("iss").map(String::as_str),
+    )?;
+
     let code = payload
         .values
         .get("code")
@@ -331,6 +344,33 @@ where
     parse_token_response(response).await.with_context(|| {
         format!("authorization code token response was invalid for '{server_name}'")
     })
+}
+
+/// RFC 9207 issuer validation for authorization responses.
+fn validate_authorization_response_iss(
+    server_name: &str,
+    expected_issuer: Option<&str>,
+    require_iss: bool,
+    returned_iss: Option<&str>,
+) -> anyhow::Result<()> {
+    match (expected_issuer, returned_iss, require_iss) {
+        (Some(expected), Some(got), _) => {
+            let expected = expected.trim_end_matches('/');
+            let got = got.trim_end_matches('/');
+            if expected != got {
+                bail!(
+                    "OAuth issuer mismatch for '{server_name}': expected '{expected}', got '{got}'"
+                );
+            }
+            Ok(())
+        }
+        (Some(_), None, true) => {
+            bail!("OAuth callback for '{server_name}' omitted required iss parameter (RFC 9207)")
+        }
+        (Some(_), None, false) => Ok(()), // AS does not advertise iss support yet
+        (None, Some(_), _) => Ok(()),     // no recorded issuer — cannot validate
+        (None, None, _) => Ok(()),
+    }
 }
 
 fn build_authorization_request_params(oauth: &OAuthConfig) -> Vec<(String, String)> {
@@ -805,6 +845,41 @@ mod tests {
         assert!(!challenge.contains('+'));
         assert!(!challenge.contains('/'));
         assert!(!challenge.contains('='));
+    }
+
+    #[test]
+    fn iss_validation_accepts_matching_issuer() {
+        validate_authorization_response_iss(
+            "srv",
+            Some("https://auth.example.com"),
+            true,
+            Some("https://auth.example.com/"),
+        )
+        .expect("match");
+    }
+
+    #[test]
+    fn iss_validation_rejects_mismatch() {
+        let err = validate_authorization_response_iss(
+            "srv",
+            Some("https://auth.example.com"),
+            true,
+            Some("https://evil.example"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("issuer mismatch"), "{err}");
+    }
+
+    #[test]
+    fn iss_validation_requires_iss_when_advertised() {
+        let err = validate_authorization_response_iss(
+            "srv",
+            Some("https://auth.example.com"),
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("omitted required iss"), "{err}");
     }
 
     #[test]

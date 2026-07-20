@@ -176,6 +176,61 @@ impl App {
         frame.render_widget(Paragraph::new(help), chunks[2]);
     }
 
+    pub(super) fn render_mcp_add_tui(&self, frame: &mut Frame, area: Rect) {
+        use crate::mcp_add_tui::MCP_ADD_ACCENT;
+        use crate::overlay_layout::popup_rect;
+        use ratatui::layout::{Constraint, Direction, Layout};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+        let popup_w = area.width.saturating_sub(6).clamp(56, 104);
+        let popup_h = area.height.saturating_sub(2).clamp(18, 34);
+        let popup = popup_rect(area, popup_w, popup_h);
+        frame.render_widget(Clear, popup);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(1),
+            ])
+            .split(popup);
+
+        let setup = &self.mcp_add;
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    setup.title(),
+                    Style::default()
+                        .fg(MCP_ADD_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", setup.subtitle()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MCP_ADD_ACCENT)),
+            ),
+            chunks[0],
+        );
+
+        frame.render_widget(
+            Paragraph::new(setup.body_lines(chunks[1].width))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                        .border_style(Style::default().fg(MCP_ADD_ACCENT)),
+                ),
+            chunks[1],
+        );
+        frame.render_widget(Paragraph::new(setup.help_line()), chunks[2]);
+    }
+
     pub(super) fn render_proxy_setup_tui(&self, frame: &mut Frame, area: Rect) {
         use crate::proxy_setup_tui::ProxySetupScreen;
         use ratatui::widgets::{Block, Borders, List, Paragraph, Wrap};

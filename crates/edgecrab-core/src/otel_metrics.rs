@@ -16,6 +16,7 @@ struct HarnessMetrics {
     tool_duration_ms: Histogram<f64>,
     tool_errors: Counter<u64>,
     harness_turns: Counter<u64>,
+    turn_phase_transitions: Counter<u64>,
 }
 
 /// Whether OTLP metrics instruments are active in this process.
@@ -54,6 +55,11 @@ pub fn install(meter_provider: &SdkMeterProvider, _service_name: &str) {
             .u64_counter("edgecrab.harness.turns")
             .with_description("Completed agent conversation turns")
             .with_unit("{turn}")
+            .build(),
+        turn_phase_transitions: meter
+            .u64_counter("edgecrab.turn.phase.transitions")
+            .with_description("Agent turn lifecycle phase transitions")
+            .with_unit("{transition}")
             .build(),
     };
     let _ = METRICS.set(Some(metrics));
@@ -127,6 +133,18 @@ pub fn record_harness_turn(platform: &str, decision: &str, harness_blocked: bool
         KeyValue::new("edgecrab.harness_blocked", harness_blocked),
     ];
     metrics.harness_turns.add(1, &attrs);
+}
+
+/// Record a typed turn lifecycle transition (no-op when OTLP metrics are inactive).
+pub fn record_turn_phase_transition(from: &str, to: &str) {
+    let Some(metrics) = METRICS.get().and_then(|m| m.as_ref()) else {
+        return;
+    };
+    let attrs = [
+        KeyValue::new("edgecrab.turn.phase.from", from.to_string()),
+        KeyValue::new("edgecrab.turn.phase.to", to.to_string()),
+    ];
+    metrics.turn_phase_transitions.add(1, &attrs);
 }
 
 #[cfg(test)]

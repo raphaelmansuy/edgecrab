@@ -2271,6 +2271,11 @@ fn normalize_browser_nav_url(url: &str) -> String {
         return t.to_string();
     }
     let lower = t.to_ascii_lowercase();
+    // Preserve explicit schemes (`file://`, `javascript:`, …) so SSRF validation
+    // can reject them. Do not rewrite into `https://file://…`.
+    if lower.contains("://") || lower.starts_with("javascript:") || lower.starts_with("data:") {
+        return t.to_string();
+    }
     if lower.starts_with("127.0.0.1")
         || lower.starts_with("localhost")
         || lower.starts_with("[::1]")
@@ -4683,6 +4688,18 @@ mod tests {
         assert_eq!(
             normalize_browser_nav_url("http://127.0.0.1:8000/"),
             "http://127.0.0.1:8000/"
+        );
+    }
+
+    #[test]
+    fn normalize_browser_nav_url_preserves_disallowed_schemes() {
+        assert_eq!(
+            normalize_browser_nav_url("file:///etc/passwd"),
+            "file:///etc/passwd"
+        );
+        assert_eq!(
+            normalize_browser_nav_url("javascript:alert(1)"),
+            "javascript:alert(1)"
         );
     }
 

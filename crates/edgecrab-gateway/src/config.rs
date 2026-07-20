@@ -95,6 +95,12 @@ pub struct GatewayConfig {
     /// How to handle a second user message that arrives while the agent is
     /// already processing a prior message for the same session.
     pub second_message_mode: SecondMessageMode,
+    /// Consecutive platform delivery failures before the circuit opens.
+    pub circuit_breaker_failure_threshold: u32,
+    /// Maximum time to wait for in-flight sessions during graceful drain.
+    pub drain_timeout_secs: u64,
+    /// Least-privilege grants applied to gateway-created agent sessions.
+    pub capability_grants: edgecrab_tools::CapabilityGrants,
 }
 
 /// Governs how a second incoming message is handled when the agent is already
@@ -127,6 +133,13 @@ impl Default for GatewayConfig {
             unauthorized_dm_behavior: UnauthorizedDmBehavior::default(),
             streaming: GatewayStreamingConfig::default(),
             second_message_mode: SecondMessageMode::default(),
+            circuit_breaker_failure_threshold: 5,
+            drain_timeout_secs: 30,
+            capability_grants: edgecrab_tools::CapabilityGrants {
+                file: false,
+                net: true,
+                mcp: false,
+            },
         }
     }
 }
@@ -145,6 +158,10 @@ impl GatewayConfig {
     /// Bind address as "host:port".
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    pub fn drain_timeout(&self) -> Duration {
+        Duration::from_secs(self.drain_timeout_secs)
     }
 }
 

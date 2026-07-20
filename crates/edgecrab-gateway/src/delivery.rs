@@ -63,60 +63,78 @@ impl DeliveryRouter {
             anyhow::bail!("platform circuit breaker open for {platform:?}");
         }
 
-        let adapter = self
-            .adapters
-            .get(&platform)
-            .ok_or_else(|| anyhow::anyhow!("No adapter registered for {:?}", platform))?;
+        let result = async {
+            let adapter = self
+                .adapters
+                .get(&platform)
+                .ok_or_else(|| anyhow::anyhow!("No adapter registered for {:?}", platform))?;
 
-        let (cleaned, media_refs) = extract_media_from_response(response);
+            let (cleaned, media_refs) = extract_media_from_response(response);
 
-        // Send text portion (skip if the response was entirely media)
-        if let Some(text) = response_text_after_media_extraction(response, &cleaned, &media_refs) {
-            let formatted = adapter.format_response(&text, metadata);
-            let max_len = adapter.max_message_length();
+            // Send text portion (skip if the response was entirely media)
+            if let Some(text) =
+                response_text_after_media_extraction(response, &cleaned, &media_refs)
+            {
+                let formatted = adapter.format_response(&text, metadata);
+                let max_len = adapter.max_message_length();
 
-            if formatted.len() > max_len {
-                let chunks = split_message(&formatted, max_len);
-                for (i, chunk) in chunks.iter().enumerate() {
+                if formatted.len() > max_len {
+                    let chunks = split_message(&formatted, max_len);
+                    for (i, chunk) in chunks.iter().enumerate() {
+                        adapter
+                            .send(OutgoingMessage {
+                                text: chunk.clone(),
+                                metadata: metadata.clone(),
+                            })
+                            .await?;
+                        if i < chunks.len() - 1 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                } else {
                     adapter
                         .send(OutgoingMessage {
-                            text: chunk.clone(),
+                            text: formatted,
                             metadata: metadata.clone(),
                         })
                         .await?;
-                    if i < chunks.len() - 1 {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
                 }
-            } else {
-                adapter
-                    .send(OutgoingMessage {
-                        text: formatted,
-                        metadata: metadata.clone(),
-                    })
-                    .await?;
+            }
+
+            // Send media attachments
+            for mref in &media_refs {
+                let result = if mref.is_image {
+                    adapter.send_photo(&mref.path, None, metadata).await
+                } else if MediaRef::detect_audio(&mref.path) {
+                    adapter.send_voice(&mref.path, None, metadata).await
+                } else {
+                    adapter.send_document(&mref.path, None, metadata).await
+                };
+                if let Err(e) = result {
+                    tracing::warn!(
+                        path = %mref.path,
+                        error = %e,
+                        "media delivery failed — falling back to path in text"
+                    );
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                crate::circuit_breaker::PlatformCircuitBreaker::global()
+                    .record_success(&platform_key);
+                Ok(())
+            }
+            Err(error) => {
+                crate::circuit_breaker::PlatformCircuitBreaker::global()
+                    .record_failure(&platform_key);
+                Err(error)
             }
         }
-
-        // Send media attachments
-        for mref in &media_refs {
-            let result = if mref.is_image {
-                adapter.send_photo(&mref.path, None, metadata).await
-            } else if MediaRef::detect_audio(&mref.path) {
-                adapter.send_voice(&mref.path, None, metadata).await
-            } else {
-                adapter.send_document(&mref.path, None, metadata).await
-            };
-            if let Err(e) = result {
-                tracing::warn!(
-                    path = %mref.path,
-                    error = %e,
-                    "media delivery failed — falling back to path in text"
-                );
-            }
-        }
-
-        Ok(())
     }
 
     /// Check if a platform adapter is registered.

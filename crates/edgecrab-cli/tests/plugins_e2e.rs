@@ -902,7 +902,12 @@ fn real_hermes_optional_skill_installs_from_local_repo_dir() {
 
     let install_out = run_edgecrab(
         home.path(),
-        &["plugins", "install", skill_dir.to_str().expect("utf8 path")],
+        &[
+            "plugins",
+            "install",
+            "--force",
+            skill_dir.to_str().expect("utf8 path"),
+        ],
     );
     assert!(install_out.contains("Plugin '1password' installed and enabled."));
 
@@ -925,6 +930,7 @@ async fn real_evey_telemetry_plugin_installs_and_runs_end_to_end() {
         &[
             "plugins",
             "install",
+            "--force",
             plugin_dir.to_str().expect("utf8 path"),
         ],
     );
@@ -973,6 +979,7 @@ async fn real_evey_status_plugin_installs_and_runs_end_to_end() {
         &[
             "plugins",
             "install",
+            "--force",
             plugin_dir.to_str().expect("utf8 path"),
         ],
     );

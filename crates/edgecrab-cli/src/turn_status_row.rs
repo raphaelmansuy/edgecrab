@@ -123,10 +123,7 @@ pub fn render_turn_status(frame: &mut Frame, area: Rect, params: &TurnStatusPara
         Span::styled(right, Style::default().fg(dim).add_modifier(Modifier::DIM)),
     ]);
 
-    frame.render_widget(
-        Paragraph::new(line).alignment(Alignment::Left),
-        area,
-    );
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
 }
 
 fn truncate_to_width(s: &str, max: usize) -> String {

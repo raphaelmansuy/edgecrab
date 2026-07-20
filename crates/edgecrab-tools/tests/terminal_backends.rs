@@ -561,6 +561,7 @@ fn make_ctx(dir: &Path) -> ToolContext {
         config: AppConfigRef::default(),
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: None,
         tool_registry: None,

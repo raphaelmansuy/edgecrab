@@ -168,6 +168,10 @@ pub const INDEXED_HOT_TOOLS: &[&str] = &[
     "patch",
     "search_files",
     "terminal",
+    // MCP meta tools stay hot so agents can discover remote servers without
+    // an extra tool_search hop (Claude Code / Hermes operator expectation).
+    "mcp_list_tools",
+    "mcp_call_tool",
 ];
 
 /// Multi-agent kanban board — opt-in via `kanban.enabled` + `enabled_toolsets: ["kanban"]`.
@@ -355,6 +359,19 @@ pub fn contains_all_sentinel(names: &[String]) -> bool {
         .any(|n| n == "all" || resolve_alias(n) == Some(&[]))
 }
 
+/// Whether `toolset` is covered by an enabled/disabled candidate list.
+///
+/// Dynamic MCP tools use per-server toolsets (`mcp-github`, `mcp-GPS`). When
+/// the meta toolset `"mcp"` is enabled (via `core` or explicitly), those
+/// per-server toolsets are included — matching Claude Code / Hermes “MCP on
+/// ⇒ server tools available” operator expectation.
+pub fn toolset_covered_by(candidates: &[String], toolset: &str) -> bool {
+    candidates.iter().any(|candidate| {
+        candidate == toolset
+            || (candidate == "mcp" && (toolset == "mcp" || toolset.starts_with("mcp-")))
+    })
+}
+
 /// Whether a toolset is reachable under the current whitelist/blacklist policy.
 pub fn toolset_enabled(
     enabled: Option<&[String]>,
@@ -364,15 +381,10 @@ pub fn toolset_enabled(
     let allowed = enabled.is_none_or(|sets| {
         sets.is_empty()
             || contains_all_sentinel(sets)
-            || expand_toolset_names(sets)
-                .iter()
-                .any(|candidate| candidate == toolset)
+            || toolset_covered_by(&expand_toolset_names(sets), toolset)
     });
-    let blocked = disabled.is_some_and(|sets| {
-        expand_toolset_names(sets)
-            .iter()
-            .any(|candidate| candidate == toolset)
-    });
+    let blocked =
+        disabled.is_some_and(|sets| toolset_covered_by(&expand_toolset_names(sets), toolset));
     allowed && !blocked
 }
 
@@ -916,8 +928,8 @@ mod tests {
     }
 
     #[test]
-    fn indexed_hot_tools_is_five_without_tool_search() {
-        assert_eq!(INDEXED_HOT_TOOLS.len(), 5);
+    fn indexed_hot_tools_keeps_mcp_meta_without_tool_search() {
+        assert_eq!(INDEXED_HOT_TOOLS.len(), 7);
         assert!(!INDEXED_HOT_TOOLS.contains(&"tool_search"));
         assert_eq!(
             INDEXED_HOT_TOOLS,
@@ -927,8 +939,34 @@ mod tests {
                 "patch",
                 "search_files",
                 "terminal",
+                "mcp_list_tools",
+                "mcp_call_tool",
             ]
         );
         assert!(!INDEXED_HOT_TOOLS.contains(&"web_search"));
+    }
+
+    #[test]
+    fn toolset_covered_by_includes_per_server_mcp_when_mcp_enabled() {
+        let candidates = vec!["file".into(), "mcp".into(), "terminal".into()];
+        assert!(toolset_covered_by(&candidates, "mcp"));
+        assert!(toolset_covered_by(&candidates, "mcp-GPS"));
+        assert!(toolset_covered_by(&candidates, "mcp-github"));
+        assert!(!toolset_covered_by(&candidates, "moa"));
+    }
+
+    #[test]
+    fn toolset_enabled_core_alias_exposes_dynamic_mcp_toolsets() {
+        let enabled = vec!["core".to_string()];
+        assert!(toolset_enabled(Some(&enabled), None, "mcp"));
+        assert!(
+            toolset_enabled(Some(&enabled), None, "mcp-GPS"),
+            "core → mcp must cover per-server dynamic toolsets"
+        );
+        assert!(!toolset_enabled(
+            Some(&enabled),
+            Some(&["mcp".to_string()]),
+            "mcp-GPS"
+        ));
     }
 }

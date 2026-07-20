@@ -277,6 +277,13 @@ async fn forward_stream_event_to_tui(
                 response_tx,
             });
         }
+        StreamEvent::McpOAuthRequired { server_name } => {
+            tracing::info!(
+                server = %server_name,
+                "TUI→agent: MCP OAuth required — opening login UX"
+            );
+            let _ = tx.send(AgentResponse::McpOAuthRequired { server_name });
+        }
         StreamEvent::HookEvent {
             event,
             context_json,

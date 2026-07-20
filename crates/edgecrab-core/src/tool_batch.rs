@@ -1,16 +1,21 @@
 //! Multi-tool batch planning (spec 022/014 WS-B).
 //!
-//! DRY: sole owner of *which* tool calls run in parallel vs sequential.
-//! Execution (JoinSet, DispatchContext) stays in `conversation.rs` so this
-//! module stays free of loop coupling (SOLID S / D).
+//! DRY: sole owner of *which* tool calls run in parallel vs sequential and
+//! how parallel calls are spawned/capped. Conversation-specific dispatch
+//! context remains supplied by the caller.
 //!
 //! Policy source of truth for path overlap remains
 //! [`edgecrab_tools::ToolRegistry::can_parallelize_in_batch`].
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use edgecrab_tools::ToolRegistry;
 use edgecrab_types::ToolCall;
+use tokio::sync::Semaphore;
+use tokio::task::{JoinError, JoinSet};
 
 /// One planned call with stable index into the original batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +91,75 @@ pub fn parallel_max_workers(configured: Option<usize>, batch_len: usize) -> usiz
         .filter(|n| *n > 0);
     let cap = from_env.or(configured).unwrap_or(32);
     cap.max(1).min(batch_len.max(1))
+}
+
+/// Completed output from one parallel tool dispatch.
+#[derive(Debug)]
+pub struct ToolBatchTask<T> {
+    pub call: PlannedToolCall,
+    pub output: T,
+    pub duration_ms: u64,
+}
+
+/// A task can fail before dispatch only if its concurrency gate is closed.
+#[derive(Debug)]
+pub enum ToolBatchTaskOutcome<T> {
+    Completed(ToolBatchTask<T>),
+    ConcurrencyGateClosed(PlannedToolCall),
+}
+
+/// Spawn API used by the conversation loop.
+///
+/// The boxed future keeps this boundary independent of `DispatchContext`.
+pub trait ToolBatchDispatch<T> {
+    fn dispatch(
+        &mut self,
+        call: PlannedToolCall,
+        task: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
+    );
+}
+
+/// JoinSet-backed parallel dispatcher with a per-batch concurrency cap.
+pub struct JoinSetToolBatch<T> {
+    tasks: JoinSet<ToolBatchTaskOutcome<T>>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl<T: Send + 'static> JoinSetToolBatch<T> {
+    pub fn new(configured_workers: Option<usize>, batch_len: usize) -> Self {
+        let workers = parallel_max_workers(configured_workers, batch_len);
+        Self {
+            tasks: JoinSet::new(),
+            semaphore: Arc::new(Semaphore::new(workers)),
+        }
+    }
+
+    pub async fn join_next(&mut self) -> Option<Result<ToolBatchTaskOutcome<T>, JoinError>> {
+        self.tasks.join_next().await
+    }
+}
+
+impl<T: Send + 'static> ToolBatchDispatch<T> for JoinSetToolBatch<T> {
+    fn dispatch(
+        &mut self,
+        call: PlannedToolCall,
+        task: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
+    ) {
+        let semaphore = Arc::clone(&self.semaphore);
+        self.tasks.spawn(async move {
+            let _permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return ToolBatchTaskOutcome::ConcurrencyGateClosed(call),
+            };
+            let started = std::time::Instant::now();
+            let output = task.await;
+            ToolBatchTaskOutcome::Completed(ToolBatchTask {
+                call,
+                output,
+                duration_ms: started.elapsed().as_millis() as u64,
+            })
+        });
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +247,30 @@ mod tests {
         assert_eq!(parallel_max_workers(Some(0), 10), 1); // max(1)
         assert_eq!(parallel_max_workers(None, 3), 3); // default 32 min batch
         assert_eq!(parallel_max_workers(Some(100), 2), 2);
+    }
+
+    #[tokio::test]
+    async fn joinset_dispatch_preserves_call_identity() {
+        let call = PlannedToolCall {
+            index: 7,
+            id: "call-7".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+        };
+        let mut batch = JoinSetToolBatch::new(Some(1), 1);
+        batch.dispatch(call.clone(), Box::pin(async { "ok" }));
+
+        let outcome = batch
+            .join_next()
+            .await
+            .expect("one task")
+            .expect("task joins");
+        match outcome {
+            ToolBatchTaskOutcome::Completed(task) => {
+                assert_eq!(task.call, call);
+                assert_eq!(task.output, "ok");
+            }
+            ToolBatchTaskOutcome::ConcurrencyGateClosed(_) => panic!("gate unexpectedly closed"),
+        }
     }
 }

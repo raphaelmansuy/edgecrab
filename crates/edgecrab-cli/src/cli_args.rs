@@ -1008,7 +1008,7 @@ pub enum McpCommand {
     /// Add or update an MCP server (stdio command or HTTP URL + optional OAuth)
     ///
     /// Examples:
-    ///   edgecrab mcp add linear --url https://mcp.example.com/mcp --auth oauth
+    ///   edgecrab mcp add remote --url https://mcp.example.com/mcp --auth oauth
     ///   edgecrab mcp add acme --url https://mcp.example.com/mcp --auth bearer --token "$TOKEN"
     ///   edgecrab mcp add github --command npx --args -y @modelcontextprotocol/server-github
     ///   edgecrab mcp add github npx -y @modelcontextprotocol/server-github   (legacy)
@@ -1024,7 +1024,7 @@ pub enum McpCommand {
         /// Bearer access token (stored in mcp-tokens/, not yaml when possible)
         #[arg(long)]
         token: Option<String>,
-        /// OAuth token endpoint (recommended with --auth oauth)
+        /// OAuth token endpoint (optional when --discover can fill it)
         #[arg(long)]
         token_url: Option<String>,
         #[arg(long)]
@@ -1040,6 +1040,12 @@ pub enum McpCommand {
         /// OAuth scopes (repeatable)
         #[arg(long = "scope")]
         scopes: Vec<String>,
+        /// Force RFC 9728 / AS metadata discovery (+ DCR when needed)
+        #[arg(long, default_value_t = false)]
+        discover: bool,
+        /// Disable discovery even for --auth oauth / auto
+        #[arg(long, default_value_t = false)]
+        no_discover: bool,
         /// Allow loopback/private MCP URLs (still subject to SSRF policy helpers)
         #[arg(long, default_value_t = false)]
         allow_loopback: bool,

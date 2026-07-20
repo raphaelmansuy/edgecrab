@@ -76,11 +76,20 @@ EdgeCrab already has:
 - Slash commands: `/mcp`, `/reload-mcp`, `/mcp-token`.
 - CLI commands: `edgecrab mcp list|refresh|search|view|install|test|doctor|auth|login|add|remove`.
 
+URL-only OAuth add is implemented:
+
+- RFC 9728 Protected Resource Metadata + RFC 8414 / OIDC AS metadata discovery (`edgecrab_tools::mcp_auth`)
+- Dynamic Client Registration (RFC 7591) for public native clients
+- Resource Indicators (RFC 8707) + RFC 9207 `iss` validation on browser login
+- CLI: `edgecrab mcp add NAME --url … --auth oauth` (auto-discover when endpoints incomplete)
+- TUI: bare `/mcp add` opens the URL wizard; flagged `/mcp add …` shares the same control plane
+
 The remaining gaps are now narrower and mostly around breadth rather than control-plane depth:
 
 - Registry discovery is broader than install support. EdgeCrab currently auto-installs only streamable HTTP, npm stdio, and PyPI stdio registry entries; other registry transports remain view-only.
 - Browser-loopback OAuth depends on provider compatibility with standard loopback redirect behavior; EdgeCrab now supports fixed-port and dynamic-port loopback redirects, but cannot normalize every provider-specific deviation.
 - EdgeCrab still relies on the system browser instead of an embedded webview for consent screens.
+- Client ID Metadata Documents (CIMD) are not hosted yet; DCR covers AS that advertise `registration_endpoint`.
 
 ## Document Map
 
@@ -95,13 +104,14 @@ The remaining gaps are now narrower and mostly around breadth rather than contro
 
 ## Implementation Priorities
 
-Priority 1:
+Priority 1 (shipped — see Current State Summary):
 
-- Cross-platform `/mcp` TUI command parsing with quoting support.
-- Dedicated MCP doctor flow in CLI and TUI.
-- Dedicated MCP auth flow in CLI and TUI with explicit refresh-token next steps.
-- Interactive MCP OAuth login for device-code and browser-loopback authorization-code flows.
-- Dynamic loopback redirect handling so browser login does not depend on one hard-coded local port.
+- ~~Cross-platform `/mcp` TUI command parsing with quoting support.~~
+- ~~Dedicated MCP doctor flow in CLI and TUI.~~
+- ~~Dedicated MCP auth flow in CLI and TUI with explicit refresh-token next steps.~~
+- ~~Interactive MCP OAuth login for device-code and browser-loopback authorization-code flows.~~
+- ~~Dynamic loopback redirect handling so browser login does not depend on one hard-coded local port.~~
+- ~~URL-only OAuth discovery + DCR + TUI `/mcp add` wizard.~~
 
 Priority 2:
 

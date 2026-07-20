@@ -31,6 +31,8 @@ mod display_state;
 mod doctor;
 mod dump_cmd;
 mod edit_diff;
+mod edit_highlighter;
+mod follow_mode;
 mod fuzzy_selector;
 mod gantt_strip;
 mod gateway_browser;
@@ -45,6 +47,7 @@ mod live_progress;
 mod logging;
 mod logs_cmd;
 mod markdown_render;
+mod mcp_add_tui;
 mod mcp_catalog;
 mod mcp_oauth;
 mod mcp_register;
@@ -62,6 +65,7 @@ mod picker_chrome;
 mod plugin_toggle;
 mod plugins;
 mod plugins_cmd;
+mod presentation;
 mod process_tail_panel;
 mod profile;
 mod proxy_cmd;
@@ -85,9 +89,6 @@ mod status_chrome;
 mod status_cmd;
 mod status_indicator;
 mod status_summaries;
-mod edit_highlighter;
-mod follow_mode;
-mod presentation;
 mod stream_bridge;
 mod stream_dispatch_harness;
 mod stream_presentation;
@@ -1985,6 +1986,8 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
             authorization_url,
             redirect_url,
             scopes,
+            discover,
+            no_discover,
             allow_loopback,
             command,
             args,
@@ -1992,6 +1995,13 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
         } => {
             let auth_kind =
                 mcp_register::McpAuthKind::parse(&auth).map_err(|e| anyhow::anyhow!(e))?;
+            let discover_flag = if no_discover {
+                Some(false)
+            } else if discover {
+                Some(true)
+            } else {
+                None
+            };
             let req = mcp_register::RegisterMcpRequest::from_cli_parts(
                 name,
                 url,
@@ -2008,10 +2018,13 @@ async fn run_mcp(command: McpCommand, args: &CliArgs) -> anyhow::Result<()> {
                 redirect_url,
                 scopes,
                 allow_loopback,
+                discover_flag,
             )
             .map_err(|e| anyhow::anyhow!(e))?;
-            let result = mcp_register::register_mcp_server(&mut config, &runtime.config_path, req)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let result =
+                mcp_register::prepare_and_register_mcp_url(&mut config, &runtime.config_path, req)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
             println!("{}", mcp_register::format_register_summary(&result));
         }
         McpCommand::Remove { name } => {

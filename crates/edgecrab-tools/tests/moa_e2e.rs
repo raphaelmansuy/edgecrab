@@ -30,6 +30,7 @@ fn live_tool_context(provider: Arc<dyn edgequake_llm::LLMProvider>) -> ToolConte
         },
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: Some(provider),
         tool_registry: None,

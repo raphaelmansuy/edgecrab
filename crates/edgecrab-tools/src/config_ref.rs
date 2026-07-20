@@ -100,6 +100,11 @@ pub struct LspServerConfigRef {
 
 #[derive(Debug, Clone)]
 pub struct AppConfigRef {
+    /// Default deadline for one foreground tool invocation.
+    ///
+    /// A value of zero disables the registry deadline. Individual tools may
+    /// override this through `ToolHandler::timeout()`.
+    pub tool_timeout_secs: u64,
     /// Whether the gateway process is running (gates send_message)
     pub gateway_running: bool,
     /// Whether Honcho integration is active (gates honcho_* tools)
@@ -315,6 +320,7 @@ pub struct AppConfigRef {
 impl Default for AppConfigRef {
     fn default() -> Self {
         Self {
+            tool_timeout_secs: 120,
             gateway_running: false,
             honcho_active: false,
             home_assistant_active: false,

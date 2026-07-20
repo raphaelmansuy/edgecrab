@@ -81,9 +81,8 @@ fn write_auth_doc_unlocked(path: &Path, doc: &Value) -> Result<(), ProxyError> {
             ProxyError::UpstreamAuth(format!("create auth dir {}: {e}", parent.display()))
         })?;
     }
-    std::fs::write(path, bytes).map_err(|e| {
-        ProxyError::UpstreamAuth(format!("write auth file {}: {e}", path.display()))
-    })
+    std::fs::write(path, bytes)
+        .map_err(|e| ProxyError::UpstreamAuth(format!("write auth file {}: {e}", path.display())))
 }
 
 /// Persist the full auth document (under file lock).

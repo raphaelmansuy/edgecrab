@@ -40,6 +40,7 @@ pub mod macos_permissions;
 #[cfg(not(target_os = "macos"))]
 #[path = "macos_permissions_stub.rs"]
 pub mod macos_permissions;
+pub mod mcp_auth;
 pub mod mutation_turn_policy;
 pub mod mutations;
 pub mod path_utils;
@@ -111,9 +112,9 @@ pub use provider_factory::{build_copilot_provider, create_provider_for_model};
 pub use provider_tracing::{llm_tracing_enabled, wrap_provider_with_tracing};
 pub use recovery_catalog::tools_to_materialize_from_error_json;
 pub use registry::{
-    SubAgentResult, SubAgentRunner, ToolContext, ToolHandler, ToolProgressUpdate, ToolRegistry,
-    build_wire_llm_definitions, to_llm_definitions, to_llm_definitions_with_materialized,
-    to_llm_definitions_with_mode,
+    CapabilityGrants, SideEffect, SubAgentResult, SubAgentRunner, ToolContext, ToolHandler,
+    ToolProgressUpdate, ToolRegistry, build_wire_llm_definitions, to_llm_definitions,
+    to_llm_definitions_with_materialized, to_llm_definitions_with_mode,
 };
 pub use schema_mode::{
     ToolSchemaMode, compact_tool_schema, prepare_schemas_for_mode, resolve_effective_schema_mode,
@@ -189,6 +190,7 @@ pub use tools::web::{
 pub use toolsets::{
     CORE_TOOLS, HONCHO_TOOLS, INDEXED_HOT_TOOLS, LSP_TOOLS, MCP_EXTENDED_TOOLS, MOA_TOOLS,
     RESEARCH_EXTRA_TOOLS, acp_tools, is_acp_tool, resolve_active_toolsets, resolve_alias,
+    toolset_covered_by, toolset_enabled,
 };
 
 #[cfg(test)]
@@ -208,7 +210,10 @@ pub(crate) mod test_support {
 
     impl TestEdgecrabHome {
         pub(crate) fn new() -> Self {
-            let guard = EDGECRAB_HOME_LOCK.lock().expect("lock");
+            let guard = match EDGECRAB_HOME_LOCK.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             let dir = TempDir::new().expect("tempdir");
             let previous = std::env::var_os("EDGECRAB_HOME");
             // SAFETY: serialized by EDGECRAB_HOME_LOCK for the guard lifetime.

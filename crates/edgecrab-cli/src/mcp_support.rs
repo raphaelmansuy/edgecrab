@@ -308,6 +308,12 @@ pub async fn render_mcp_doctor_report(server_name: Option<&str>) -> Result<Strin
                     if result.tool_count == 0 {
                         report.status = report.status.max(McpDoctorStatus::Warn);
                         report.lines.push("probe: ok | visible-tools=0".to_string());
+                        if !server.include.is_empty() || !server.exclude.is_empty() {
+                            report.lines.push(
+                                "filters: hid all tools after successful connect — check tools.include / tools.exclude"
+                                    .into(),
+                            );
+                        }
                     } else {
                         report.lines.push(format!(
                             "probe: ok | transport={} | visible-tools={}",

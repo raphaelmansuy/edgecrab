@@ -308,6 +308,11 @@ mcp_servers:
     bearer_token: "my-static-token"
     headers:
       X-Custom-Header: "value"
+
+  # OAuth HTTP MCP — prefer URL discovery over hand-written endpoints:
+  #   edgecrab mcp add remote --url https://mcp.example.com/mcp --auth oauth
+  #   /mcp add   (TUI wizard — paste URL, same as SuperGrok sign-in flow)
+  # Discovery fills token_url, authorization_url, client_id (DCR), resource, scopes.
 ```
 
 Manage without editing YAML:
@@ -315,6 +320,8 @@ Manage without editing YAML:
 ```bash
 edgecrab mcp list
 edgecrab mcp add github npx -y @modelcontextprotocol/server-github
+edgecrab mcp add remote --url https://mcp.example.com/mcp --auth oauth
+edgecrab mcp login remote
 edgecrab mcp remove github
 ```
 

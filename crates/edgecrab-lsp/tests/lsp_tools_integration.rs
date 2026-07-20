@@ -34,6 +34,7 @@ fn make_ctx(workspace: &TempDir, home: &TempDir) -> ToolContext {
         config: edgecrab_tools::AppConfigRef::default(),
         state_db: None,
         platform: Platform::Cli,
+        capability_grants: None,
         process_table: None,
         provider: None,
         tool_registry: None,

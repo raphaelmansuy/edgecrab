@@ -14,7 +14,6 @@
 pub mod approval;
 pub mod command_scan;
 pub mod injection;
-pub mod threat_patterns;
 pub mod normalize;
 pub mod os_sandbox;
 pub mod path_jail;
@@ -22,6 +21,7 @@ pub mod path_policy;
 pub mod proxy;
 pub mod redact;
 pub mod secrets;
+pub mod threat_patterns;
 pub mod url_safety;
 pub mod url_validation;
 pub mod website_policy;

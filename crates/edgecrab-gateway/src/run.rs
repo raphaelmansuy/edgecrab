@@ -564,6 +564,8 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
     let provider = agent.provider_handle().await;
     let auxiliary = agent.auxiliary_config().await;
     let (_, stt, _) = agent.media_config().await;
+    let capability_grants = agent.capability_grants().await;
+    let net_allowed = capability_grants.is_none_or(|grants| grants.net);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let session_key = format!(
         "gateway-image-preanalysis-{}",
@@ -582,10 +584,18 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
 
     let mut effective_text = base_text;
     let mut analyses = Vec::new();
-    let mut failures = Vec::new();
+    let mut failures = if net_allowed {
+        Vec::new()
+    } else {
+        vec!["Image pre-analysis skipped: network capability is not granted.".to_string()]
+    };
     for (idx, source) in image_sources
         .iter()
-        .take(MAX_GATEWAY_EAGER_IMAGE_ANALYSES)
+        .take(if net_allowed {
+            MAX_GATEWAY_EAGER_IMAGE_ANALYSES
+        } else {
+            0
+        })
         .enumerate()
     {
         let ctx = ToolContext {
@@ -597,6 +607,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             config: config.clone(),
             state_db: None,
             platform: msg.platform,
+            capability_grants,
             process_table: None,
             provider: Some(provider.clone()),
             tool_registry: None,
@@ -652,10 +663,18 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
     }
 
     let mut transcripts = Vec::new();
-    let mut transcription_failures = Vec::new();
+    let mut transcription_failures = if net_allowed {
+        Vec::new()
+    } else {
+        vec!["Audio transcription skipped: network capability is not granted.".to_string()]
+    };
     for (idx, source) in audio_sources
         .iter()
-        .take(MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS)
+        .take(if net_allowed {
+            MAX_GATEWAY_EAGER_AUDIO_TRANSCRIPTS
+        } else {
+            0
+        })
         .enumerate()
     {
         let ctx = ToolContext {
@@ -667,6 +686,7 @@ async fn build_effective_text(agent: &Agent, msg: &IncomingMessage) -> String {
             config: config.clone(),
             state_db: None,
             platform: msg.platform,
+            capability_grants,
             process_table: None,
             provider: None,
             tool_registry: None,
@@ -977,6 +997,10 @@ async fn maybe_send_voice_reply(
     };
 
     let (tts, _, _) = agent.media_config().await;
+    let capability_grants = agent.capability_grants().await;
+    if capability_grants.is_some_and(|grants| !grants.net) {
+        return;
+    }
     let ctx = ToolContext {
         task_id: "gateway-auto-tts".into(),
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -996,6 +1020,7 @@ async fn maybe_send_voice_reply(
         },
         state_db: None,
         platform: msg.platform,
+        capability_grants,
         process_table: None,
         provider: None,
         tool_registry: None,
@@ -1132,15 +1157,9 @@ async fn maybe_discord_channel_backfill(
     };
 
     let exclude = msg.metadata.message_id.as_deref();
-    let seed = crate::backfill::prepare_seed(
-        &history,
-        exclude,
-        discord_cfg.backfill_max_tokens as usize,
-    );
-    let last_id = history
-        .last()
-        .map(|m| m.id.as_str())
-        .unwrap_or_default();
+    let seed =
+        crate::backfill::prepare_seed(&history, exclude, discord_cfg.backfill_max_tokens as usize);
+    let last_id = history.last().map(|m| m.id.as_str()).unwrap_or_default();
     if !seed.is_empty() {
         let seeded = seed.len();
         agent.seed_history(seed).await;
@@ -1269,6 +1288,8 @@ pub struct Gateway {
     /// removed when it exits.  Used by `SecondMessageMode::Steer` to inject
     /// live guidance into a running agent loop.
     steer_senders: Arc<tokio::sync::Mutex<HashMap<String, edgecrab_core::SteeringSender>>>,
+    /// Admission and in-flight accounting for graceful shutdown.
+    drain: crate::drain::DrainController,
 }
 
 impl Gateway {
@@ -1298,6 +1319,7 @@ impl Gateway {
             voice_mode_path: gateway_voice_mode_path(),
             pairing_store: Arc::new(PairingStore::new()),
             steer_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            drain: crate::drain::DrainController::new(),
         }
     }
 
@@ -1829,6 +1851,13 @@ impl Gateway {
     /// enters the message dispatch loop.
     pub async fn run(&self) -> anyhow::Result<()> {
         crate::clarify_wiring::install_interaction_broker(self.interaction_broker.clone());
+        crate::circuit_breaker::PlatformCircuitBreaker::global()
+            .set_threshold(self.config.circuit_breaker_failure_threshold);
+        if let Some(agent) = self.agent.as_ref() {
+            agent
+                .set_capability_grants(Some(self.config.capability_grants))
+                .await;
+        }
         let (tx, mut rx) = mpsc::channel::<IncomingMessage>(256);
         let mut delivery_router = DeliveryRouter::new();
 
@@ -2261,6 +2290,10 @@ impl Gateway {
         loop {
             tokio::select! {
                 Some(msg) = rx.recv() => {
+                    if self.cancel.is_cancelled() {
+                        self.drain.begin_drain();
+                        break;
+                    }
                     tracing::debug!(
                         platform = ?msg.platform,
                         user = %msg.user_id,
@@ -3753,6 +3786,13 @@ impl Gateway {
                         }
 
                         // No running task — register this one and dispatch.
+                        let drain_permit = match self.drain.try_start() {
+                            Some(permit) => permit,
+                            None => {
+                                tracing::debug!("gateway draining; rejecting new agent work");
+                                continue;
+                            }
+                        };
                         let task_cancel = CancellationToken::new();
                         {
                             let mut guard = self.running_sessions.lock().await;
@@ -3838,12 +3878,14 @@ impl Gateway {
                             steer_guard.insert(session_key.clone(), session_agent.steer_sender());
                         }
                         let steer_senders_for_task = self.steer_senders.clone();
+                        let drain_for_task = self.drain.clone();
 
                         // The token is registered in running_sessions; drop the local copy.
                         // /stop cancels the map-held token via running_sessions.remove().cancel().
                         drop(task_cancel);
 
                         tokio::spawn(async move {
+                            let _drain_permit = drain_permit;
                             let task_outcome = AssertUnwindSafe(async {
                                 // Resolve the origin chat_id: prefer channel_id (group/channel),
                                 // fall back to user_id (DM).  This is what deliver='origin' uses
@@ -4124,7 +4166,9 @@ impl Gateway {
                                 let mut p = pending_messages.lock().await;
                                 p.remove(&task_session_key)
                             };
-                            if let Some(queued_msg) = pending {
+                            if let Some(queued_msg) = pending
+                                && drain_for_task.is_accepting()
+                            {
                                 tracing::debug!(
                                     session = %task_session_key,
                                     "re-dispatching queued message after task completion"
@@ -4137,28 +4181,26 @@ impl Gateway {
                     }
                 }
                 _ = self.cancel.cancelled() => {
-                    tracing::info!("gateway shutting down");
+                    self.drain.begin_drain();
+                    tracing::info!("gateway draining");
                     break;
                 }
             }
         }
 
-        let session_cancels = {
-            let running = self.running_sessions.lock().await;
-            running.values().cloned().collect::<Vec<_>>()
-        };
-        for token in session_cancels {
-            token.cancel();
-        }
-        let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while tokio::time::Instant::now() < wait_deadline {
-            if self.running_sessions.lock().await.is_empty() {
-                break;
+        self.drain.begin_drain();
+        if !self.drain.wait_for_idle(self.config.drain_timeout()).await {
+            tracing::warn!(
+                in_flight = self.drain.in_flight(),
+                "gateway drain timed out; cancelling running sessions"
+            );
+            let session_cancels = {
+                let running = self.running_sessions.lock().await;
+                running.values().cloned().collect::<Vec<_>>()
+            };
+            for token in session_cancels {
+                token.cancel();
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        if !self.running_sessions.lock().await.is_empty() {
-            tracing::warn!("gateway shutdown timed out waiting for running sessions to drain");
         }
         self.session_manager.finalize_all().await;
         let _ = edgecrab_tools::tools::terminal::cleanup_all_backends().await;
@@ -4298,6 +4340,9 @@ async fn webhook_incoming(
 ) -> Json<serde_json::Value> {
     use crate::webhook::WebhookAdapter;
 
+    if state.cancel.is_cancelled() {
+        return Json(serde_json::json!({"status": "draining"}));
+    }
     let msg = WebhookAdapter::parse_incoming(&payload);
     match state.message_tx.send(msg).await {
         Ok(()) => Json(serde_json::json!({"status": "queued"})),
@@ -4454,6 +4499,12 @@ async fn webhook_subscription_incoming(
         },
     };
 
+    if state.cancel.is_cancelled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "draining"})),
+        );
+    }
     match state.message_tx.send(message).await {
         Ok(()) => (
             StatusCode::ACCEPTED,
@@ -5707,6 +5758,8 @@ def register(ctx):
                 port: 0,
                 streaming: crate::config::GatewayStreamingConfig {
                     enabled: false,
+                    // Isolation assertion cares about final replies, not LLM-wait status.
+                    tool_progress: false,
                     ..crate::config::GatewayStreamingConfig::default()
                 },
                 ..GatewayConfig::default()
@@ -5730,7 +5783,27 @@ def register(ctx):
         ));
 
         let task = tokio::spawn(async move { gateway.run().await });
-        let sent = adapter.wait_for_sent(4).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let sent = loop {
+            let current = adapter.wait_for_sent(1).await;
+            let has_alpha = current
+                .iter()
+                .any(|msg| msg.contains("current=alpha;prior_users=0;first_prior=-"));
+            let has_bravo = current
+                .iter()
+                .any(|msg| msg.contains("current=bravo;prior_users=0;first_prior=-"));
+            let has_again = current
+                .iter()
+                .any(|msg| msg.contains("current=again;prior_users=1;first_prior=alpha"));
+            if has_alpha && has_bravo && has_again {
+                break current;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for isolated history replies, sent: {current:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await

@@ -2150,6 +2150,7 @@ dependencies = [
  "edgecrab-types",
  "edgequake-llm",
  "futures",
+ "image",
  "insta",
  "mockall",
  "opentelemetry 0.27.1",
@@ -2501,6 +2502,7 @@ dependencies = [
  "strsim",
  "tar",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -2555,6 +2557,8 @@ dependencies = [
 [[package]]
 name = "edgequake-llm"
 version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91df30b5b1ccfe85d65df92235c3c05d1f03b1542c2c0d6a82ffd4ff4653def"
 dependencies = [
  "anyhow",
  "async-openai",

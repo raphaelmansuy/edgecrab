@@ -84,8 +84,10 @@ fn format_pending_interaction(view: &PendingInteractionView) -> String {
             } else {
                 reasons.join("; ")
             };
-            let is_preview =
-                matches!(kind, edgecrab_tools::registry::ApprovalKind::PreviewLoopback);
+            let is_preview = matches!(
+                kind,
+                edgecrab_tools::registry::ApprovalKind::PreviewLoopback
+            );
             if is_preview {
                 format!(
                     "⚠️ Preview access required [#{}]\nAllow browser_navigate to `{}`?\nReason: {}\n\nReply `/approve`, `/approve session`, `/approve always`, or `/deny`.\nYou can also reply with plain text like `approve session`.\n\nURL:\n```\n{}\n```",
@@ -670,6 +672,14 @@ impl GatewayEventProcessor {
                         );
                     }
                     let _ = response_tx.send(value);
+                }
+
+                StreamEvent::McpOAuthRequired { server_name } => {
+                    // Gateway cannot open a browser OAuth loopback; tell the operator.
+                    self.send_status(&format!(
+                        "🔐 MCP '{server_name}' needs OAuth. On a machine with EdgeCrab TUI/CLI run: `/mcp login {server_name}` (or `edgecrab mcp login {server_name}`), then retry."
+                    ))
+                    .await;
                 }
 
                 // Steering events are TUI-only — the gateway logs them but takes

@@ -1276,6 +1276,10 @@ pub struct ToolsConfig {
     pub tool_delay: f32,
     pub parallel_execution: bool,
     pub max_parallel_workers: usize,
+    /// Default deadline for one foreground tool invocation in seconds.
+    /// Set to zero to disable the registry-level deadline.
+    #[serde(default = "default_tool_timeout_secs")]
+    pub timeout_secs: u64,
     /// Gate for tool-result spill-to-artifact (default: true).
     pub result_spill: bool,
     /// Byte threshold above which tool results are spilled (default: 16384).
@@ -1296,6 +1300,10 @@ fn default_result_turn_budget_chars() -> usize {
     200_000
 }
 
+fn default_tool_timeout_secs() -> u64 {
+    120
+}
+
 fn default_max_materialized_tools() -> usize {
     edgecrab_tools::DEFAULT_MAX_MATERIALIZED_TOOLS
 }
@@ -1313,6 +1321,7 @@ impl Default for ToolsConfig {
             tool_delay: 1.0,
             parallel_execution: true,
             max_parallel_workers: 8,
+            timeout_secs: default_tool_timeout_secs(),
             result_spill: true,
             result_spill_threshold: 16_384,
             result_spill_preview_lines: 80,
@@ -1594,6 +1603,12 @@ pub struct GatewayConfig {
     pub enabled_platforms: Vec<String>,
     pub disabled_platforms: Vec<String>,
     pub session_timeout_minutes: u32,
+    /// Consecutive delivery failures before a platform circuit opens.
+    pub circuit_breaker_failure_threshold: u32,
+    /// Graceful shutdown drain timeout.
+    pub drain_timeout_secs: u64,
+    /// Least-privilege scopes granted to gateway principals.
+    pub capability_grants: edgecrab_tools::CapabilityGrants,
     /// Default group chat policy for platforms without an explicit override.
     pub group_policy: GroupPolicy,
     /// Behavior when an unauthorized user sends a direct message.
@@ -1614,6 +1629,13 @@ impl Default for GatewayConfig {
             enabled_platforms: Vec::new(),
             disabled_platforms: Vec::new(),
             session_timeout_minutes: 30,
+            circuit_breaker_failure_threshold: 5,
+            drain_timeout_secs: 30,
+            capability_grants: edgecrab_tools::CapabilityGrants {
+                file: false,
+                net: true,
+                mcp: false,
+            },
             group_policy: GroupPolicy::default(),
             unauthorized_dm_behavior: UnauthorizedDmBehavior::default(),
             telegram: TelegramGatewayConfig::default(),
@@ -1939,6 +1961,10 @@ pub struct McpOauthConfig {
     pub scopes: Vec<String>,
     pub audience: Option<String>,
     pub resource: Option<String>,
+    /// Authorization server issuer (RFC 9207 `iss` validation).
+    pub issuer: Option<String>,
+    /// When true, require `iss` on authorization responses (from AS metadata).
+    pub iss_parameter_supported: Option<bool>,
     pub refresh_token: Option<String>,
     pub authorization_params: HashMap<String, String>,
     pub extra_params: HashMap<String, String>,
@@ -3479,6 +3505,7 @@ observability:
         let path = dir.path().join("config.yaml");
         let mut config = AppConfig::default();
         config.security.preview.enabled = true;
+        config.security.preview.allow_any_loopback_port = false;
         config.security.preview.allow_localhost_ports = vec![8000];
         config.save_to(&path).expect("save");
 

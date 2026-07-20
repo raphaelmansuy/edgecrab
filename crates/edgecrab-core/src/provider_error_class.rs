@@ -96,6 +96,9 @@ pub fn classify_error_text(message: &str) -> ProviderErrorClass {
 }
 
 pub fn classify_error_with_session(message: &str, session: ClassifyContext) -> ProviderErrorClass {
+    if crate::copilot_agent_probe::is_copilot_model_not_supported_error(message) {
+        return ProviderErrorClass::ModelNotSupported;
+    }
     to_provider_error_class(&failover::classify_api_error(failover::ClassifyInput {
         raw_message: message,
         body_message: None,
