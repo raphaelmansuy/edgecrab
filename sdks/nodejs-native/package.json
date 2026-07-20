@@ -1,6 +1,6 @@
 {
   "name": "edgecrab",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Native Node.js SDK for the EdgeCrab AI agent runtime",
   "main": "index.js",
   "types": "index.d.ts",
