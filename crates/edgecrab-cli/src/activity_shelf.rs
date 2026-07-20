@@ -41,6 +41,8 @@ pub struct ShelfRenderParams<'a> {
     pub verbose_tools: bool,
     /// Session edit ledger caption (`files N  +X −Y`), when present.
     pub edit_ledger_caption: Option<&'a str>,
+    /// Tool-usage strip (`Exec N · Read N · Edit N`), when present (026 A4).
+    pub tool_usage_caption: Option<&'a str>,
     /// Truncated last-N-lines thinking body from StreamPresentation (multi-line peek).
     pub thinking_truncated: Option<&'a str>,
 }
@@ -137,7 +139,13 @@ pub fn render_activity_shelf(frame: &mut Frame, area: Rect, params: &ShelfRender
         }
         append_activity_lines(&mut lines, state, details, &palette);
         if (lines.len() as u16) < MAX_SHELF_LINES {
-            append_tokens_footer(&mut lines, state, &palette, params.edit_ledger_caption);
+            append_tokens_footer(
+                &mut lines,
+                state,
+                &palette,
+                params.edit_ledger_caption,
+                params.tool_usage_caption,
+            );
         }
         // Hard cap — prefer keeping tool evidence (already first).
         if lines.len() > MAX_SHELF_LINES as usize {
@@ -370,11 +378,15 @@ fn append_tokens_footer(
     state: &TurnActivityState,
     palette: &ShelfPalette,
     edit_ledger_caption: Option<&str>,
+    tool_usage_caption: Option<&str>,
 ) {
     let tokens = format_tokens_total(state.thinking_token_est, state.tool_token_acc);
     let mut parts: Vec<String> = Vec::new();
     if let Some(total) = tokens {
         parts.push(total);
+    }
+    if let Some(usage) = tool_usage_caption.filter(|s| !s.is_empty()) {
+        parts.push(usage.to_string());
     }
     if let Some(ledger) = edit_ledger_caption.filter(|s| !s.is_empty()) {
         parts.push(ledger.to_string());

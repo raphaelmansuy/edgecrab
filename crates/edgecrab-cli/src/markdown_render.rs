@@ -13,6 +13,129 @@ use ratatui::{
 
 use crate::theme::palette as P;
 
+/// Checkpointed streaming markdown (026 Wave D).
+///
+/// Freezes rendered output up to the last stable block boundary and only
+/// re-renders the tail — O(tail) instead of O(N) full re-parse per chunk.
+#[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
+pub struct StreamingMarkdown {
+    buffer: String,
+    /// Byte offset of the last checkpoint (stable prefix end).
+    checkpoint: usize,
+    frozen: Vec<Line<'static>>,
+    /// Wrap/render generation — bump on content change.
+    generation: u64,
+    /// Cached wrap for `(width, generation)`.
+    wrap_cache: Option<WrapCache>,
+}
+
+#[derive(Debug, Clone)]
+struct WrapCache {
+    width: u16,
+    generation: u64,
+    lines: Vec<Line<'static>>,
+}
+
+#[allow(dead_code)]
+impl StreamingMarkdown {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn push(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.buffer.push_str(chunk);
+        self.generation = self.generation.saturating_add(1);
+        self.advance_checkpoint();
+        self.wrap_cache = None;
+    }
+
+    pub fn finish(&mut self) -> Vec<Line<'static>> {
+        // Final paint: full document (fence promotions settle here).
+        self.checkpoint = self.buffer.len();
+        self.frozen = render_markdown(&self.buffer);
+        self.generation = self.generation.saturating_add(1);
+        self.wrap_cache = None;
+        self.frozen.clone()
+    }
+
+    pub fn text(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Render current stream (frozen prefix + live tail).
+    pub fn render(&mut self) -> Vec<Line<'static>> {
+        let tail = &self.buffer[self.checkpoint..];
+        let mut out = self.frozen.clone();
+        if !tail.is_empty() {
+            out.extend(render_markdown(tail));
+        }
+        out
+    }
+
+    /// Width-keyed cache: free when scrolling without new tokens.
+    pub fn render_cached(&mut self, width: u16) -> Vec<Line<'static>> {
+        if let Some(cache) = &self.wrap_cache
+            && cache.width == width
+            && cache.generation == self.generation
+        {
+            return cache.lines.clone();
+        }
+        let lines = self.render();
+        self.wrap_cache = Some(WrapCache {
+            width,
+            generation: self.generation,
+            lines: lines.clone(),
+        });
+        lines
+    }
+
+    pub fn invalidate_wrap_cache(&mut self) {
+        self.wrap_cache = None;
+    }
+
+    /// Advance checkpoint to the last complete blank-line-separated block.
+    fn advance_checkpoint(&mut self) {
+        // Prefer closed fences, else last double-newline before the final incomplete block.
+        let buf = &self.buffer;
+        let mut last_stable = self.checkpoint;
+        let mut in_fence = false;
+        let mut line_start = 0usize;
+        for (i, ch) in buf.char_indices() {
+            if ch == '\n' {
+                let line = &buf[line_start..i];
+                if line.trim_start().starts_with("```") {
+                    in_fence = !in_fence;
+                    if !in_fence {
+                        // Checkpoint after closed fence line (+ newline).
+                        last_stable = i + 1;
+                    }
+                } else if !in_fence && line.is_empty() && i + 1 > last_stable {
+                    // Blank line ends a paragraph.
+                    last_stable = i + 1;
+                }
+                line_start = i + 1;
+            }
+        }
+        // Never move checkpoint backwards; never consume the unfinished tail entirely
+        // unless we closed a fence.
+        if last_stable > self.checkpoint && last_stable < buf.len() {
+            let newly_frozen = &buf[self.checkpoint..last_stable];
+            if !newly_frozen.is_empty() {
+                self.frozen.extend(render_markdown(newly_frozen));
+            }
+            self.checkpoint = last_stable;
+        }
+    }
+}
+
 /// Render a markdown string into a vector of styled ratatui Lines.
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -294,5 +417,22 @@ mod tests {
         let lines = render_markdown("---");
         assert_eq!(lines.len(), 1);
         assert!(lines[0].spans[0].content.contains('─'));
+    }
+
+    #[test]
+    fn streaming_checkpoints_paragraphs() {
+        let mut s = StreamingMarkdown::new();
+        s.push("Hello paragraph.\n\n");
+        s.push("Second ");
+        s.push("continues.");
+        assert!(s.checkpoint > 0, "first paragraph should freeze");
+        let g1 = s.generation();
+        let _ = s.render_cached(80);
+        let again = s.render_cached(80);
+        assert_eq!(s.generation(), g1);
+        assert!(!again.is_empty());
+        s.push("\n\nThird.\n\n");
+        let finished = s.finish();
+        assert!(!finished.is_empty());
     }
 }

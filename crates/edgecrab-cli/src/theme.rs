@@ -114,6 +114,21 @@ pub struct SkinConfig {
     pub shelf_hint_color: Option<String>,
     /// Rotating charm strings for long-running tools (Hermes `LONG_RUN_CHARMS`).
     pub long_run_hints: Option<Vec<String>>,
+
+    // ── Stream UX semantic colors (026 Wave F / 024 §9) ─────────────
+    // skin.yaml example:
+    //   thinking_color: "#A096BE"
+    //   insert_color: "#78C88C"
+    //   delete_color: "#DC7878"
+    //   tool_error_color: "#EF5350"
+    /// Thinking / reasoning body color (quieter than assistant).
+    pub thinking_color: Option<String>,
+    /// Diff insert / + lines.
+    pub insert_color: Option<String>,
+    /// Diff delete / − lines.
+    pub delete_color: Option<String>,
+    /// Soft tool-error accent (distinct from fatal `error_color` when desired).
+    pub tool_error_color: Option<String>,
 }
 
 impl SkinConfig {
@@ -209,6 +224,12 @@ pub struct Theme {
     pub shelf_border: Color,
     pub shelf_hint: Style,
     pub long_run_hints: Vec<String>,
+
+    // ── Stream UX semantic colors (026) ───────────────────────────────
+    pub thinking: Style,
+    pub insert: Style,
+    pub delete: Style,
+    pub tool_error: Style,
 }
 
 impl Default for Theme {
@@ -564,6 +585,10 @@ impl Theme {
         let shelf_dim_fg = skin.color_or(&skin.shelf_dim_color, Color::Rgb(120, 120, 130));
         let shelf_border = skin.color_or(&skin.shelf_border_color, Color::Rgb(55, 55, 68));
         let shelf_hint_fg = skin.color_or(&skin.shelf_hint_color, Color::Rgb(255, 200, 80));
+        let thinking_fg = skin.color_or(&skin.thinking_color, Color::Rgb(160, 150, 190));
+        let insert_fg = skin.color_or(&skin.insert_color, Color::Rgb(120, 200, 140));
+        let delete_fg = skin.color_or(&skin.delete_color, Color::Rgb(220, 120, 120));
+        let tool_error_fg = skin.color_or(&skin.tool_error_color, error_fg);
         let long_run_hints: Vec<String> = skin
             .long_run_hints
             .as_ref()
@@ -621,6 +646,12 @@ impl Theme {
             shelf_border,
             shelf_hint: Style::default().fg(shelf_hint_fg),
             long_run_hints,
+            thinking: Style::default()
+                .fg(thinking_fg)
+                .add_modifier(Modifier::ITALIC),
+            insert: Style::default().fg(insert_fg),
+            delete: Style::default().fg(delete_fg),
+            tool_error: Style::default().fg(tool_error_fg),
         }
     }
 

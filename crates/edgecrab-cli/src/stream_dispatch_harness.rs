@@ -513,4 +513,127 @@ mod tests {
             h.presentation.worked_for_label().is_some() || h.presentation.turn_started.is_some()
         );
     }
+
+    #[test]
+    fn golden_stream_usage_and_phase_labels() {
+        use crate::presentation::entries::{CardStatus, RenderEntry, VerbGroupEntry};
+        use crate::presentation::render::{RenderOpts, render_entry_plain};
+        use crate::stream_presentation::{DisplayMode, ToolCardKind, VerbGroupKind};
+
+        let mut h = TurnStreamHarness::new();
+        let now = Instant::now();
+        h.apply(StreamEvent::Reasoning("inspect then edit".into()), now);
+        assert!(
+            h.presentation
+                .phase_activity_label(false)
+                .contains("Thinking")
+        );
+
+        for (i, _) in ["a.rs", "b.rs", "c.rs"].iter().enumerate() {
+            let id = format!("r{i}");
+            h.apply(
+                StreamEvent::ToolExec {
+                    tool_call_id: id.clone(),
+                    name: "read_file".into(),
+                    args_json: format!(r#"{{"path":"{i}"}}"#),
+                },
+                now,
+            );
+            h.apply(
+                StreamEvent::ToolDone {
+                    tool_call_id: id,
+                    name: "read_file".into(),
+                    args_json: "{}".into(),
+                    result_preview: Some("ok".into()),
+                    duration_ms: 5,
+                    is_error: false,
+                },
+                now,
+            );
+        }
+        assert_eq!(h.presentation.tool_usage.read, 3);
+
+        h.apply(
+            StreamEvent::ToolExec {
+                tool_call_id: "e1".into(),
+                name: "write_file".into(),
+                args_json: r#"{"path":"a.rs"}"#.into(),
+            },
+            now,
+        );
+        h.presentation.record_edit("a.rs", 5, 1);
+        h.apply(
+            StreamEvent::ToolDone {
+                tool_call_id: "e1".into(),
+                name: "write_file".into(),
+                args_json: "{}".into(),
+                result_preview: Some("ok".into()),
+                duration_ms: 8,
+                is_error: false,
+            },
+            now,
+        );
+
+        h.apply(
+            StreamEvent::ToolExec {
+                tool_call_id: "t1".into(),
+                name: "terminal".into(),
+                args_json: r#"{"command":"cargo test"}"#.into(),
+            },
+            now,
+        );
+        h.apply(
+            StreamEvent::ToolProgress {
+                tool_call_id: "t1".into(),
+                name: "terminal".into(),
+                message: "compiling…\nok".into(),
+            },
+            now,
+        );
+        h.apply(
+            StreamEvent::ToolDone {
+                tool_call_id: "t1".into(),
+                name: "terminal".into(),
+                args_json: "{}".into(),
+                result_preview: Some("ok".into()),
+                duration_ms: 20,
+                is_error: false,
+            },
+            now,
+        );
+
+        let usage = h.presentation.tool_usage_caption().expect("usage");
+        assert!(usage.contains("Exec 1"), "{usage}");
+        assert!(usage.contains("Read 3"), "{usage}");
+        assert!(usage.contains("Edit 1"), "{usage}");
+        assert!(
+            h.presentation
+                .edit_ledger
+                .caption()
+                .expect("ledger")
+                .contains("+5")
+        );
+
+        let group = RenderEntry::verb_group(VerbGroupEntry {
+            kind: VerbGroupKind::Read,
+            count: 3,
+            running: false,
+            items: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+        });
+        assert!(
+            render_entry_plain(&group, RenderOpts::default()).starts_with("Read 3 files")
+        );
+
+        let edit = RenderEntry::tool(crate::presentation::entries::ToolEntryArgs {
+            name: "write_file".into(),
+            kind: ToolCardKind::Edit,
+            status: CardStatus::Success,
+            caption: "Edited a.rs".into(),
+            body: "+x\n-y".into(),
+            mode: DisplayMode::Truncated,
+            duration: None,
+            is_error: false,
+        });
+        assert!(render_entry_plain(&edit, RenderOpts::default()).contains("Edited"));
+    }
 }

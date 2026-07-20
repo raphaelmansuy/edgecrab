@@ -15,6 +15,8 @@ path = "src/main.rs"
 default = ["bedrock-model-discovery"]
 bedrock-model-discovery = ["edgecrab-core/bedrock-model-discovery"]
 termux = []
+## Optional syntect-backed edit hunk highlighting (026 Wave F). Noop without it.
+edit-syntax = []
 
 [dependencies]
 edgecrab-command-catalog = { workspace = true }

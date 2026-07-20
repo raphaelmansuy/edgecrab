@@ -115,11 +115,9 @@ impl App {
                 self.completion.active = false;
                 return;
             }
-            // Ctrl+G — scroll output to very bottom (jump back to live view)
+            // Ctrl+G — scroll output to very bottom (jump back to live view / re-engage follow)
             (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
-                self.scroll_offset = 0;
-                self.at_bottom = true;
-                self.needs_redraw = true;
+                self.reengage_follow();
                 return;
             }
             // Ctrl+K — kill text from cursor to end of line (readline standard)
@@ -147,12 +145,12 @@ impl App {
                     .saturating_sub(self.output_area_height);
                 self.scroll_offset = max_scroll;
                 self.at_bottom = false;
+                self.follow_mode.on_scroll_away();
                 return;
             }
             // Ctrl+End — scroll output to very bottom
             (KeyModifiers::CONTROL, KeyCode::End) => {
-                self.scroll_offset = 0;
-                self.at_bottom = true;
+                self.reengage_follow();
                 return;
             }
             // Shift+Up — scroll output up one line (doesn't conflict with history navigation)
@@ -2849,15 +2847,30 @@ impl App {
             return;
         }
 
-        // `t` — expand foreground tool live buffer when prompt is empty (spec 020).
-        if matches!(key.code, KeyCode::Char('t'))
-            && key.modifiers == KeyModifiers::NONE
-            && self.is_processing
-            && self.textarea_text().trim().is_empty()
-            && self.turn_activity.primary_focus_tool().is_some()
-            && self.open_foreground_tool_live_panel()
-        {
-            return;
+        // Empty-prompt card / follow keys (026 C2 / E2) — do not steal typed input.
+        if key.modifiers == KeyModifiers::NONE && self.textarea_text().trim().is_empty() {
+            match key.code {
+                // `t` — expand foreground tool live buffer when a tool runs (spec 020).
+                KeyCode::Char('t')
+                    if self.is_processing
+                        && self.turn_activity.primary_focus_tool().is_some()
+                        && self.open_foreground_tool_live_panel() =>
+                {
+                    return;
+                }
+                // `e` — expand focused / most recent expandable card.
+                KeyCode::Char('e') if self.expand_focused_card() => return,
+                // `E` — expand all thinking cards.
+                KeyCode::Char('E') if self.expand_all_thinking_cards() => return,
+                // `c` — collapse focused card.
+                KeyCode::Char('c') if self.collapse_focused_card() => return,
+                // `G` — re-engage follow mode (vim-style bottom).
+                KeyCode::Char('G') => {
+                    self.reengage_follow();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         match self.editor_mode {

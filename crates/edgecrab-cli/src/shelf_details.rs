@@ -27,6 +27,15 @@ impl ShelfDetailsMode {
         }
     }
 
+    /// Map shelf disclosure → card [`crate::stream_presentation::DisplayMode`] (026 C4).
+    /// Hidden sections still finish as Collapsed cards in the transcript.
+    pub fn to_card_display_mode(self) -> crate::stream_presentation::DisplayMode {
+        match self {
+            Self::Hidden | Self::Collapsed => crate::stream_presentation::DisplayMode::Collapsed,
+            Self::Expanded => crate::stream_presentation::DisplayMode::Expanded,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Hidden => "hidden",

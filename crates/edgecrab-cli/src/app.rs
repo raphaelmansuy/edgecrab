@@ -116,7 +116,7 @@ use crate::stream_presentation::{ActionVerbGroup, ToolCardKind, VerbGroupKind};
 use crate::theme::{SkinConfig, Theme, palette as P};
 use crate::tool_display::{
     DisplayWidths, build_subagent_done_line_width, build_subagent_running_line_width,
-    build_tool_done_line_width, build_tool_running_line_width,
+    build_tool_done_line_width, build_tool_running_line_width, mute_tool_spans,
     build_tool_running_line_width_elapsed, build_tool_verbose_lines_width,
     extract_streaming_tool_preview, extract_tool_preview, tool_signature, tool_status_preview,
 };
@@ -4156,6 +4156,13 @@ pub struct App {
     output_area_height: u16,
     /// True when user is at the very bottom — new content triggers auto-scroll
     at_bottom: bool,
+    /// First-class follow / browse mode (026 Wave E). Kept in sync with `at_bottom`.
+    follow_mode: crate::follow_mode::FollowMode,
+    /// Typed scrollback entries keyed by [`crate::presentation::EntryId`] (026 Wave B).
+    render_entries: std::collections::HashMap<
+        crate::presentation::EntryId,
+        crate::presentation::RenderEntry,
+    >,
 
     // ── Dirty flag — avoid redundant redraws ─────────────────────────
     /// True whenever state changed and a redraw is needed
@@ -4274,6 +4281,8 @@ pub struct App {
     turn_activity: TurnActivityState,
     /// Thinking/tool stream cards (024) — phase + finished thinking for transcript.
     stream_presentation: crate::stream_presentation::StreamPresentation,
+    /// Checkpointed streaming markdown for the live assistant reply (026 Wave D).
+    assistant_stream_md: crate::markdown_render::StreamingMarkdown,
     shelf_coalescer: ShelfCoalescer,
     /// `/tail` overlay for background process output.
     process_tail_panel: ProcessTailPanel,
@@ -4809,13 +4818,38 @@ impl App {
         if !self.turn_activity.enabled || !self.is_processing {
             return 0;
         }
-        estimate_shelf_lines(
+        let lines = estimate_shelf_lines(
             &self.turn_activity,
             &self.shelf_details,
             self.shelf_compact_mode(),
             self.tool_progress_mode == ToolProgressMode::Verbose,
             self.is_processing,
-        )
+        );
+        // 026 A1: yield space when phase is idle and shelf would paint nothing useful.
+        if lines == 0
+            && matches!(
+                self.stream_presentation.phase,
+                crate::stream_presentation::TurnPhase::Idle
+            )
+            && !self.stream_presentation.thinking.is_active()
+            && self.stream_presentation.tools.is_empty()
+        {
+            return 0;
+        }
+        lines
+    }
+
+    /// Sync follow mode from bottom sticky flag (026 E).
+    fn sync_follow_from_bottom(&mut self) {
+        self.follow_mode
+            .sync_from_offset(if self.at_bottom { 0 } else { 1 });
+    }
+
+    fn reengage_follow(&mut self) {
+        self.scroll_offset = 0;
+        self.at_bottom = true;
+        self.follow_mode.reengage();
+        self.needs_redraw = true;
     }
 
     /// Open or refresh the foreground Focus Tool live overlay (`t` while a tool runs).
@@ -5051,10 +5085,20 @@ impl App {
         };
         self.turn_activity.clear_thinking_peek();
         let label = card.collapsed_label();
-        let text = card.text;
+        let text = card.text.clone();
         if text.trim().is_empty() {
             return;
         }
+        let mut entry = crate::presentation::RenderEntry::from_finished_thinking(&card);
+        // Bridge `/details thinking` → finished card default mode (026 C4).
+        let details_mode = self
+            .shelf_details
+            .effective_mode(crate::shelf_details::ShelfSection::Thinking)
+            .to_card_display_mode();
+        entry.set_mode(details_mode);
+        let entry_id = entry.id;
+        let mode = entry.mode;
+        self.render_entries.insert(entry_id, entry);
         // If we were streaming reasoning into a live line, rewrite header and attach body.
         if let Some(idx) = self.reasoning_line.take()
             && idx < self.output.len()
@@ -5074,6 +5118,7 @@ impl App {
             self.output[idx].collapsed_prebuilt_spans = None;
             self.output[idx].prebuilt_spans = None;
             self.output[idx].attach_expandable_body_always(body);
+            self.output[idx].bind_entry(entry_id, mode);
             self.output[idx].invalidate_render_cache();
             self.needs_redraw = true;
             return;
@@ -5089,6 +5134,7 @@ impl App {
             text
         };
         line.attach_expandable_body_always(body);
+        line.bind_entry(entry_id, mode);
         if let Some(idx) = self.streaming_line {
             let insert_idx = idx.min(self.output.len());
             self.output.insert(insert_idx, line);
@@ -5311,6 +5357,8 @@ impl App {
             output_visual_rows: 0,
             output_area_height: 24,
             at_bottom: true,
+            follow_mode: crate::follow_mode::FollowMode::Following,
+            render_entries: std::collections::HashMap::new(),
             needs_redraw: true,
             needs_full_terminal_clear: false,
             min_draw_interval: terminal_caps.min_draw_interval,
@@ -5353,6 +5401,7 @@ impl App {
             bg_process_lines: std::collections::HashMap::new(),
             turn_activity: TurnActivityState::new(display_preferences.activity_shelf_enabled),
             stream_presentation: crate::stream_presentation::StreamPresentation::new(),
+            assistant_stream_md: crate::markdown_render::StreamingMarkdown::new(),
             shelf_coalescer: ShelfCoalescer::new(),
             process_tail_panel: ProcessTailPanel::default(),
             agents_overlay: AgentsOverlay::default(),
@@ -6126,13 +6175,51 @@ impl App {
         }
     }
 
+    /// Expand the most recent expandable card (`e` / Enter with empty prompt — 026 C2).
+    fn expand_focused_card(&mut self) -> bool {
+        for line in self.output.iter_mut().rev() {
+            if line.expand_card() {
+                self.needs_redraw = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Collapse the most recent expanded card (`c` with empty prompt — 026 C2).
+    fn collapse_focused_card(&mut self) -> bool {
+        for line in self.output.iter_mut().rev() {
+            if line.collapse_card() {
+                self.needs_redraw = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Expand all thinking / reasoning cards (`E` with empty prompt — 026 C2).
+    fn expand_all_thinking_cards(&mut self) -> bool {
+        let mut any = false;
+        for line in self.output.iter_mut() {
+            if line.role == OutputRole::Reasoning && line.expand_card() {
+                any = true;
+            }
+        }
+        if any {
+            self.needs_redraw = true;
+        }
+        any
+    }
+
     /// Clear the output area.
     pub fn clear_output(&mut self) {
         self.output.clear();
         self.transcript_heights.clear();
+        self.render_entries.clear();
         self.scroll_offset = 0;
         self.bg_process_lines.clear();
         self.at_bottom = true;
+        self.follow_mode.reengage();
         self.output_visual_rows = 0;
         // Reset streaming cursors so any in-flight agent events are handled
         // correctly: stale indices into the now-empty output vec would cause
@@ -6140,6 +6227,7 @@ impl App {
         self.streaming_line = None;
         self.reasoning_line = None;
         self.buffered_assistant_output.clear();
+        self.assistant_stream_md = crate::markdown_render::StreamingMarkdown::new();
         self.pending_tool_lines.clear();
         self.collapsed_tool_fail = None;
         self.edit_verb_group = None;
@@ -10264,6 +10352,7 @@ impl App {
         let new_offset = (self.scroll_offset as i32 + delta).clamp(0, max_scroll as i32) as u16;
         self.scroll_offset = new_offset;
         self.at_bottom = self.scroll_offset == 0;
+        self.sync_follow_from_bottom();
         self.needs_redraw = true;
     }
 

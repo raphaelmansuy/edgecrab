@@ -9,7 +9,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::display_state::DisplayState;
 use crate::markdown_render;
+use crate::presentation::entries::EntryId;
 use crate::status_chrome::{TerminalGlyphProfile, compact_spinner_frame};
+use crate::stream_presentation::DisplayMode;
 use crate::theme::palette as P;
 use crate::transcript_heights::TranscriptHeightCache;
 
@@ -24,6 +26,10 @@ pub struct OutputLine {
     pub expandable_body: Option<String>,
     /// Whether [`expandable_body`] is shown instead of the collapsed spans.
     pub expanded: bool,
+    /// Optional link to a typed [`crate::presentation::RenderEntry`] (026 Wave B).
+    pub entry_id: Option<EntryId>,
+    /// Uniform disclosure mode when backed by a render entry.
+    pub display_mode: DisplayMode,
     pub(crate) collapsed_prebuilt_spans: Option<Vec<Span<'static>>>,
     /// Truncated / collapsed plain text restored when leaving Expanded (thinking cards).
     pub(crate) collapsed_text: Option<String>,
@@ -49,6 +55,8 @@ impl OutputLine {
             prebuilt_spans: None,
             expandable_body: None,
             expanded: false,
+            entry_id: None,
+            display_mode: DisplayMode::Truncated,
             collapsed_prebuilt_spans: None,
             collapsed_text: None,
             rendered: None,
@@ -63,11 +71,20 @@ impl OutputLine {
             prebuilt_spans: Some(spans),
             expandable_body: None,
             expanded: false,
+            entry_id: None,
+            display_mode: DisplayMode::Truncated,
             collapsed_prebuilt_spans: None,
             collapsed_text: None,
             rendered: None,
             plain_rendered: None,
         }
+    }
+
+    /// Bind this transcript line to a typed render entry.
+    pub(crate) fn bind_entry(&mut self, id: EntryId, mode: DisplayMode) {
+        self.entry_id = Some(id);
+        self.display_mode = mode;
+        self.expanded = matches!(mode, DisplayMode::Expanded);
     }
 
     pub(crate) fn invalidate_render_cache(&mut self) {
@@ -102,6 +119,11 @@ impl OutputLine {
             return false;
         };
         self.expanded = !self.expanded;
+        self.display_mode = if self.expanded {
+            DisplayMode::Expanded
+        } else {
+            DisplayMode::Collapsed
+        };
         if self.expanded {
             self.collapsed_prebuilt_spans = self.prebuilt_spans.take();
             if !self.text.is_empty() {
@@ -120,6 +142,22 @@ impl OutputLine {
         }
         self.invalidate_render_cache();
         true
+    }
+
+    /// Expand to full body (Wave C `e` / Enter on card).
+    pub fn expand_card(&mut self) -> bool {
+        if self.expanded || self.expandable_body.is_none() {
+            return false;
+        }
+        self.toggle_expand()
+    }
+
+    /// Collapse expanded body (Wave C `c`).
+    pub fn collapse_card(&mut self) -> bool {
+        if !self.expanded {
+            return false;
+        }
+        self.toggle_expand()
     }
 }
 
@@ -408,12 +446,38 @@ pub fn render_transcript_rich(
     // "Scrolled ↑" hint — anchored to right edge of the content area
     // (not the scrollbar edge) so it stays readable.
     if scroll > 0 {
-        let hint = format!(" ↑{}  ^G=end  ↕scroll  {} ", scroll, params.paging_key_hint);
+        // Sticky user header (026 E4): pin latest user prompt above viewport.
+        let sticky = sticky_user_header(params.output, top_row);
+        if let Some(ref sticky_text) = sticky {
+            let sticky_area = Rect::new(content_area.x, area.y, content_area.width, 1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "▎ ",
+                        Style::default().fg(Color::Rgb(205, 127, 50)),
+                    ),
+                    Span::styled(
+                        sticky_text.clone(),
+                        Style::default()
+                            .fg(Color::Rgb(255, 248, 220))
+                            .bg(Color::Rgb(36, 32, 28))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])),
+                sticky_area,
+            );
+        }
+        let hint = format!(" ↑{}  ↓follow/G  ↕scroll  {} ", scroll, params.paging_key_hint);
         let hint_len = hint
             .len()
             .min(content_area.width.saturating_sub(1) as usize);
         let hint_x = content_area.x + content_area.width.saturating_sub(hint_len as u16);
-        let hint_area = Rect::new(hint_x, area.y, hint_len as u16, 1);
+        let hint_y = if sticky.is_some() {
+            area.y.saturating_add(1)
+        } else {
+            area.y
+        };
+        let hint_area = Rect::new(hint_x, hint_y, hint_len as u16, 1);
         frame.render_widget(
             Paragraph::new(Span::styled(
                 hint,
@@ -425,6 +489,25 @@ pub fn render_transcript_rich(
             hint_area,
         );
     }
+}
+
+/// Latest user prompt when the viewport is scrolled away from the bottom.
+fn sticky_user_header(output: &[OutputLine], top_row: u16) -> Option<String> {
+    if top_row == 0 {
+        return None;
+    }
+    output
+        .iter()
+        .rev()
+        .find(|ol| ol.role == OutputRole::User && !ol.text.trim().is_empty())
+        .map(|ol| {
+            let first = ol.text.lines().next().unwrap_or("").trim();
+            let mut s = first.to_string();
+            if s.chars().count() > 72 {
+                s = format!("{}…", edgecrab_core::safe_truncate(&s, 71));
+            }
+            s
+        })
 }
 
 pub fn render_transcript_compact(

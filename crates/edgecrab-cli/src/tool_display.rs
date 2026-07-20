@@ -1355,6 +1355,13 @@ pub fn tool_failure_fingerprint(
     format!("{tool_name}\0{preview}\0{err_key}")
 }
 
+/// Dim finished collapsed tool chrome (026 C3 Grok `muted_collapsed`).
+pub fn mute_tool_spans(spans: &mut [Span<'static>]) {
+    for span in spans.iter_mut() {
+        span.style = span.style.add_modifier(Modifier::DIM);
+    }
+}
+
 pub fn build_tool_done_line_width(
     tool_name: &str,
     args_json: &str,

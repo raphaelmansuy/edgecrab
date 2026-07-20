@@ -64,9 +64,12 @@ impl App {
                     }
 
                     if self.live_token_display_enabled {
+                        // 026 D: checkpointed markdown accumulator (tail re-render only).
+                        self.assistant_stream_md.push(&text);
                         if let Some(idx) = self.streaming_line {
                             if idx < self.output.len() {
                                 self.output[idx].text.push_str(&text);
+                                // Prefer StreamingMarkdown paint on next frame (see render_output).
                                 self.output[idx].invalidate_render_cache();
                             }
                         } else {
@@ -80,6 +83,7 @@ impl App {
                         }
                         self.needs_redraw = true;
                     } else {
+                        self.assistant_stream_md.push(&text);
                         self.buffered_assistant_output.push_str(&text);
                     }
                     // Accumulate response text for voice mode TTS readback.
@@ -637,7 +641,7 @@ impl App {
                             });
 
                         if !collapsed_into_prior {
-                            let spans = build_tool_done_line_width(
+                            let mut spans = build_tool_done_line_width(
                                 &name,
                                 &resolved_args,
                                 result_preview.as_deref(),
@@ -646,6 +650,15 @@ impl App {
                                 &self.theme.tool_emojis,
                                 &widths,
                             );
+                            // 026 C3: mute finished Read/Search noise so replies dominate.
+                            if !is_error
+                                && matches!(
+                                    tool_kind,
+                                    ToolCardKind::Read | ToolCardKind::Search
+                                )
+                            {
+                                mute_tool_spans(&mut spans);
+                            }
                             // Upgrade the in-flight placeholder in-place (if present).
                             //
                             // WHY in-place: replacing the placeholder avoids appending a
@@ -1013,9 +1026,21 @@ impl App {
                 AgentResponse::Done => {
                     self.flush_buffered_assistant_output();
                     self.finalize_thinking_stream_card();
+                    // Settle streaming markdown fences/images once (026 D4).
+                    let finished_md = self.assistant_stream_md.finish();
+                    if let Some(idx) = self.streaming_line
+                        && idx < self.output.len()
+                        && !finished_md.is_empty()
+                    {
+                        self.output[idx].rendered = Some(finished_md);
+                    }
+                    self.assistant_stream_md = crate::markdown_render::StreamingMarkdown::new();
                     // 024 W4: Grok-style turn footer before clearing presentation.
                     if let Some(worked) = self.stream_presentation.worked_for_label() {
-                        self.push_output(format!("  ◆ {worked}"), OutputRole::System);
+                        // Compact terminals: suppress Worked-for density (026 A3).
+                        if self.last_terminal_width >= 60 && !self.shelf_compact_mode() {
+                            self.push_output(format!("  ◆ {worked}"), OutputRole::System);
+                        }
                     }
                     self.auto_update_status();
                     let turn_metrics = TurnCommitMetrics {

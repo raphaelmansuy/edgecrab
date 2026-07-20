@@ -678,7 +678,7 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, params: &StatusBarRender
     }
     if params.scroll_offset > 0 {
         right_spans.push(Span::styled(
-            format!(" ↑SCROLLED  ^G=↓  ↕scroll  {} ", params.paging_key_hint),
+            format!(" ↑SCROLLED  ↓follow/G  ↕scroll  {} ", params.paging_key_hint),
             Style::default()
                 .fg(Color::Rgb(255, 210, 50))
                 .add_modifier(Modifier::BOLD),

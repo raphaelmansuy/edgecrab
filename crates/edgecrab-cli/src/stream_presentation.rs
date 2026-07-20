@@ -1,8 +1,8 @@
-//! Stream presentation helpers — TurnPhase + thinking/tool card lifecycle (024 W1–W4).
+//! Stream presentation helpers — TurnPhase + thinking/tool card lifecycle (024 W1–W4 · 026).
 //!
 //! SOLID: pure state; no ratatui. `turn_activity` owns shelf buffers; this module
-//! owns phase transitions, card modes, verb-group kinds, session edit ledger, and
-//! finished-card snapshots for the transcript.
+//! owns phase transitions, card modes, verb-group kinds, session edit ledger,
+//! tool-usage counters, and finished-card snapshots for the transcript.
 //!
 //! Law: model stream events are facts. Presentation is a state machine of cards.
 
@@ -193,6 +193,56 @@ impl ActionVerbGroup {
             lines.push(format!("  {}. {item}", i + 1));
         }
         lines.join("\n")
+    }
+}
+
+/// Session/turn tool category counts (`Exec N · Read N · Edit N · Search N`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolUsageCounters {
+    pub exec: u32,
+    pub read: u32,
+    pub edit: u32,
+    pub search: u32,
+    pub other: u32,
+}
+
+impl ToolUsageCounters {
+    pub fn record(&mut self, kind: ToolCardKind) {
+        match kind {
+            ToolCardKind::Execute => self.exec = self.exec.saturating_add(1),
+            ToolCardKind::Read => self.read = self.read.saturating_add(1),
+            ToolCardKind::Edit => self.edit = self.edit.saturating_add(1),
+            ToolCardKind::Search => self.search = self.search.saturating_add(1),
+            ToolCardKind::Other => self.other = self.other.saturating_add(1),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.exec == 0 && self.read == 0 && self.edit == 0 && self.search == 0 && self.other == 0
+    }
+
+    /// Compact strip: `Exec 2 · Read 5 · Edit 3 · Search 1`
+    pub fn caption(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.exec > 0 {
+            parts.push(format!("Exec {}", self.exec));
+        }
+        if self.read > 0 {
+            parts.push(format!("Read {}", self.read));
+        }
+        if self.edit > 0 {
+            parts.push(format!("Edit {}", self.edit));
+        }
+        if self.search > 0 {
+            parts.push(format!("Search {}", self.search));
+        }
+        if self.other > 0 {
+            parts.push(format!("Other {}", self.other));
+        }
+        Some(parts.join(" · "))
     }
 }
 
@@ -400,6 +450,10 @@ pub struct StreamPresentation {
     pub tools_completed: u32,
     /// Session-scoped edit ledger (survives turn reset until explicit clear).
     pub edit_ledger: SessionEditLedger,
+    /// Session-scoped tool category usage (survives turn reset until clear).
+    pub tool_usage: ToolUsageCounters,
+    /// Per-turn tool category usage (reset with turn).
+    pub turn_tool_usage: ToolUsageCounters,
 }
 
 impl Default for StreamPresentation {
@@ -421,6 +475,8 @@ impl StreamPresentation {
             turn_started: None,
             tools_completed: 0,
             edit_ledger: SessionEditLedger::default(),
+            tool_usage: ToolUsageCounters::default(),
+            turn_tool_usage: ToolUsageCounters::default(),
         }
     }
 
@@ -467,8 +523,10 @@ impl StreamPresentation {
 
     pub fn on_tool_done(&mut self, tool_call_id: &str) -> Option<ToolBodyBuffer> {
         let buf = self.tools.remove(tool_call_id);
-        if buf.is_some() {
+        if let Some(ref b) = buf {
             self.tools_completed = self.tools_completed.saturating_add(1);
+            self.tool_usage.record(b.kind);
+            self.turn_tool_usage.record(b.kind);
         }
         if self.tools.is_empty() {
             // Between tools: idle until next token / tool (maps to AwaitingFirstToken).
@@ -503,16 +561,28 @@ impl StreamPresentation {
         Some(format!("Worked for {}", format_elapsed_compact(elapsed)))
     }
 
-    /// Reset per-turn state; keep session edit ledger.
+    /// Reset per-turn state; keep session edit ledger + session tool usage.
     pub fn reset_turn(&mut self) {
         let ledger = std::mem::take(&mut self.edit_ledger);
+        let usage = std::mem::take(&mut self.tool_usage);
         *self = Self::new();
         self.edit_ledger = ledger;
+        self.tool_usage = usage;
     }
 
     /// Clear session ledger (e.g. `/new` session).
     pub fn clear_session_ledger(&mut self) {
         self.edit_ledger = SessionEditLedger::default();
+        self.tool_usage = ToolUsageCounters::default();
+    }
+
+    /// Prefer turn strip while a turn is active; else session strip.
+    pub fn tool_usage_caption(&self) -> Option<String> {
+        if !self.turn_tool_usage.is_empty() {
+            self.turn_tool_usage.caption()
+        } else {
+            self.tool_usage.caption()
+        }
     }
 
     pub fn shelf_thinking_snippet(&self) -> Option<String> {
@@ -581,6 +651,51 @@ impl StreamPresentation {
             TurnPhase::Tool { .. } => ChromePhaseHint::ToolExec,
             TurnPhase::Responding => ChromePhaseHint::Streaming,
         }
+    }
+
+    /// Shared phase label for shelf title + status chrome (026 A5).
+    pub fn phase_activity_label(&self, tool_generating: bool) -> String {
+        phase_activity_label(self.chrome_phase_hint(tool_generating), self.active_tool_name())
+    }
+
+    pub fn active_tool_name(&self) -> Option<&str> {
+        match &self.phase {
+            TurnPhase::Tool { name, .. } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// True when chrome should show a turn-status row (non-idle turn).
+    pub fn turn_status_visible(&self) -> bool {
+        !matches!(
+            self.chrome_phase_hint(false),
+            ChromePhaseHint::Idle
+        ) || !self.tools.is_empty()
+            || self.thinking.is_active()
+    }
+}
+
+/// Single source for human-readable phase sentences (shelf + turn-status + status bar).
+pub fn phase_activity_label(hint: ChromePhaseHint, tool_name: Option<&str>) -> String {
+    match hint {
+        ChromePhaseHint::Idle => "Idle".into(),
+        ChromePhaseHint::AwaitingFirstToken => "Waiting for response…".into(),
+        ChromePhaseHint::Thinking => "Thinking…".into(),
+        ChromePhaseHint::GeneratingTool => {
+            if let Some(name) = tool_name {
+                format!("Preparing {}…", name.replace('_', " "))
+            } else {
+                "Preparing tool…".into()
+            }
+        }
+        ChromePhaseHint::ToolExec => {
+            if let Some(name) = tool_name {
+                format!("Running {}…", name.replace('_', " "))
+            } else {
+                "Running tool…".into()
+            }
+        }
+        ChromePhaseHint::Streaming => "Responding…".into(),
     }
 }
 
@@ -667,10 +782,32 @@ mod tests {
         assert!(body.body.contains("line one"));
         assert!(body.body.contains("line two"));
         assert_eq!(p.tools_completed, 1);
+        assert_eq!(p.tool_usage.edit, 1);
+        assert_eq!(
+            p.tool_usage_caption().as_deref(),
+            Some("Edit 1")
+        );
         assert_eq!(
             p.chrome_phase_hint(false),
             ChromePhaseHint::AwaitingFirstToken
         );
+        assert!(p.phase_activity_label(false).contains("Waiting"));
+    }
+
+    #[test]
+    fn tool_usage_strip_aggregates_kinds() {
+        let mut p = StreamPresentation::new();
+        let _ = p.on_tool_exec("a".into(), "read_file".into());
+        let _ = p.on_tool_done("a");
+        let _ = p.on_tool_exec("b".into(), "read_file".into());
+        let _ = p.on_tool_done("b");
+        let _ = p.on_tool_exec("c".into(), "terminal".into());
+        let _ = p.on_tool_done("c");
+        assert_eq!(p.tool_usage.read, 2);
+        assert_eq!(p.tool_usage.exec, 1);
+        let cap = p.tool_usage_caption().expect("caption");
+        assert!(cap.contains("Exec 1"));
+        assert!(cap.contains("Read 2"));
     }
 
     #[test]

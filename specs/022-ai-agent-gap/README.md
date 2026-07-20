@@ -86,8 +86,9 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
 | [021](021-chess-verification-forensics-and-plan-2026-07-19.md) | SuperGrok 3D chess verify RCA | Evidence |
 | [022](022-session-roadblock-4f94111e-harness-deadlock.md) | Harness deadlock RCA + Heal SM | Harness |
 | [023](023-first-principles-browser-localhost-2026-07-19.md) | Browser localhost / CDP / proxy | Browser |
-| [024](024-tui-stream-ux-from-grok-build.md) | **TUI stream UX: thinking · tools · files** | **Active plan** |
+| [024](024-tui-stream-ux-from-grok-build.md) | TUI stream UX: thinking · tools · files | W1–W3 + light W4 landed |
 | [025](025-harness-balance-reopen-cap-2026-07-20.md) | **Harness balance: reopen cap · prebuilt latch** | **Shipped 2026-07-20** |
+| [026](026-tui-polish-density-follow-blocks.md) | **TUI polish: density · follow · typed blocks** | **Active plan** |
 | **[014](014-improvement-plan.md)** | **Improvement plan + assessment** | **✅ MCP URL/OAuth · multi-tool · harness wave-2** |
 | **[015](015-grok-build-tui-code-display.md)** | **Grok Build TUI analysis** | Code edit/update display first principles |
 | **[016](016-tui-edit-display-plan.md)** | **TUI edit display plan** | DRY/SOLID borrow plan from Grok Build |
@@ -104,7 +105,7 @@ Older folders (`003-ec-vs-hermes`, `017-…`) remain historical; **022 is the st
 |----------|------|
 | **Engineer** | 000 → 003 → **014** → 012 |
 | **Implementer (MCP / multi-tool)** | **014** (primary) · [specs/mcp/](../mcp/) |
-| **TUI / code-edit UX** | **015** → **016** · `edit_diff.rs` / `tool_display.rs` |
+| **TUI / code-edit UX** | **015** → **016** → **024** → **026** · `stream_presentation.rs` / `presentation/` |
 | **Harness / visual_ux thrash** | **017** → **018** → **019** · `harness_gates.rs` · `completion_assessor.rs` |
 | **PM / exec** | 000 skim → 001 → 004 → 011 → 014 |
 | **Platform** | 000 → 002 → 007 → 009 → 014 WS-A |

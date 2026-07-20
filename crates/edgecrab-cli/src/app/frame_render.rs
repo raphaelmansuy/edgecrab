@@ -10,12 +10,24 @@ impl App {
 
         let textarea_height = self.input_area_height_for_area(frame.area());
         let shelf_height = self.shelf_area_height();
+        let turn_status_h = crate::turn_status_row::turn_status_height(
+            &self.stream_presentation,
+            self.is_processing,
+        );
+        // Compact terminals: suppress Worked-for density; clamp chrome (026 A3).
+        let short_terminal = frame.area().height <= 18 || self.shelf_compact_mode();
+        let turn_status_h = if short_terminal && shelf_height > 0 {
+            0
+        } else {
+            turn_status_h
+        };
         let queue_height = crate::queued_messages::panel_height(self.prompt_queue.len());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1), // output area
                 Constraint::Length(shelf_height),
+                Constraint::Length(turn_status_h), // 026 turn-status row
                 Constraint::Length(1), // separator
                 Constraint::Length(if self.show_status_bar { 1 } else { 0 }), // status bar
                 Constraint::Length(queue_height),
@@ -26,6 +38,7 @@ impl App {
         self.render_output(frame, chunks[0]);
         if shelf_height > 0 {
             let edit_ledger_caption = self.stream_presentation.edit_ledger.caption();
+            let tool_usage_caption = self.stream_presentation.tool_usage_caption();
             let thinking_truncated = self.stream_presentation.shelf_thinking_truncated();
             render_activity_shelf(
                 frame,
@@ -39,28 +52,50 @@ impl App {
                     animate: self.animate_status_indicators,
                     verbose_tools: self.tool_progress_mode == ToolProgressMode::Verbose,
                     edit_ledger_caption: edit_ledger_caption.as_deref(),
+                    tool_usage_caption: tool_usage_caption.as_deref(),
                     thinking_truncated: thinking_truncated.as_deref(),
                 },
             );
         }
+        if turn_status_h > 0 {
+            let tool_generating = matches!(
+                self.turn_activity.phase,
+                crate::turn_activity::ShelfPhase::GeneratingTool
+            );
+            crate::turn_status_row::render_turn_status(
+                frame,
+                chunks[2],
+                &crate::turn_status_row::TurnStatusParams {
+                    presentation: &self.stream_presentation,
+                    theme: &self.theme,
+                    spinner_frame: self.shelf_spinner_frame(),
+                    glyphs: self.terminal_glyph_profile,
+                    animate: self.animate_status_indicators,
+                    is_processing: self.is_processing,
+                    tool_generating,
+                    token_hint: None,
+                    show_stop_affordance: self.is_processing,
+                },
+            );
+        }
         // Thin horizontal separator between output/shelf and status
-        let sep = Paragraph::new(Line::from("─".repeat(chunks[2].width as usize)))
+        let sep = Paragraph::new(Line::from("─".repeat(chunks[3].width as usize)))
             .style(Style::default().fg(Color::Rgb(60, 60, 70)));
-        frame.render_widget(sep, chunks[2]);
+        frame.render_widget(sep, chunks[3]);
         if self.show_status_bar {
-            self.render_status_bar(frame, chunks[3]);
+            self.render_status_bar(frame, chunks[4]);
         }
         if queue_height > 0 {
             crate::queued_messages::render_queued_messages(
                 frame,
-                chunks[4],
+                chunks[5],
                 &self.prompt_queue,
                 self.queue_edit_idx,
                 &self.theme,
             );
         }
         if !self.grok_auth.active {
-            self.render_input(frame, chunks[5]);
+            self.render_input(frame, chunks[6]);
         }
 
         // Model selector overlay (full screen)
@@ -314,6 +349,20 @@ impl App {
 
     /// Render the scrollable output area with markdown formatting and a scrollbar.
     pub(super) fn render_output(&mut self, frame: &mut Frame, area: Rect) {
+        // 026 D2/E5: invalidate wrap cache on width change; paint live assistant via
+        // checkpointed StreamingMarkdown when a stream line is active.
+        let width = area.width.saturating_sub(4);
+        if let Some(idx) = self.streaming_line
+            && idx < self.output.len()
+            && self.output[idx].role == OutputRole::Assistant
+            && self.is_processing
+        {
+            let painted = self.assistant_stream_md.render_cached(width);
+            if !painted.is_empty() {
+                self.output[idx].rendered = Some(painted);
+            }
+        }
+
         let paging_key_hint = self.paging_key_hint_label();
         let mut metrics = TranscriptScrollMetrics {
             scroll_offset: self.scroll_offset,
@@ -341,6 +390,7 @@ impl App {
         self.output_visual_rows = metrics.output_visual_rows;
         self.output_area_height = metrics.output_area_height;
         self.at_bottom = metrics.at_bottom;
+        self.sync_follow_from_bottom();
     }
 
     /// Render the status bar with spinner and color-coded metrics.
