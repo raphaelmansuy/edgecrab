@@ -229,6 +229,14 @@ jobs:
       - name: Wait for crates.io index (migrate)
         run: wait_for_crate_version edgecrab-migrate "$CRATE_VERSION"
 
+      - name: Publish edgecrab-proxy
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: publish_crate edgecrab-proxy --no-verify
+
+      - name: Wait for crates.io index (proxy)
+        run: wait_for_crate_version edgecrab-proxy "$CRATE_VERSION"
+
       - name: Publish edgecrab-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
