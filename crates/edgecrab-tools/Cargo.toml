@@ -75,5 +75,6 @@ tempfile = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 edgecrab-types = { workspace = true }
-edgecrab-core = { workspace = true }
+# Do NOT add edgecrab-core here — cargo publish resolves it from crates.io and
+# tools must publish before core (core depends on tools).
 serial_test = "3"

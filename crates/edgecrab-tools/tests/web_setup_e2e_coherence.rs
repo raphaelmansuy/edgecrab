@@ -117,7 +117,9 @@ fn e2e_app_config_load_from_migrates_legacy_search_override() {
         },
     )
     .expect("legacy");
-    edgecrab_core::AppConfig::load_from(&path).expect("load");
+    // Same migration AppConfig::load_from invokes — keep this crate free of
+    // edgecrab-core so crates.io publish order (tools → core) stays acyclic.
+    ensure_web_search_config_coherence_at(&path);
     assert!(search_section_override_from_path(&path).is_none());
     let search = load_web_search_config_from_path(&path).expect("search");
     assert_eq!(search.primary, "brave");
