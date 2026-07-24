@@ -72,6 +72,8 @@ jobs:
 
           git add \
             Cargo.toml \
+            sdks/node/package.json \
+            sdks/node/package-lock.json \
             sdks/nodejs-native/index.js \
             sdks/nodejs-native/package-lock.json \
             sdks/nodejs-native/package.json \
@@ -82,6 +84,11 @@ jobs:
 
           git commit -m "chore: bump version to $VERSION"
           git tag "v$VERSION"
+          # Prefer a fine-grained PAT with bypass (branch protection blocks GITHUB_TOKEN
+          # on required-check / PR-only main). Fall back to GITHUB_TOKEN for forks.
+          if [ -n "${{ secrets.RELEASE_PUSH_TOKEN }}" ]; then
+            git remote set-url origin "https://x-access-token:${{ secrets.RELEASE_PUSH_TOKEN }}@github.com/${{ github.repository }}.git"
+          fi
           git push origin HEAD:main
           git push origin "v$VERSION"
 
