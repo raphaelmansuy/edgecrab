@@ -15,6 +15,7 @@ use edgecrab_tools::build_copilot_provider;
 use edgequake_llm::providers::gemini::GeminiModelsResponse;
 use edgequake_llm::{
     CopilotModelsResponse, GeminiProvider, LMStudioProvider, OllamaProvider, OpenRouterProvider,
+    list_cached_model_ids, resolve_mtplx_runtime_config, resolve_omlx_runtime_config,
 };
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,51 @@ static NVIDIA_DISCOVERY: OpenAICompatibleDiscovery = OpenAICompatibleDiscovery {
     api_key_envs: &["NVIDIA_API_KEY"],
     default_base_url: "https://integrate.api.nvidia.com/v1",
 };
+/// Dedicated oMLX adapter — API key is optional in env because many installs
+/// only store the key in `~/.omlx/settings.json` (OpenAICompatibleDiscovery
+/// would skip entirely when `OMLX_API_KEY` is unset).
+struct OmlxDiscovery;
+struct MtplxDiscovery;
+
+static OMLX_DISCOVERY: OmlxDiscovery = OmlxDiscovery;
+static MTPLX_DISCOVERY: MtplxDiscovery = MtplxDiscovery;
+
+/// Local OpenAI-compatible servers that need no API key (key optional).
+/// Uses short local TTL — models load/unload frequently on Mac labs.
+struct LocalOpenAiDiscovery {
+    canonical: &'static str,
+    aliases: &'static [&'static str],
+    base_url_envs: &'static [&'static str],
+    api_key_envs: &'static [&'static str],
+    default_base_url: &'static str,
+}
+
+static LLAMACPP_DISCOVERY: LocalOpenAiDiscovery = LocalOpenAiDiscovery {
+    canonical: "llamacpp",
+    aliases: &["llama-server", "llama.cpp", "llamacpp-server"],
+    base_url_envs: &[
+        "LLAMACPP_HOST",
+        "LLAMA_SERVER_HOST",
+        "LLAMACPP_BASE_URL",
+        "LLAMA_SERVER_BASE_URL",
+    ],
+    api_key_envs: &["LLAMACPP_API_KEY", "LLAMA_SERVER_API_KEY"],
+    default_base_url: "http://127.0.0.1:8080",
+};
+static VLLM_MLX_DISCOVERY: LocalOpenAiDiscovery = LocalOpenAiDiscovery {
+    canonical: "vllm-mlx",
+    aliases: &["vllm_mlx", "vllmmx"],
+    base_url_envs: &["VLLM_MLX_HOST", "VLLM_MLX_BASE_URL"],
+    api_key_envs: &["VLLM_MLX_API_KEY"],
+    default_base_url: "http://127.0.0.1:8000",
+};
+static MLX_LM_DISCOVERY: LocalOpenAiDiscovery = LocalOpenAiDiscovery {
+    canonical: "mlx-lm",
+    aliases: &["mlx_lm", "mlxlm"],
+    base_url_envs: &["MLX_LM_HOST", "MLX_LM_BASE_URL", "MLXLM_HOST"],
+    api_key_envs: &["MLX_LM_API_KEY", "MLXLM_API_KEY"],
+    default_base_url: "http://127.0.0.1:8080",
+};
 
 #[cfg(feature = "bedrock-model-discovery")]
 static BEDROCK_DISCOVERY: BedrockDiscovery = BedrockDiscovery;
@@ -153,6 +199,11 @@ fn adapters() -> Vec<&'static dyn ModelDiscoveryAdapter> {
         &GROQ_DISCOVERY,
         &DEEPSEEK_DISCOVERY,
         &NVIDIA_DISCOVERY,
+        &OMLX_DISCOVERY,
+        &MTPLX_DISCOVERY,
+        &LLAMACPP_DISCOVERY,
+        &VLLM_MLX_DISCOVERY,
+        &MLX_LM_DISCOVERY,
     ];
     #[cfg(feature = "bedrock-model-discovery")]
     {
@@ -310,6 +361,17 @@ pub fn merge_grouped_catalog_with_dynamic(
         let set = map.entry(entry.provider.clone()).or_default();
         for model in &entry.models {
             set.insert(model.clone());
+        }
+        // When live inventory is non-empty, drop static placeholders for local
+        // servers so the picker shows real model ids only.
+        if !entry.models.is_empty()
+            && matches!(
+                entry.provider.as_str(),
+                "omlx" | "mtplx" | "llamacpp" | "vllm-mlx" | "mlx-lm" | "lmstudio" | "ollama"
+            )
+            && matches!(entry.source, DiscoverySource::Live | DiscoverySource::Cache)
+        {
+            set.remove("default");
         }
     }
 
@@ -585,6 +647,110 @@ impl ModelDiscoveryAdapter for LMStudioDiscovery {
             .or_else(|_| std::env::var("LMSTUDIO_HOST"))
             .unwrap_or_else(|_| "http://127.0.0.1:1234".to_string());
         fetch_openai_compatible_models(&base_url, None).await
+    }
+}
+
+#[async_trait]
+impl ModelDiscoveryAdapter for OmlxDiscovery {
+    fn canonical_name(&self) -> &'static str {
+        "omlx"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["o-mlx", "o_mlx"]
+    }
+
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(LOCAL_CACHE_TTL_SECS)
+    }
+
+    async fn fetch_models(&self) -> anyhow::Result<Vec<String>> {
+        let cfg = resolve_omlx_runtime_config();
+        // Always attempt the live call. Key may come from ~/.omlx/settings.json
+        // even when OMLX_API_KEY is unset — do not bail early.
+        fetch_openai_compatible_models(&cfg.host, cfg.api_key.as_deref())
+            .await
+            .with_context(|| {
+                format!(
+                    "oMLX discovery failed at {} (set OMLX_HOST / OMLX_API_KEY or check ~/.omlx/settings.json)",
+                    cfg.host
+                )
+            })
+    }
+}
+
+#[async_trait]
+impl ModelDiscoveryAdapter for MtplxDiscovery {
+    fn canonical_name(&self) -> &'static str {
+        "mtplx"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["mtp-lx", "mtp_lx", "mtpl-x"]
+    }
+
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(LOCAL_CACHE_TTL_SECS)
+    }
+
+    async fn fetch_models(&self) -> anyhow::Result<Vec<String>> {
+        let cfg = resolve_mtplx_runtime_config();
+        match fetch_openai_compatible_models(&cfg.host, cfg.api_key.as_deref()).await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) => {
+                let cached = list_cached_model_ids();
+                if cached.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(cached)
+                }
+            }
+            Err(err) => {
+                let cached = list_cached_model_ids();
+                if cached.is_empty() {
+                    Err(err).with_context(|| {
+                        format!(
+                            "MTPLX discovery failed at {} (run `mtplx quickstart` or set MTPLX_HOST)",
+                            cfg.host
+                        )
+                    })
+                } else {
+                    Ok(cached)
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ModelDiscoveryAdapter for LocalOpenAiDiscovery {
+    fn canonical_name(&self) -> &'static str {
+        self.canonical
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        self.aliases
+    }
+
+    fn cache_ttl(&self) -> Duration {
+        Duration::from_secs(LOCAL_CACHE_TTL_SECS)
+    }
+
+    async fn fetch_models(&self) -> anyhow::Result<Vec<String>> {
+        // API key optional for local servers (empty key list → never skip).
+        let api_key = first_non_empty_env(self.api_key_envs);
+        let base_url = first_non_empty_env(self.base_url_envs)
+            .unwrap_or_else(|| self.default_base_url.to_string());
+        fetch_openai_compatible_models(&base_url, api_key.as_deref())
+            .await
+            .with_context(|| {
+                format!(
+                    "{} discovery failed at {} (start the server or set {})",
+                    self.canonical,
+                    base_url,
+                    self.base_url_envs.first().copied().unwrap_or("HOST")
+                )
+            })
     }
 }
 

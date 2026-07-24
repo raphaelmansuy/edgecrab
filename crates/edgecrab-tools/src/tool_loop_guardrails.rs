@@ -424,9 +424,11 @@ mod tests {
 
     #[test]
     fn hard_stop_blocks_identical_failure() {
-        let mut cfg = ToolLoopGuardrailConfig::default();
-        cfg.hard_stop_enabled = true;
-        cfg.exact_failure_block_after = 2;
+        let cfg = ToolLoopGuardrailConfig {
+            hard_stop_enabled: true,
+            exact_failure_block_after: 2,
+            ..Default::default()
+        };
         let mut ctrl = ToolLoopGuardrailController::new(cfg);
         let args = r#"{"command":"false"}"#;
         ctrl.after_call("terminal", args, r#"{"exit_code":1}"#, None);

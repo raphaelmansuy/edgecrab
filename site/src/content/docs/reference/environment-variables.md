@@ -208,7 +208,32 @@ These are not `EDGECRAB_*` variables — they are standard API key env vars dete
 | `ZAI_API_KEY` | Z.AI |
 | `GITHUB_TOKEN` | GitHub Copilot |
 
-Ollama and LM Studio require no API key (local inference only).
+### Local inference (optional keys; no cloud billing)
+
+| Variable | Provider / role |
+|----------|-----------------|
+| `OLLAMA_HOST` / `OLLAMA_BASE_URL` | Ollama base (default `:11434`) |
+| `OLLAMA_TIMEOUT_SECONDS` | Ollama HTTP timeout |
+| `LMSTUDIO_HOST` / `LMSTUDIO_BASE_URL` | LM Studio base (default `:1234`) |
+| `LMSTUDIO_TIMEOUT_SECONDS` | LM Studio HTTP timeout |
+| `OMLX_HOST` / `OMLX_BASE_URL` | oMLX base (default `:9050`; else `~/.omlx/settings.json`) |
+| `OMLX_API_KEY` | oMLX bearer (else settings `auth.api_key`) |
+| `OMLX_TIMEOUT_SECONDS` | oMLX HTTP timeout |
+| `MTPLX_HOST` / `MTPLX_BASE_URL` | MTPLX base (else app settings.port) |
+| `MTPLX_API_KEY` | Optional MTPLX bearer |
+| `MTPLX_TIMEOUT_SECONDS` | MTPLX HTTP timeout |
+| `LLAMACPP_HOST` / `LLAMA_SERVER_HOST` / `LLAMACPP_BASE_URL` | llama-server base (default `:8080`) |
+| `LLAMACPP_API_KEY` / `LLAMA_SERVER_API_KEY` | Optional bearer |
+| `LLAMACPP_TIMEOUT_SECONDS` | llama-server HTTP timeout |
+| `VLLM_MLX_HOST` / `VLLM_MLX_BASE_URL` | vLLM-MLX base (default `:8000`) |
+| `VLLM_MLX_API_KEY` | Optional bearer |
+| `VLLM_MLX_TIMEOUT_SECONDS` | HTTP timeout |
+| `MLX_LM_HOST` / `MLX_LM_BASE_URL` / `MLXLM_HOST` | mlx_lm.server base (default `:8080`) |
+| `MLX_LM_API_KEY` / `MLXLM_API_KEY` | Optional bearer |
+| `MLX_LM_TIMEOUT_SECONDS` | HTTP timeout |
+| `LLAMACPP_E2E` / `VLLM_MLX_E2E` / `MLX_LM_E2E` | Set to `1` to require live models in citizenship e2e tests |
+
+Config overrides: `provider_endpoints.<id>.base_url` in `config.yaml`, or TUI `/endpoint`. See [Local Models](/providers/local/).
 
 ---
 

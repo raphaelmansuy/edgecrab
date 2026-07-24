@@ -256,6 +256,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
+    #[allow(clippy::await_holding_lock)] // intentional: env isolation mutex across prepare await
     async fn prepare_uses_static_key_without_auth_json() {
         let _guard = crate::gateway_catalog::lock_test_env();
         let home = tempfile::tempdir().expect("home");
@@ -279,6 +280,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
+    #[allow(clippy::await_holding_lock)] // intentional: env isolation mutex across prepare await
     async fn prepare_loads_oauth_from_auth_json() {
         let _guard = crate::gateway_catalog::lock_test_env();
         let home = tempfile::tempdir().expect("home");
@@ -325,6 +327,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(edgecrab_home_env)]
+    #[allow(clippy::await_holding_lock)] // intentional: env isolation mutex across prepare await
     async fn prefer_oauth_overrides_static_key_when_tokens_present() {
         let _guard = crate::gateway_catalog::lock_test_env();
         let home = tempfile::tempdir().expect("home");

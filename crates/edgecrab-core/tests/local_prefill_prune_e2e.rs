@@ -118,7 +118,7 @@ fn lh30_mid_band_triggers_preflight_prune() {
 
     assert_eq!(budget, 32_000);
     assert!(
-        before >= 34_000 && before <= 40_000,
+        (34_000..=40_000).contains(&before),
         "fixture must match homelab mid band (got {before})"
     );
     assert!(
@@ -240,7 +240,7 @@ fn lh32_high_band_triggers_local_structural_compress_not_llm() {
     let params = lmstudio_compression_params();
 
     assert!(
-        before >= 55_000 && before <= 65_000,
+        (55_000..=65_000).contains(&before),
         "fixture must sit in high band (got {before})"
     );
     assert!(before > mid, "before={before} mid={mid}");

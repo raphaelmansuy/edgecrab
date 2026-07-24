@@ -43,7 +43,7 @@ fn tui_stream_ux_semantic_rows_snapshot() {
     stream.record_edit("src/app.rs", 1, 1);
     let _ = stream.on_token();
 
-    let entries = vec![
+    let entries = [
         RenderEntry::from_finished_thinking(&thought),
         RenderEntry::tool(ToolEntryArgs {
             name: tool.name,

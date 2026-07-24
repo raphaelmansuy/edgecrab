@@ -156,6 +156,7 @@ mod key_dispatch;
 mod log_session_browsers;
 mod mode_selectors;
 mod model_selectors;
+mod provider_endpoint_overlay;
 mod queue_edit;
 mod remote_skill_guard;
 mod replay_command;
@@ -4098,6 +4099,8 @@ pub struct App {
     /// Skin browser overlay (activated by `/skin list`)
     skin_browser: FuzzySelector<SkinEntry>,
     /// Verbose / tool-progress picker overlay (activated by `/verbose` with no args)
+    /// Per-provider base URL override dialog (`/endpoint`).
+    provider_endpoint_overlay: Option<crate::provider_endpoint_overlay::ProviderEndpointOverlay>,
     verbose_selector_active: bool,
     /// Which row is highlighted in the verbose picker (0=Off,1=New,2=All,3=Verbose)
     verbose_selector_cursor: usize,
@@ -5341,6 +5344,7 @@ impl App {
             gateway_browser_pane: DetailPaneState::default(),
             diagnose_panel: DiagnosePanelState::default(),
             skin_browser: FuzzySelector::new(),
+            provider_endpoint_overlay: None,
             verbose_selector_active: false,
             verbose_selector_cursor: 3, // default to Verbose (the new default mode)
             reasoning_selector_active: false,
@@ -11022,6 +11026,9 @@ impl App {
             }
             CommandResult::ModelSelector => {
                 self.refresh_model_selector_catalog();
+            }
+            CommandResult::ProviderEndpointOverlay => {
+                self.open_provider_endpoint_overlay();
             }
             CommandResult::CheapModelSelector => {
                 self.open_cheap_model_selector();
@@ -18084,7 +18091,19 @@ impl App {
             .unwrap_or_default();
         let dynamic_providers: Vec<String> = live_discovery_providers()
             .into_iter()
-            .filter(|provider| provider == "ollama" || provider == "lmstudio")
+            .filter(|provider| {
+                matches!(
+                    provider.as_str(),
+                    "ollama"
+                        | "lmstudio"
+                        | "omlx"
+                        | "mtplx"
+                        | "llamacpp"
+                        | "vllm-mlx"
+                        | "mlx-lm"
+                        | "vllm"
+                )
+            })
             .collect();
         let dynamic_models = self
             .rt_handle
@@ -24674,10 +24693,9 @@ kind = "skill"
             !app.remote_skill_browser.selector.items.is_empty(),
             "partial must paint rows"
         );
-        assert_eq!(
+        assert!(
             browse_page_cache::marketplace_browse_range_label_with_catalog(0, 1, 1, true, None)
-                .contains("loading"),
-            true
+                .contains("loading")
         );
     }
 

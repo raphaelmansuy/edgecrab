@@ -107,6 +107,7 @@ fn lifecycle_hooks_home_respects_edgecrab_home() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // intentional: env isolation mutex across hook emit await
 async fn lifecycle_hook_emit_runs_discovered_script() {
     let _guard = env_lock();
     let tmp = TempDir::new().expect("tmpdir");

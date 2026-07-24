@@ -4538,7 +4538,7 @@ mod tests {
             .flat_map(|g| g.results.iter().map(|s| s.name.as_str()))
             .collect();
         assert!(
-            names.iter().any(|n| *n == "browse-demo"),
+            names.contains(&"browse-demo"),
             "empty-query browse should list seeded index skills, got {names:?}"
         );
     }
@@ -4591,7 +4591,7 @@ mod tests {
     #[test]
     fn skills_sh_browse_is_frugal_two_seeds() {
         assert_eq!(SKILLS_SH_BROWSE_SEEDS, &["skill", "ai"]);
-        assert!(SKILLS_SH_PER_SEED_MAX <= 40);
+        const { assert!(SKILLS_SH_PER_SEED_MAX <= 40) };
         assert!(skills_sh_is_rate_limited(
             "skills.sh returned HTTP 429: rate_limit_exceeded"
         ));

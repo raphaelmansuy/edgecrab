@@ -126,6 +126,16 @@ pub fn map_skill_trust_key(
     }
 }
 
+impl Default for SkillTrustKeyContext {
+    fn default() -> Self {
+        Self {
+            pane: SkillTrustPane::Findings,
+            needs_trust: false,
+            review_only: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,15 +226,5 @@ mod tests {
             ),
             SkillTrustOverlayAction::JumpToFindingFile
         );
-    }
-}
-
-impl Default for SkillTrustKeyContext {
-    fn default() -> Self {
-        Self {
-            pane: SkillTrustPane::Findings,
-            needs_trust: false,
-            review_only: false,
-        }
     }
 }

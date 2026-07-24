@@ -8,11 +8,29 @@ sidebar:
 All notable changes to EdgeCrab are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-Last updated: 2026-07-20
+Last updated: 2026-07-24
 
 ---
 
 ## [Unreleased]
+
+## [0.12.0] — 2026-07-24
+
+### Added
+
+- **oMLX / MTPLX first-class local providers** — catalog, live `/v1/models`, settings-aware hosts, local agent harness, zero-cost, `/endpoint`, setup/doctor badges. Requires `edgequake-llm` ≥ 0.10.3.
+- **llama-server / vLLM-MLX / mlx-lm** (Wave D–F) — ids `llamacpp`, `vllm-mlx`, `mlx-lm` via shared `LocalOpenAiProvider` in edgequake-llm; discovery, harness, doctor multi-port probes, optional `LLAMACPP_E2E` / `VLLM_MLX_E2E` / `MLX_LM_E2E`.
+- **Local prefix/KV freeze** — stable tool wire schemas on local providers for multi-turn TTFT.
+- **`/endpoint` TUI** — per-provider base URL browse/edit/probe.
+
+### Changed
+
+- **`edgequake-llm` v0.10.3** — crates.io pin.
+- **CI** — faster offline jobs (shallow checkout, shared caches, install-action for audit/wasm-pack, frozen pnpm, single-threaded Ubuntu tests); `scripts/ci-local.sh`.
+
+### Docs
+
+- Site: [Local Models](/providers/local/) rewritten for all Mac/desktop local citizens; [Provider Overview](/providers/overview/) updated; env-var table for local hosts/keys.
 
 ## [0.11.0] — 2026-07-20
 

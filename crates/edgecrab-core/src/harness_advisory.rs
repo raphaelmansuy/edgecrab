@@ -657,7 +657,7 @@ mod tests {
 
         let mut harness = HarnessTurnAdvisory::new();
         let mut messages = vec![Message::user("make demo/games003/index.html beautiful UX")];
-        let tool_names: Vec<&str> = std::iter::repeat("terminal").take(6).collect();
+        let tool_names: Vec<&str> = std::iter::repeat_n("terminal", 6).collect();
         apply_harness_advisories(
             &mut harness,
             &mut messages,

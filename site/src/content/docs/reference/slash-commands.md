@@ -63,7 +63,8 @@ MCP          /mcp /mcp-token
 
 | Command | Description |
 |---------|-------------|
-| `/model [name]` | Show current model or switch (e.g. `/model ollama/gemma4:latest`) |
+| `/model [name]` | Show current model or switch (e.g. `/model ollama/gemma4:latest`, `/model omlx/…`, `/model llamacpp/…`) |
+| `/endpoint` | Per-provider base URL override (local ports, probes `/v1/models`); aliases `/endpoints`, `/provider-url`, `/base-url` |
 | `/cheap_model [spec]` | Open, show, or set the cheap smart-routing model; `/cheap_model off` disables it |
 | `/models [provider]` | List models; `/models <provider>` queries live, `/models refresh` refreshes cache |
 | `/image_model [spec]` | Open image-model selector, or set/show the default image-generation backend |

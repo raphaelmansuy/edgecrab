@@ -767,3 +767,55 @@ providers:
       - model: "default"
         context: 128000
         tier: standard
+
+  # ─── oMLX (local MLX / Apple Silicon) ───────────────────────────
+  # Live models come from GET {OMLX_HOST}/v1/models (default :9050).
+  # Static "default" is a seed so the provider appears before discovery.
+  omlx:
+    label: "oMLX (local MLX · :9050)"
+    default_model: "default"
+    models:
+      - model: "default"
+        context: 128000
+        tier: standard
+
+  # ─── MTPLX (local MTP / Apple Silicon) ──────────────────────────
+  # Live models: GET {MTPLX_HOST}/v1/models; settings.port often 8002.
+  mtplx:
+    label: "MTPLX (local MTP · Apple Silicon)"
+    default_model: "default"
+    models:
+      - model: "default"
+        context: 131072
+        tier: standard
+
+  # ─── llama-server (llama.cpp Metal GGUF) ────────────────────────
+  # Live models: GET {LLAMACPP_HOST}/v1/models (default :8080).
+  llamacpp:
+    label: "llama-server (GGUF · :8080)"
+    default_model: "default"
+    models:
+      - model: "default"
+        context: 128000
+        tier: standard
+
+  # ─── vLLM-MLX (local MLX continuous batching) ───────────────────
+  # Live models: GET {VLLM_MLX_HOST}/v1/models (default :8000).
+  vllm-mlx:
+    label: "vLLM-MLX (local MLX · batching)"
+    default_model: "default"
+    models:
+      - model: "default"
+        context: 128000
+        tier: standard
+
+  # ─── mlx_lm.server (official Apple MLX-LM) ──────────────────────
+  # Live models: GET {MLX_LM_HOST}/v1/models (default :8080).
+  mlx-lm:
+    label: "mlx-lm (MLX-LM server · :8080)"
+    default_model: "default"
+    models:
+      - model: "default"
+        context: 128000
+        tier: standard
+

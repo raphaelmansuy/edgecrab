@@ -596,6 +596,12 @@ impl App {
             return;
         }
 
+        // Provider base URL overlay — intercept all keys while open
+        if self.provider_endpoint_overlay.is_some() {
+            self.handle_provider_endpoint_key(key);
+            return;
+        }
+
         // Verbose / tool-progress picker overlay active — intercept all keys
         if self.verbose_selector_active {
             match key.code {

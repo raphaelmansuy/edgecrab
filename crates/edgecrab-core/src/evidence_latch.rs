@@ -1022,11 +1022,13 @@ mod tests {
 
     #[test]
     fn heal_allows_exact_server_command() {
-        let mut st = EvidenceState::default();
-        st.last_heal_port = Some(8000);
-        st.last_heal_dir = Some(PathBuf::from("demos/chess"));
-        st.phase = EvidencePhase::Heal;
-        st.heal_remaining = 1;
+        let st = EvidenceState {
+            last_heal_port: Some(8000),
+            last_heal_dir: Some(PathBuf::from("demos/chess")),
+            phase: EvidencePhase::Heal,
+            heal_remaining: 1,
+            ..Default::default()
+        };
         assert_eq!(
             st.terminal_heal_policy("python3 -m http.server 8000 --directory demos/chess"),
             Some(true)
@@ -1037,10 +1039,12 @@ mod tests {
 
     #[test]
     fn allowed_action_message_heal_mentions_only_heal() {
-        let mut st = EvidenceState::default();
-        st.phase = EvidencePhase::Heal;
-        st.last_heal_port = Some(8000);
-        st.last_heal_dir = Some(PathBuf::from("demos/chess"));
+        let st = EvidenceState {
+            phase: EvidencePhase::Heal,
+            last_heal_port: Some(8000),
+            last_heal_dir: Some(PathBuf::from("demos/chess")),
+            ..Default::default()
+        };
         let msg = st.allowed_action_message();
         assert!(msg.contains("HEAL"));
         assert!(msg.contains("http.server"));

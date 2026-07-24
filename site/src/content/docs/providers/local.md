@@ -1,17 +1,58 @@
 ---
-title: Local Models (Ollama & LM Studio)
-description: Run EdgeCrab completely offline with Ollama or LM Studio. Model recommendations, configuration, performance tips, and GPU acceleration.
+title: Local Models (Mac & Desktop)
+description: Run EdgeCrab offline with Ollama, LM Studio, oMLX, MTPLX, llama-server, vLLM-MLX, and mlx_lm.server. Ports, env vars, /endpoint, agent harness, and Apple Silicon tips.
 sidebar:
   order: 2
 ---
 
-EdgeCrab works with local LLMs through Ollama and LM Studio — no API keys, no internet, no billing. This is the recommended setup for air-gapped environments, privacy-sensitive work, or learning without cost.
+EdgeCrab first-classes several **local OpenAI-compatible** servers. No cloud API key is required for local inference (optional bearer keys are supported where the server enforces auth). All local providers share the same agent harness: non-streaming tool turns when needed, no dual-request on timeout, zero-cost pricing, prefix/KV tool-schema freeze, live `/v1/models` discovery, and `/endpoint` base-URL overrides.
+
+---
+
+## Quick chooser
+
+| Goal | Provider id | Typical port | Notes |
+|------|-------------|--------------|--------|
+| Easiest install | `ollama` | **11434** | Ubiquitous; Metal / MLX path on recent Ollama |
+| GUI + MLX speed | `lmstudio` | **1234** | Desktop app; load a model then Start Server |
+| Best agent TTFT / SSD KV | `omlx` | **9050** | oMLX menu bar; reads `~/.omlx/settings.json` |
+| Speculative decode (MTP) | `mtplx` | settings / **8000** | MTPLX app; often `settings.port` = 8002 |
+| Hermes-style GGUF control | `llamacpp` | **8080** | `llama-server` (llama.cpp Metal) |
+| Dev batching without oMLX app | `vllm-mlx` | **8000** | May collide with MTPLX — use `/endpoint` |
+| Official Apple one-liner | `mlx-lm` | **8080** | `mlx_lm.server` — may collide with llama-server |
+
+```bash
+edgecrab --model ollama/llama3.3 "work offline"
+edgecrab --model omlx/<id>
+edgecrab --model mtplx/<id>
+edgecrab --model llamacpp/<id>
+edgecrab --model vllm-mlx/<id>
+edgecrab --model mlx-lm/<id>
+```
+
+**Port collisions:** TCP open ≠ product identity. Prefer `edgecrab doctor` and `GET /v1/models` labeled by configured provider. Override with TUI `/endpoint` (aliases `/endpoints`, `/provider-url`, `/base-url`).
+
+---
+
+## Shared local family behavior
+
+| Behavior | Detail |
+|----------|--------|
+| Live discovery | `GET {host}/v1/models` (short local cache TTL) |
+| Cost | $0 for all local provider ids |
+| Tool turns | Prefer non-streaming completion for large tool JSON |
+| Timeouts | Do **not** retry transport failures (avoids stacked generations) |
+| Prefix / KV | Tool wire schemas frozen after first annotate for the session |
+| Base URL | Config `provider_endpoints.<id>.base_url` or env host vars |
+
+Canonical ids in `LOCAL_INFERENCE_PROVIDERS`:  
+`ollama`, `lmstudio`, `omlx`, `mtplx`, `vllm`, `vllm-mlx`, `llamacpp`, `mlx-lm`.
 
 ---
 
 ## Ollama
 
-[Ollama](https://ollama.com) is the easiest way to run LLMs locally. It handles model downloads, quantization, GPU acceleration, and serves a local OpenAI-compatible API.
+[Ollama](https://ollama.com) is the easiest way to run LLMs locally.
 
 ### Installation
 
@@ -21,195 +62,233 @@ brew install ollama
 
 # Linux
 curl -fsSL https://ollama.com/install.sh | sh
-
-# Windows
-# Download from https://ollama.com/download
 ```
 
-### Start the Server
+### Start and pull
 
 ```bash
 ollama serve
 # Listening on http://127.0.0.1:11434
+
+ollama pull llama3.3
+ollama pull codestral
+ollama pull qwen2.5-coder:7b
 ```
 
-Keep this running in a terminal (or as a background service) while using EdgeCrab.
-
-### Pull Models
+### EdgeCrab
 
 ```bash
-ollama pull llama3.3          # General-purpose flagship (4.9 GB, 4-bit)
-ollama pull codestral         # Code-specialized model (4.1 GB)
-ollama pull gemma3:27b        # Google Gemma 3 27B (16 GB)
-ollama pull qwen2.5-coder:7b  # Qwen 2.5 Coder 7B (4.4 GB, fast)
-ollama pull phi4              # Microsoft Phi-4 (8.1 GB)
-```
-
-Check available models:
-
-```bash
-ollama list
-```
-
-### Using with EdgeCrab
-
-```bash
-# One-off session
 edgecrab --model ollama/llama3.3
-
-# Make Ollama the default
-edgecrab setup   # Choose "ollama" when prompted
+edgecrab setup   # choose ollama
 ```
-
-In `config.yaml`:
 
 ```yaml
+# config.yaml
 provider: ollama
 model: llama3.3
 ```
 
-### Recommended Models by Use Case
-
-| Use Case | Model | Size | Notes |
-|----------|-------|------|-------|
-| General coding | `codestral` | 4.1 GB | Best code model for Ollama |
-| General purpose | `llama3.3` | 4.9 GB | Meta's latest, excellent quality |
-| Fast, lightweight | `qwen2.5-coder:7b` | 4.4 GB | Great performance for size |
-| High quality (needs 16+ GB) | `gemma3:27b` | 16 GB | Excellent reasoning |
-| Fastest response | `phi4` | 8.1 GB | Microsoft's efficient model |
-
-### GPU Acceleration
-
-Ollama automatically uses your GPU if available:
-- **Apple Silicon (M1/M2/M3/M4)**: uses Metal via llama.cpp — full GPU acceleration
-- **NVIDIA**: CUDA support automatic with compatible drivers
-- **AMD**: ROCm support on Linux
-
-Check GPU utilization:
-
-```bash
-# macOS
-sudo powermetrics --samplers gpu_power -i1000 -n1
-
-# Linux (NVIDIA)
-nvidia-smi
-```
+Env: `OLLAMA_HOST` / `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434`).
 
 ---
 
 ## LM Studio
 
-[LM Studio](https://lmstudio.ai) is a desktop application for downloading and running local models with a GUI.
-
-### Setup
-
-1. Download LM Studio from [lmstudio.ai](https://lmstudio.ai)
-2. Install and open it
-3. Search for and download a model (e.g. "Llama 3.3", "Codestral")
-4. Click **"Start Server"** in the Local Server tab
-
-The server starts on `http://localhost:1234` with an OpenAI-compatible API.
-
-### Using with EdgeCrab
+1. Download [LM Studio](https://lmstudio.ai)
+2. Download a model in the app
+3. **Start Server** (default `http://127.0.0.1:1234`)
 
 ```bash
-# Use whatever model is currently loaded in LM Studio
-edgecrab --model lmstudio/local-model
+edgecrab --model lmstudio/<loaded-model-id>
 ```
 
-In `config.yaml`:
+Env: `LMSTUDIO_HOST` / `LMSTUDIO_BASE_URL`.
 
-```yaml
-provider: lmstudio
-model: local-model    # Any string — LM Studio ignores the model name and uses the loaded model
+---
+
+## oMLX (Apple Silicon MLX)
+
+Menu-bar MLX server with multi-model support and agent-friendly KV behavior.
+
+| | |
+|--|--|
+| Id | `omlx` |
+| Default | `http://127.0.0.1:9050` |
+| Settings | `~/.omlx/settings.json` (`server.port`, `auth.api_key`) |
+| Env | `OMLX_HOST`, `OMLX_BASE_URL`, `OMLX_API_KEY`, `OMLX_TIMEOUT_SECONDS` |
+
+```bash
+edgecrab --model omlx/<model-from-/v1/models>
 ```
 
 ---
 
-## Performance Tips
+## MTPLX (native MTP)
 
-### Context Length
+Speculative decoding (MTP) on Apple Silicon.
 
-Local models typically support 8K–32K context windows (much less than cloud models). EdgeCrab automatically compresses history when approaching the limit, but you can also reduce it:
+| | |
+|--|--|
+| Id | `mtplx` |
+| Default | `http://127.0.0.1:8000` (often overridden by settings.port, e.g. 8002) |
+| Settings | `~/Library/Application Support/MTPLX/settings.json` |
+| Env | `MTPLX_HOST`, `MTPLX_BASE_URL`, `MTPLX_API_KEY`, `MTPLX_TIMEOUT_SECONDS` |
+| Offline inventory | `~/.mtplx/models` when API is down |
+
+```bash
+edgecrab --model mtplx/<id>
+```
+
+---
+
+## llama-server (`llamacpp`)
+
+[llama.cpp](https://github.com/ggerganov/llama.cpp) **llama-server** — Metal GGUF path (Hermes Mac guide parity).
+
+| | |
+|--|--|
+| Id | `llamacpp` |
+| Aliases | `llama-server`, `llama.cpp`, `llamacpp-server` |
+| Default | `http://127.0.0.1:8080` |
+| Env | `LLAMACPP_HOST`, `LLAMA_SERVER_HOST`, `LLAMACPP_BASE_URL`, `LLAMACPP_API_KEY`, `LLAMACPP_TIMEOUT_SECONDS` |
+
+```bash
+# example: start llama-server with OpenAI API, then
+edgecrab --model llamacpp/<model-id>
+```
+
+Optional hard e2e: `LLAMACPP_E2E=1 cargo test -p edgecrab-core --test local_mac_providers_citizenship`.
+
+---
+
+## vLLM-MLX (`vllm-mlx`)
+
+MLX-backed continuous batching / paged-KV style server (developer install, not the oMLX app).
+
+| | |
+|--|--|
+| Id | `vllm-mlx` |
+| Aliases | `vllm_mlx`, `vllmmx` |
+| Default | `http://127.0.0.1:8000` |
+| Env | `VLLM_MLX_HOST`, `VLLM_MLX_BASE_URL`, `VLLM_MLX_API_KEY`, `VLLM_MLX_TIMEOUT_SECONDS` |
+
+```bash
+edgecrab --model vllm-mlx/<id>
+```
+
+Optional e2e: `VLLM_MLX_E2E=1`.
+
+---
+
+## mlx-lm (`mlx-lm`)
+
+Official Apple [mlx-lm](https://github.com/ml-explore/mlx-lm) OpenAI server (`mlx_lm.server`).
+
+| | |
+|--|--|
+| Id | `mlx-lm` |
+| Aliases | `mlx_lm`, `mlxlm` |
+| Default | `http://127.0.0.1:8080` |
+| Env | `MLX_LM_HOST`, `MLX_LM_BASE_URL`, `MLX_LM_API_KEY`, `MLX_LM_TIMEOUT_SECONDS` |
+
+```bash
+# python -m mlx_lm.server --model … --port 8080
+edgecrab --model mlx-lm/<id>
+```
+
+Optional e2e: `MLX_LM_E2E=1`.
+
+---
+
+## `/endpoint` and config overrides
+
+```yaml
+# ~/.edgecrab/config.yaml
+provider_endpoints:
+  llamacpp:
+    base_url: "http://127.0.0.1:8081"
+  vllm-mlx:
+    base_url: "http://127.0.0.1:8010"
+  mlx-lm:
+    base_url: "http://127.0.0.1:8082"
+```
+
+In the TUI: `/endpoint` → select provider → set base URL → probe `/v1/models`.
+
+---
+
+## Doctor
+
+`edgecrab doctor` probes local ports for Ollama, LM Studio, oMLX, MTPLX, and additional TCP opens for llama-server / vLLM-MLX / mlx-lm (labeled cautiously when ports may be shared).
+
+---
+
+## Performance tips
+
+### Context length
+
+Local models often use 8K–128K windows depending on load flags. EdgeCrab compresses history near the limit; you can also cap:
 
 ```yaml
 session:
-  max_context_tokens: 8000    # Match your local model's context window
+  max_context_tokens: 32000
 ```
 
-### Model Quantization
+### Quantization / Metal
 
-Smaller quantizations (Q4, Q5) are faster with slightly lower quality. Larger (Q8, fp16) are slower but more accurate. For coding tasks, Q5_K_M or Q6_K are a good balance.
+- GGUF via **llama-server** / Ollama / LM Studio  
+- MLX via **oMLX**, **MTPLX**, **vLLM-MLX**, **mlx-lm**, LM Studio MLX engine  
 
-### Threads
+### Cold start
 
-For CPU-only inference, set the number of threads to your CPU core count:
-
-```bash
-# Ollama — set via environment
-OLLAMA_NUM_THREAD=8 ollama serve
-```
-
-### Cold Start
-
-Ollama keeps the model loaded in memory after first use. Cold start (first request after pulling the model) can take 5–30 seconds depending on model size and hardware. Subsequent requests are fast.
+First request after load can take seconds to minutes for large models. Subsequent turns benefit from **stable tool schemas** (EdgeCrab freezes them on local providers).
 
 ---
 
-## Offline Mode
-
-When using local models, you may want to disable web tools to ensure no outbound connections:
+## Offline toolset
 
 ```bash
 edgecrab --model ollama/llama3.3 --toolset file,terminal,memory,skills
 ```
 
-Or in `config.yaml`:
-
-```yaml
-tools:
-  enabled:
-    - file
-    - terminal
-    - memory
-    - skills
-    # web and session omitted
-```
-
 ---
 
-## Pro Tips
+## Architecture (DRY)
 
-- **Choose model size by VRAM/RAM**: A rule of thumb is 6 GB VRAM for 7B models at Q4, 12 GB for 13B, 24 GB for 34B. On CPU, double these values as RAM requirements.
-- **Set a low max_iterations for local testing**: Local models are slower, so `EDGECRAB_MAX_ITERATIONS=10` keeps experiments snappy while you pick the right model.
-- **Use Ollama's model aliases**: `ollama pull codestral:latest` pins to the latest release. Omit the tag if you want `ollama pull codestral` to auto-upgrade.
-- **LM Studio model name doesn't matter**: EdgeCrab sends `model: local-model` but LM Studio uses whatever model it has loaded. Only the server URL matters.
-- **Keep the Ollama server warm**: Use `OLLAMA_KEEP_ALIVE=24h ollama serve` so the model stays loaded in VRAM between sessions.
-- **Monitor GPU memory**: `ollama ps` shows which models are loaded and their VRAM usage.
+```text
+LocalOpenAiIdentity { id, default_host, env keys… }
+        │
+        ▼
+LocalOpenAiProvider  (edgequake-llm)  →  OpenAI-compatible HTTP
+        │
+        ▼
+catalog · discovery · local harness · /endpoint  (EdgeCrab)
+```
+
+Product-specific settings files remain only where needed (`omlx`, `mtplx`). Thin citizens (`llamacpp`, `vllm-mlx`, `mlx-lm`) use env + `/endpoint` only.
+
+Spec pack (in the EdgeCrab repo): `specs/023-omlx/` — landscape [014](https://github.com/raphaelmansuy/edgecrab/blob/main/specs/023-omlx/014-apple-silicon-local-landscape.md), assessment [015](https://github.com/raphaelmansuy/edgecrab/blob/main/specs/023-omlx/015-wave-def-implementation-assessment.md).
 
 ---
 
 ## FAQ
 
-**Which model should I start with?**
-For coding: `codestral` (Ollama) is the best all-round local coding model at 4 GB. For general tasks: `llama3.3` gives the best quality. For low-RAM machines: `qwen2.5-coder:7b` fits in 4 GB.
+**Which should I use on a MacBook for coding agents?**  
+Start with **oMLX** (agent TTFT / multi-model) or **Ollama** (simplest). Use **llama-server** for GGUF control; **MTPLX** when you want MTP speed; **vLLM-MLX** / **mlx-lm** for research/dev servers.
 
-**My model fits in RAM but generation is slow. Why?**
-The model is running on CPU because the GPU isn't detected. Check `ollama ps` — a `(CPU)` label means no GPU offloading. Install CUDA drivers (NVIDIA) or verify Metal is enabled (macOS).
+**My model outputs garbage with tools.**  
+Prefer models with function-calling support. Local harness forces non-streaming tool turns on these providers; still pick tool-capable checkpoints.
 
-**Can I use a local model for some tasks and a cloud model for others?**
-Yes. Use `--model ollama/codestral` for local tasks and override per-session. No global config change needed.
+**Port 8080 is already in use.**  
+Could be llama-server or mlx_lm.server. Use `/endpoint` to point each id at a distinct host/port.
 
-**Does EdgeCrab support OpenAI-format custom base URLs?**
-Yes. Set `base_url: http://localhost:11434/v1` in `config.yaml` to point at any OpenAI-compatible local server.
-
-**My local model outputs garbage with tool calls. What's wrong?**
-Not all local models support function calling (tool use). Stick to models with `:tools` variants in Ollama (e.g. `llama3.1:8b-instruct-q4_K_M`) or models tested with OpenAI function calling format.
+**Does EdgeCrab implement MLX kernels?**  
+No. It is a thin OpenAI-compatible client + agent harness around your local server.
 
 ---
 
 ## See Also
 
-- [Provider Overview](/providers/overview/) — full list of supported providers
-- [Environment Variables](/reference/environment-variables/) — `EDGECRAB_MODEL` and `OLLAMA_*` vars
-- [Offline Mode toolset config](/reference/configuration/) — disable web tools for air-gapped use
+- [Provider Overview](/providers/overview/)
+- [Environment Variables](/reference/environment-variables/)
+- [Configuration](/user-guide/configuration/)

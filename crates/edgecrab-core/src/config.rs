@@ -83,6 +83,12 @@ pub struct AppConfig {
     pub local_inference: LocalInferenceConfig,
     /// Harness completion / verification policy (spec 015).
     pub harness: HarnessConfig,
+    /// Per-provider base URL overrides (`provider_endpoints.omlx.base_url`, …).
+    ///
+    /// Applied to process env on load so factory paths honor TUI/config hosts.
+    #[serde(default)]
+    pub provider_endpoints:
+        std::collections::HashMap<String, crate::provider_endpoints::ProviderEndpointConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -393,6 +399,7 @@ impl AppConfig {
         sanitize_tools_policy(&mut config.tools);
         edgecrab_tools::ensure_web_search_config_coherence_at(&path);
         config.apply_security_runtime();
+        config.apply_provider_endpoints();
         Ok(config)
     }
 
@@ -433,6 +440,7 @@ impl AppConfig {
         sanitize_tools_policy(&mut config.tools);
         edgecrab_tools::ensure_web_search_config_coherence_at(path);
         config.apply_security_runtime();
+        config.apply_provider_endpoints();
         Ok(config)
     }
 
@@ -443,7 +451,13 @@ impl AppConfig {
         sanitize_tools_policy(&mut config.tools);
         edgecrab_tools::ensure_web_search_config_coherence_at(path);
         config.apply_security_runtime();
+        config.apply_provider_endpoints();
         Ok(config)
+    }
+
+    /// Push `provider_endpoints` into process env for factory consumption.
+    pub fn apply_provider_endpoints(&self) {
+        crate::provider_endpoints::load_endpoint_overrides(&self.provider_endpoints);
     }
 
     /// Load `config.yaml` from the install root (not the active profile home).
@@ -596,6 +610,7 @@ impl AppConfig {
             .map_err(|e| AgentError::Config(format!("failed to serialize config: {e}")))?;
         std::fs::write(path, yaml).map_err(AgentError::Io)?;
         self.apply_security_runtime();
+        self.apply_provider_endpoints();
         Ok(())
     }
 

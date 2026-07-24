@@ -153,9 +153,22 @@ pub fn build_model_selector_entries_with_auth(
                 Some(_) => "catalog fallback".into(),
                 None => discovery_source_label(DiscoverySource::Static).to_string(),
             };
-            let detail = match &auth_part {
-                Some(a) => format!("{model} · {a} · {inv}"),
-                None => format!("{model} · {inv}"),
+            // Local free providers: surface a clear badge so they are not confused
+            // with cloud OpenRouter substring hits (e.g. "olmo" vs "omlx").
+            let local_badge = match provider.as_str() {
+                "omlx" => Some("local MLX"),
+                "mtplx" => Some("local MTP"),
+                "llamacpp" => Some("local GGUF"),
+                "vllm-mlx" => Some("local vLLM-MLX"),
+                "mlx-lm" => Some("local mlx-lm"),
+                "ollama" | "lmstudio" | "vllm" => Some("local"),
+                _ => None,
+            };
+            let detail = match (&auth_part, local_badge) {
+                (Some(a), Some(local)) => format!("{model} · {local} · {a} · {inv}"),
+                (Some(a), None) => format!("{model} · {a} · {inv}"),
+                (None, Some(local)) => format!("{model} · {local} · {inv}"),
+                (None, None) => format!("{model} · {inv}"),
             };
             all_models.push(ModelEntry {
                 display: format!("{provider}/{model}"),
@@ -268,6 +281,41 @@ mod tests {
         selector.query = "anthropic".into();
         selector.update_filter();
         assert_eq!(selector.filtered.len(), 1);
+    }
+
+    #[test]
+    fn fuzzy_ranks_omlx_provider_above_substring_model_id() {
+        // Both rows match "omlx"; provider-tag / primary-prefix should win.
+        let mut selector = FuzzySelector::new();
+        selector.set_items(vec![
+            ModelEntry {
+                display: "openrouter/vendor/omlx-port-mirror".into(),
+                provider: "openrouter".into(),
+                model_name: "vendor/omlx-port-mirror".into(),
+                detail: "key · live discovery".into(),
+            },
+            ModelEntry {
+                display: "omlx/Qwen3.6-35B-A3B".into(),
+                provider: "omlx".into(),
+                model_name: "Qwen3.6-35B-A3B".into(),
+                detail: "local MLX · live discovery".into(),
+            },
+        ]);
+        selector.query = "omlx".into();
+        selector.update_filter();
+        assert_eq!(selector.filtered.len(), 2);
+        let first = &selector.items[selector.filtered[0]];
+        assert_eq!(
+            first.provider, "omlx",
+            "provider-prefix match should rank omlx above openrouter model-id substring"
+        );
+    }
+
+    #[test]
+    fn omlx_entries_show_local_mlx_badge() {
+        let grouped = vec![("omlx".into(), vec!["Qwen3".into()])];
+        let entries = build_model_selector_entries(&grouped, None);
+        assert!(entries[0].detail.contains("local MLX"));
     }
 
     #[test]

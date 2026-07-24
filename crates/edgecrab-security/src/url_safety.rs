@@ -127,10 +127,7 @@ static PREVIEW_TEST_SERIAL: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock
 /// Serialize tests that mutate or assert on the global preview policy.
 #[doc(hidden)]
 pub fn preview_policy_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    match PREVIEW_TEST_SERIAL
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-    {
+    match PREVIEW_TEST_SERIAL.get_or_init(|| Mutex::new(())).lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     }

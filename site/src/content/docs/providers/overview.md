@@ -1,11 +1,11 @@
 ---
 title: LLM Provider Overview
-description: All 15 LLM providers supported by EdgeCrab — GitHub Copilot, OpenAI, Anthropic, Google Gemini, Vertex AI, AWS Bedrock, xAI Grok, DeepSeek, Mistral, Groq, Hugging Face, Z.AI, OpenRouter, Ollama, and LM Studio.
+description: EdgeCrab multi-provider catalog — cloud APIs plus local Ollama, LM Studio, oMLX, MTPLX, llama-server, vLLM-MLX, and mlx-lm. Switch with --model or /model.
 sidebar:
   order: 1
 ---
 
-EdgeCrab supports **15 LLM providers** out of the box (13 cloud, 2 local). Over 200 models are compiled in, with user override via `~/.edgecrab/models.yaml`. Auto-detection finds the right provider from your environment variables — or switch at any time with `--model` or `/model` inside the TUI.
+EdgeCrab ships a **compiled model catalog** with cloud and **first-class local** providers (count is source-derived from `model_catalog_default.yaml`). Over 200 models are compiled in, with user override via `~/.edgecrab/models.yaml`. Auto-detection finds a default from environment variables — or switch at any time with `--model` or `/model` inside the TUI.
 
 ---
 
@@ -26,10 +26,15 @@ EdgeCrab supports **15 LLM providers** out of the box (13 cloud, 2 local). Over 
 | 11 | `huggingface` | `HUGGING_FACE_HUB_TOKEN` | Any HF Inference API model |
 | 12 | `zai` | `ZAI_API_KEY` | Z.AI / GLM series |
 | 13 | `openrouter` | `OPENROUTER_API_KEY` | 600+ models via one endpoint |
-| — | `ollama` | *(none)* | Any model — `ollama serve` on port 11434 |
-| — | `lmstudio` | *(none)* | Any model — LM Studio on port 1234 |
+| — | `ollama` | *(none)* | Local — port **11434** |
+| — | `lmstudio` | *(none)* | Local — port **1234** |
+| — | `omlx` | optional `OMLX_API_KEY` | Apple Silicon MLX — **9050** |
+| — | `mtplx` | optional `MTPLX_API_KEY` | Apple Silicon MTP — settings port |
+| — | `llamacpp` | optional `LLAMACPP_API_KEY` | llama-server GGUF — **8080** |
+| — | `vllm-mlx` | optional `VLLM_MLX_API_KEY` | vLLM-MLX — **8000** |
+| — | `mlx-lm` | optional `MLX_LM_API_KEY` | `mlx_lm.server` — **8080** |
 
-> **Auto-detection order**: EdgeCrab checks env vars in priority order (1–13). The first matching key sets the default provider. Local providers (ollama, lmstudio) are available regardless.
+> **Auto-detection order**: EdgeCrab checks cloud env vars in priority order. Local providers are selected when you pass `--model <local-id>/…`, choose them in `edgecrab setup`, or set host env vars (e.g. `OMLX_HOST`, `LLAMACPP_HOST`).
 
 ---
 
@@ -221,37 +226,21 @@ zai/glm-4.5                   # Latest GLM
 zai/glm-5                     # Most capable GLM
 ```
 
-### Ollama (local, no API key)
+### Local providers (no cloud API key)
 
-Run any model locally. Requires [Ollama](https://ollama.com) installed and running:
+| Id | Default base | One-liner |
+|----|--------------|-----------|
+| `ollama` | `:11434` | `edgecrab --model ollama/llama3.3` |
+| `lmstudio` | `:1234` | `edgecrab --model lmstudio/<loaded>` |
+| `omlx` | `:9050` | `edgecrab --model omlx/<id>` |
+| `mtplx` | settings / `:8000` | `edgecrab --model mtplx/<id>` |
+| `llamacpp` | `:8080` | `edgecrab --model llamacpp/<id>` |
+| `vllm-mlx` | `:8000` | `edgecrab --model vllm-mlx/<id>` |
+| `mlx-lm` | `:8080` | `edgecrab --model mlx-lm/<id>` |
 
-```bash
-# Start Ollama (keep this running)
-ollama serve
+Override any base URL with TUI **`/endpoint`**. Full setup, ports, env vars, doctor probes, and Apple Silicon guidance:
 
-# Pull a model
-ollama pull llama3.3
-ollama pull codestral
-```
-
-No API key needed. EdgeCrab connects to `http://localhost:11434` automatically:
-
-```bash
-edgecrab --model ollama/llama3.3 "explain this code"
-edgecrab --model ollama/codestral "write a Rust async function"
-```
-
-→ [Local Models guide](/providers/local/) for full setup and model recommendations.
-
-### LM Studio (local, no API key)
-
-Download a model in [LM Studio](https://lmstudio.ai) and start its local server (default port 1234):
-
-```bash
-edgecrab --model lmstudio/your-loaded-model "..."
-```
-
-→ [Local Models guide](/providers/local/).
+→ **[Local Models guide](/providers/local/)**
 
 ### OpenRouter (`openrouter`)
 
@@ -310,7 +299,9 @@ If the primary provider returns an error (rate limit, outage), EdgeCrab retries 
 | Large refactor (100+ files) | `anthropic/claude-opus-4-6` |
 | Quick one-file fix | `groq/llama-3.3-70b-versatile` or `openai/gpt-4.1-mini` |
 | Reasoning / complex logic | `deepseek/deepseek-reasoner` or `openai/o3` |
-| Offline / air-gapped | `ollama/llama3.3` or `ollama/codestral` |
+| Offline / air-gapped | `ollama/…`, `omlx/…`, `llamacpp/…`, or other [local providers](/providers/local/) |
+| Mac agent TTFT / MLX | `omlx/…` or `mtplx/…` |
+| GGUF Metal control | `llamacpp/…` (llama-server) |
 | Maximum model variety | `openrouter/...` (600+ models) |
 | Budget-conscious | `deepseek/deepseek-chat` or `groq/llama-3.1-8b-instant` |
 | Lowest latency | `groq/llama-3.3-70b-versatile` (LPU hardware) |
@@ -352,6 +343,6 @@ Yes — any OpenAI-compatible endpoint accepts a custom `model` name. Set `base_
 
 ## See Also
 
-- [Local Models](/providers/local/) — Ollama and LM Studio setup
+- [Local Models](/providers/local/) — Ollama, LM Studio, oMLX, MTPLX, llama-server, vLLM-MLX, mlx-lm
 - [Environment Variables](/reference/environment-variables/) — all API key env var names
 - [Configuration Reference](/reference/configuration/) — `provider`, `model`, and `fallback_providers` config keys

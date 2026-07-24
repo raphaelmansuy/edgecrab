@@ -42,7 +42,12 @@ pub fn local_default_max_tool_argument_bytes() -> usize {
 const TOOL_CALL_ENVELOPE_TOKENS: usize = 64;
 
 fn is_local_inference_provider(provider_name: &str) -> bool {
-    matches!(provider_name, "lmstudio" | "ollama")
+    // Keep in sync with edgecrab_core::local_provider_policy::LOCAL_INFERENCE_PROVIDERS
+    // (tools cannot import core — dependency direction).
+    matches!(
+        provider_name,
+        "lmstudio" | "ollama" | "omlx" | "mtplx" | "vllm" | "vllm-mlx" | "llamacpp" | "mlx-lm"
+    )
 }
 
 /// Provider-stated or context-derived output token ceiling (non-local default path).
@@ -276,7 +281,7 @@ pub fn local_inference_geometry_guidance(max_arg_bytes: usize, max_output_tokens
         "\
 ## Local Inference Tool Geometry (binding)
 
-You are on a local provider (LM Studio / Ollama). Each tool turn has a hard output ceiling:
+You are on a local provider (LM Studio / Ollama / oMLX / MTPLX). Each tool turn has a hard output ceiling:
   - max completion tokens: {max_output_tokens}
   - max tool-argument size: {max_arg_bytes} bytes (~{max_kib} KiB)
 

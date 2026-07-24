@@ -642,6 +642,11 @@ pub struct SessionState {
     pub smart_routing_cheap_turns: u32,
     /// Turns routed to the primary (strong) model.
     pub smart_routing_strong_turns: u32,
+    /// Frozen local-provider tool wire schemas (prefix/KV stability — spec 023/013).
+    ///
+    /// When set, local API calls reuse these defs instead of re-annotating budgets
+    /// every iteration (avoids `prefix_divergence_at_token` on MTPLX/oMLX).
+    pub frozen_local_api_tools: Option<crate::local_prefix_cache::LocalToolFreeze>,
 }
 
 impl SessionState {
@@ -652,6 +657,7 @@ impl SessionState {
     ) {
         self.cached_system_prompt = None;
         self.cached_stable_prompt = None;
+        crate::local_prefix_cache::clear_local_tool_freeze(&mut self.frozen_local_api_tools);
         self.cached_semi_stable_prompt = None;
         if outcome.compressed {
             self.first_compression_done = true;

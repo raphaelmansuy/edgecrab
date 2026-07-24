@@ -284,12 +284,8 @@ mod tests {
             .args
             .iter()
             .find(|a| a.contains("(deny default)"))
-            .cloned();
-        assert!(
-            profile.is_some(),
-            "deny_default Seatbelt profile must include (deny default)"
-        );
-        let profile = profile.unwrap();
+            .cloned()
+            .expect("deny_default Seatbelt profile must include (deny default)");
         assert!(profile.contains("(allow process-exec)"));
         assert!(profile.contains("/tmp/project"));
         assert!(!profile.contains("(allow default)"));

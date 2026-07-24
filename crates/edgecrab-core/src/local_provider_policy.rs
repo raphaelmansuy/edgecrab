@@ -47,9 +47,19 @@ pub fn local_structural_compress_threshold_ratio() -> f32 {
         .unwrap_or(LOCAL_STRUCTURAL_COMPRESS_THRESHOLD_RATIO)
 }
 
+/// Canonical local inference provider ids (runtime `LLMProvider::name()` values).
+///
+/// Single source of truth — use [`is_local_inference_provider`] everywhere instead of
+/// re-listing ids (DRY / Open-Closed).
+pub const LOCAL_INFERENCE_PROVIDERS: &[&str] = &[
+    "ollama", "lmstudio", "omlx", "mtplx", "vllm", "vllm-mlx", "llamacpp", "mlx-lm",
+];
+
 /// Providers that run on localhost and queue generations server-side.
 pub fn is_local_inference_provider(provider_name: &str) -> bool {
-    matches!(provider_name, "lmstudio" | "ollama" | "vllm" | "llamacpp")
+    LOCAL_INFERENCE_PROVIDERS
+        .iter()
+        .any(|&p| p.eq_ignore_ascii_case(provider_name))
 }
 
 /// First segment of `provider/model` or bare provider name.
@@ -89,7 +99,7 @@ pub fn log_local_harness_activated(provider_name: &str, has_tools: bool, write_c
         structural_prefill_prune = has_tools,
         mid_band_compress = has_tools,
         tool_call_pipeline = has_tools,
-        "local inference harness activated (default-on for lmstudio/ollama)"
+        "local inference harness activated (default-on for local providers incl. omlx)"
     );
 }
 
@@ -98,7 +108,11 @@ pub fn log_local_harness_activated(provider_name: &str, has_tools: bool, write_c
 /// Local servers buffer large tool JSON; Copilot now uses native SSE tool deltas
 /// (edgequake-llm + post-connect timeout) so it is excluded here.
 pub fn prefers_nonstreaming_tool_turns(provider: &dyn LLMProvider) -> bool {
-    matches!(provider.name(), "lmstudio" | "ollama")
+    // Local OpenAI-compat servers buffer large tool JSON poorly under SSE.
+    matches!(
+        provider.name(),
+        "lmstudio" | "ollama" | "omlx" | "mtplx" | "llamacpp" | "vllm-mlx" | "mlx-lm" | "vllm"
+    )
 }
 
 /// Whether EdgeCrab must not retry a failed transport call.
@@ -137,6 +151,31 @@ pub fn transport_stall_error_suffix(provider_name: &str) -> Option<&'static str>
              Wait for the server to finish or restart Ollama before retrying; EdgeCrab did not \
              start a duplicate request to avoid stacked generations.",
         ),
+        "omlx" => Some(
+            "Local inference timed out — oMLX may still be generating in the background. \
+             Wait for the server to finish or restart oMLX before retrying; EdgeCrab did not \
+             start a duplicate request to avoid stacked generations.",
+        ),
+        "mtplx" => Some(
+            "Local inference timed out — MTPLX may still be generating in the background. \
+             Wait for the server to finish or restart MTPLX before retrying; EdgeCrab did not \
+             start a duplicate request to avoid stacked generations.",
+        ),
+        "llamacpp" => Some(
+            "Local inference timed out — llama-server may still be generating in the background. \
+             Wait for the server to finish or restart llama-server before retrying; EdgeCrab did \
+             not start a duplicate request to avoid stacked generations.",
+        ),
+        "vllm-mlx" => Some(
+            "Local inference timed out — vLLM-MLX may still be generating in the background. \
+             Wait for the server to finish before retrying; EdgeCrab did not start a duplicate \
+             request to avoid stacked generations.",
+        ),
+        "mlx-lm" => Some(
+            "Local inference timed out — mlx_lm.server may still be generating in the background. \
+             Wait for the server to finish before retrying; EdgeCrab did not start a duplicate \
+             request to avoid stacked generations.",
+        ),
         name if is_local_inference_provider(name) => Some(
             "Local inference timed out — the server may still be generating. Wait before \
              retrying; EdgeCrab did not start a duplicate request.",
@@ -156,6 +195,27 @@ pub fn local_http_timeout_secs(provider_name: &str) -> u64 {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_LOCAL_HTTP_TIMEOUT_SECS),
+        "omlx" => std::env::var("OMLX_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_LOCAL_HTTP_TIMEOUT_SECS),
+        "mtplx" => std::env::var("MTPLX_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_LOCAL_HTTP_TIMEOUT_SECS),
+        "llamacpp" => std::env::var("LLAMACPP_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_LOCAL_HTTP_TIMEOUT_SECS),
+        "vllm-mlx" => std::env::var("VLLM_MLX_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_LOCAL_HTTP_TIMEOUT_SECS),
+        "mlx-lm" => std::env::var("MLX_LM_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_LOCAL_HTTP_TIMEOUT_SECS),
+        name if is_local_inference_provider(name) => DEFAULT_LOCAL_HTTP_TIMEOUT_SECS,
         _ => DEFAULT_LOCAL_HTTP_TIMEOUT_SECS,
     }
 }
@@ -653,6 +713,11 @@ mod tests {
     fn local_provider_detection() {
         assert!(is_local_inference_provider("lmstudio"));
         assert!(is_local_inference_provider("ollama"));
+        assert!(is_local_inference_provider("omlx"));
+        assert!(is_local_inference_provider("mtplx"));
+        assert!(is_local_inference_provider("llamacpp"));
+        assert!(is_local_inference_provider("vllm-mlx"));
+        assert!(is_local_inference_provider("mlx-lm"));
         assert!(!is_local_inference_provider("anthropic"));
     }
 

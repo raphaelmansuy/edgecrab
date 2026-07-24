@@ -714,7 +714,11 @@ mod tests {
         else {
             return;
         };
-        assert_eq!(out.exit_code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+        assert_eq!(
+            out.exit_code, 0,
+            "stdout={} stderr={}",
+            out.stdout, out.stderr
+        );
         let lines: Vec<&str> = out.stdout.lines().collect();
         assert!(
             lines.len() >= 2,

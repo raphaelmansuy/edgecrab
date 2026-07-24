@@ -31,7 +31,7 @@ edgecrab/
 │   │   ├── prompt_builder.rs System prompt assembly (12 sources)
 │   │   ├── config.rs        AppConfig, ModelConfig, DEFAULT_CONFIG
 │   │   ├── model_catalog.rs ModelCatalog — single source of truth for models
-│   │   ├── model_catalog_default.yaml  13 providers × N models (compiled-in)
+│   │   ├── model_catalog_default.yaml  catalog providers × N models (compiled-in; incl. local omlx/mtplx/llamacpp/vllm-mlx/mlx-lm)
 │   │   ├── model_router.rs  Provider factory, smart routing
 │   │   ├── pricing.rs       Token cost calculation
 │   │   └── sub_agent_runner.rs  Subagent delegation runner
@@ -664,12 +664,14 @@ compress_with_llm(messages, params, provider)
 
 ## Model Catalog (model_catalog.rs)
 
-Single source of truth for all 13 providers. Compiled-in YAML:
+Single source of truth for catalog providers (cloud + first-class local). Compiled-in YAML:
 
 ```
 ~/.edgecrab/models.yaml   ← user overrides (merged on top)
-model_catalog_default.yaml ← embedded default (13 providers, 200+ models)
+model_catalog_default.yaml ← embedded default (200+ models; local: ollama, lmstudio, omlx, mtplx, llamacpp, vllm-mlx, mlx-lm)
 ```
+
+Local Apple Silicon / desktop servers share `LocalOpenAiProvider` in edgequake-llm and `LOCAL_INFERENCE_PROVIDERS` in EdgeCrab (harness, prefix freeze, `/endpoint`). Specs: `specs/023-omlx/`.
 
 Access via `ModelCatalog::get()` (thread-safe lazy OnceLock).
 

@@ -116,34 +116,56 @@ impl<T: Clone + FuzzyItem> FuzzySelector<T> {
     }
 
     /// Recompute `filtered` based on the current `query`.
+    ///
+    /// Matches are ranked so provider-prefix hits win over accidental substrings
+    /// (e.g. query `oml` ranks `omlx/…` above OpenRouter `…/olmo-…`).
     pub fn update_filter(&mut self) {
         let q = self.query.to_lowercase();
         let tokens: Vec<&str> = q
             .split_whitespace()
             .filter(|token| !token.is_empty())
             .collect();
-        self.filtered = self
+
+        let mut scored: Vec<(u8, usize)> = self
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| {
+            .filter_map(|(i, item)| {
                 if q.is_empty() {
-                    return true;
+                    return Some((0, i));
                 }
                 let primary = item.primary().to_lowercase();
                 let secondary = item.secondary().to_lowercase();
                 let tag = item.tag().to_lowercase();
-                if primary.contains(&q) || secondary.contains(&q) || tag.contains(&q) {
-                    return true;
+                let matched = primary.contains(&q)
+                    || secondary.contains(&q)
+                    || tag.contains(&q)
+                    || (!tokens.is_empty()
+                        && tokens
+                            .iter()
+                            .all(|token| format!("{primary} {secondary} {tag}").contains(token)));
+                if !matched {
+                    return None;
                 }
-                if tokens.is_empty() {
-                    return false;
-                }
-                let haystack = format!("{primary} {secondary} {tag}");
-                tokens.iter().all(|token| haystack.contains(token))
+                // Lower score = better rank.
+                // Prefer exact tag/primary, then prefix (tag, primary, or `query/…`), then first path segment.
+                let score = if tag == q || primary == q {
+                    0
+                } else if tag.starts_with(&q)
+                    || primary.starts_with(&q)
+                    || primary.starts_with(&format!("{q}/"))
+                {
+                    1
+                } else if primary.split('/').next().is_some_and(|p| p.starts_with(&q)) {
+                    2
+                } else {
+                    5
+                };
+                Some((score, i))
             })
-            .map(|(i, _)| i)
             .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        self.filtered = scored.into_iter().map(|(_, i)| i).collect();
         if self.selected >= self.filtered.len() {
             self.selected = 0;
         }

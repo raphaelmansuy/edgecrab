@@ -890,6 +890,13 @@ fn check_provider_keys() -> Vec<Check> {
         // Also check for local providers
         let ollama_up = std::env::var("OLLAMA_HOST").is_ok() || check_local_port(11434);
         let lmstudio_up = check_local_port(1234);
+        let omlx_cfg = edgequake_llm::resolve_omlx_runtime_config();
+        let omlx_port = omlx_cfg
+            .host
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(9050);
+        let omlx_up = check_local_port(omlx_port);
 
         let mut checks = vec![Check::warn(
             "API keys",
@@ -900,6 +907,62 @@ fn check_provider_keys() -> Vec<Check> {
         }
         if lmstudio_up {
             checks.push(Check::pass("LMStudio", "running on localhost:1234"));
+        }
+        if omlx_up {
+            checks.push(Check::pass(
+                "oMLX",
+                format!(
+                    "listening on {} (key {})",
+                    omlx_cfg.host,
+                    if omlx_cfg.api_key.is_some() {
+                        "configured"
+                    } else {
+                        "missing — set OMLX_API_KEY or ~/.omlx/settings.json"
+                    }
+                ),
+            ));
+        }
+        let mtplx_cfg = edgequake_llm::resolve_mtplx_runtime_config();
+        let mtplx_port = mtplx_cfg
+            .host
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(8000);
+        if check_local_port(mtplx_port) {
+            checks.push(Check::pass(
+                "MTPLX",
+                format!("listening on {}", mtplx_cfg.host),
+            ));
+        }
+        // Multi-port local scan (Wave D–F): label by configured product, not port alone.
+        let local_probes: &[(&str, &str, u16)] = &[
+            ("llama-server", "llamacpp", 8080),
+            ("vLLM-MLX", "vllm-mlx", 8000),
+            ("mlx-lm", "mlx-lm", 8080),
+        ];
+        for (label, id, default_port) in local_probes {
+            let host = edgecrab_core::provider_endpoints::resolve_endpoint(
+                id,
+                &std::collections::HashMap::new(),
+            )
+            .map(|(u, _)| u)
+            .unwrap_or_default();
+            let port = host
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
+                .unwrap_or(*default_port);
+            // Skip duplicate TCP hits already reported for MTPLX on same port.
+            if *id == "vllm-mlx" && port == mtplx_port && check_local_port(mtplx_port) {
+                continue;
+            }
+            if check_local_port(port) {
+                checks.push(Check::pass(
+                    label,
+                    format!(
+                        "TCP open on :{port} — confirm with GET /v1/models (may be another product)"
+                    ),
+                ));
+            }
         }
         checks
     } else {

@@ -74,7 +74,7 @@ regex = "1"
 url = "2"
 
 # LLM backend — crates.io pin (publish edgequake-llm before cutting EdgeCrab).
-edgequake-llm = { version = "0.10.2", features = ["bedrock", "otel"] }
+edgequake-llm = { version = "0.10.3", features = ["bedrock", "otel"] }
 
 # Image processing (vision tool: resize/compress before base64 encoding)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

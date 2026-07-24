@@ -364,7 +364,12 @@ mod tests {
             outcome.headline(),
             "Failed — invalid tool call retry budget exhausted."
         );
-        assert!(outcome.operator_hint().unwrap().contains("exact tool name"));
+        assert!(
+            outcome
+                .operator_hint()
+                .expect("invalid-tool budget outcome should include operator hint")
+                .contains("exact tool name")
+        );
         assert!(outcome.emoji_headline().starts_with('❌'));
     }
 

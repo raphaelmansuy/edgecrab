@@ -1335,6 +1335,9 @@ impl Agent {
         'conversation_loop: loop {
             phase.transition(crate::turn_phase::TurnPhase::Preflight);
             if tool_defs_dirty {
+                crate::local_prefix_cache::clear_local_tool_freeze(
+                    &mut session.frozen_local_api_tools,
+                );
                 active_tool_defs = if let Some(ref registry) = tool_registry {
                     let schema_ctx = build_tool_context(
                         &cwd,
@@ -1886,9 +1889,12 @@ impl Agent {
             let local_turn_budget = local_tool_turn_plan
                 .as_ref()
                 .map(|plan| (plan.max_tool_argument_bytes, plan.max_tokens));
-            let api_tool_defs = edgecrab_tools::registry::annotate_llm_definitions_for_local_turn(
-                active_tool_defs.clone(),
+            // Local KV/MTP prefix stability (023/013): freeze annotated tool wire
+            // schemas for the session so budget suffixes don't diverge every turn.
+            let api_tool_defs = crate::local_prefix_cache::resolve_frozen_local_api_tools(
+                &mut session.frozen_local_api_tools,
                 effective_provider.name(),
+                &active_tool_defs,
                 local_turn_budget,
             );
             let classify_session = crate::provider_call::classify_session_for_call(
@@ -2100,10 +2106,15 @@ impl Agent {
                                         max_mutation_payload_bytes,
                                         local_abs_max,
                                     );
+                                // New provider → drop freeze so schemas match fallback geometry.
+                                crate::local_prefix_cache::clear_local_tool_freeze(
+                                    &mut session.frozen_local_api_tools,
+                                );
                                 let fb_tool_defs =
-                                    edgecrab_tools::registry::annotate_llm_definitions_for_local_turn(
-                                        active_tool_defs.clone(),
+                                    crate::local_prefix_cache::resolve_frozen_local_api_tools(
+                                        &mut session.frozen_local_api_tools,
                                         fb_prov.name(),
+                                        &active_tool_defs,
                                         local_turn_budget,
                                     );
                                 match api_call_with_retry(
@@ -7104,9 +7115,11 @@ def register(ctx):
 
     #[test]
     fn envelope_layout_uses_single_system_block() {
-        let mut session = SessionState::default();
-        session.cached_stable_prompt = Some("STABLE".into());
-        session.cached_system_prompt = Some("STABLE\nDYNAMIC".into());
+        let session = SessionState {
+            cached_stable_prompt: Some("STABLE".into()),
+            cached_system_prompt: Some("STABLE\nDYNAMIC".into()),
+            ..Default::default()
+        };
         let msgs = vec![Message::user("hi")];
         let decision = crate::prompt_cache_policy::PromptCacheDecision {
             should_cache: true,

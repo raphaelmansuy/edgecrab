@@ -164,7 +164,7 @@ async fn toolset_bulk_materializes_pack() {
     let activated = parsed["activated"].as_array().expect("activated");
     assert!(!activated.is_empty());
     assert!(activated.len() <= edgecrab_tools::MAX_TOOLSET_MATERIALIZE);
-    assert!(mat.read().unwrap().len() >= 1);
+    assert!(!mat.read().unwrap().is_empty());
 }
 
 #[test]

@@ -59,6 +59,8 @@ pub enum CommandResult {
     SessionHandoff(String),
     /// Activate the interactive model selector overlay
     ModelSelector,
+    /// Per-provider base URL override dialog.
+    ProviderEndpointOverlay,
     /// Activate the interactive cheap-model selector overlay.
     CheapModelSelector,
     /// Activate the interactive vision-model selector overlay.
@@ -854,6 +856,14 @@ impl CommandRegistry {
         });
 
         self.register(Command {
+            name: "endpoint",
+            aliases: &["endpoints", "provider-url", "base-url", "baseurl"],
+            description:
+                "Override provider base URLs (oMLX, Ollama, OpenAI, …) — browse, edit, probe",
+            handler: |_| CommandResult::ProviderEndpointOverlay,
+        });
+
+        self.register(Command {
             name: "prompt",
             aliases: &["sys", "system"],
             description: "Show, clear, or set the custom system prompt (/prompt, /prompt clear, /prompt <text>)",
@@ -1641,8 +1651,14 @@ fn provider_help_text() -> String {
          deepseek         — DeepSeek (DEEPSEEK_API_KEY, {})\n\
          ollama           — Ollama (local, OLLAMA_BASE_URL or OLLAMA_HOST, {})\n\
          lmstudio         — LM Studio (local, LMSTUDIO_BASE_URL or LMSTUDIO_HOST, {})\n\
+         omlx             — oMLX (local MLX, OMLX_HOST default :9050, reads ~/.omlx/settings.json, {})\n\
+         mtplx            — MTPLX (local MTP, MTPLX_HOST / settings.port, {})\n\
+         llamacpp         — llama-server (GGUF Metal, LLAMACPP_HOST default :8080, {})\n\
+         vllm-mlx         — vLLM-MLX (local MLX batching, VLLM_MLX_HOST default :8000, {})\n\
+         mlx-lm           — mlx_lm.server (official MLX-LM, MLX_LM_HOST default :8080, {})\n\
          openrouter       — OpenRouter (OPENROUTER_API_KEY, {})\n\
-         \nUsage: /model <provider>/<model-name>",
+         \nUsage: /model <provider>/<model-name>\n\
+         Tip: /endpoint — override any provider base URL in the TUI",
         discovery_note("copilot"),
         discovery_note("openai"),
         discovery_note("anthropic"),
@@ -1656,6 +1672,11 @@ fn provider_help_text() -> String {
         discovery_note("deepseek"),
         discovery_note("ollama"),
         discovery_note("lmstudio"),
+        discovery_note("omlx"),
+        discovery_note("mtplx"),
+        discovery_note("llamacpp"),
+        discovery_note("vllm-mlx"),
+        discovery_note("mlx-lm"),
         discovery_note("openrouter"),
     )
 }

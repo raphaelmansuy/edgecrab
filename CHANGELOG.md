@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-07-24
+
+### Added
+
+- **oMLX first-class provider** — `omlx/<model>` in catalog, live `/v1/models` discovery, local harness (non-stream tools, no dual-request on timeout), zero-cost pricing, setup/doctor/TUI surfaces. Requires `edgequake-llm` ≥ 0.10.3 (`OmlxProvider`).
+- **oMLX discovery UX** — default port **9050**; auto-reads host/port/API key from `~/.omlx/settings.json` when env unset; model picker ranks provider-prefix matches (so `oml` prefers `omlx/…` over OpenRouter `olmo`); live inventory drops the static `default` placeholder; rows show a **local MLX** badge.
+- **MTPLX first-class provider** — `mtplx/<model>` with settings-aware host/port (`Application Support/MTPLX/settings.json`), live `/v1/models` + `~/.mtplx/models` cache fallback, local harness, zero-cost, setup/doctor/`/endpoint`, selector badge **local MTP**.
+- **llama-server / vLLM-MLX / mlx-lm first-class** (023 Wave D–F) — `llamacpp`, `vllm-mlx`, `mlx-lm` thin citizens over shared `LocalOpenAiProvider` in edgequake-llm: catalog seeds, live discovery, local harness + prefix freeze, zero-cost, setup/doctor multi-port probe, `/endpoint` rows, selector badges. Optional e2e: `LLAMACPP_E2E=1`, `VLLM_MLX_E2E=1`, `MLX_LM_E2E=1`.
+- **Local prefix/KV freeze (023/013)** — for oMLX/MTPLX/Ollama/LM Studio (and all `LOCAL_INFERENCE_PROVIDERS`), freeze annotated tool wire schemas for the session after first send so changing max_tokens budgets cannot rewrite tool descriptions every API call (fixes `prefix_divergence_at_token` / multi-minute TTFT).
+- **`/endpoint` TUI** — exceptional per-provider base URL dialog (browse, edit, reset, probe `/v1/models`); persists under `provider_endpoints.<id>.base_url` in `config.yaml` and applies to process env for factory paths. Aliases: `/endpoints`, `/provider-url`, `/base-url`.
+
+### Changed
+
+- **`edgequake-llm` v0.10.3** — crates.io pin (Apple Silicon local OpenAI citizens: oMLX, MTPLX, llama-server, vLLM-MLX, mlx-lm).
+- **CI** — shallow checkout (no full-history/tags for offline jobs), shared rust-cache keys, `taiki-e/install-action` for `cargo-audit` / `wasm-pack`, pnpm frozen lockfile + cache, docker-smoke gated to main (or `docker` label), Ubuntu workspace tests `--test-threads=1` for `EDGECRAB_HOME` isolation, `scripts/ci-local.sh` for local parity.
+
 ## [0.11.0] — 2026-07-20
 
 ### Added

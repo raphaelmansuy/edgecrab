@@ -65,6 +65,11 @@ const PROVIDER_ENV_MAP: &[(&str, &str, &str)] = &[
 const LOCAL_PROVIDERS: &[(&str, &str)] = &[
     ("ollama", "Ollama (local models, free)"),
     ("lmstudio", "LMStudio (local models, free)"),
+    ("omlx", "oMLX (local MLX on Apple Silicon, free)"),
+    ("mtplx", "MTPLX (local MTP on Apple Silicon, free)"),
+    ("llamacpp", "llama-server (llama.cpp Metal GGUF, free)"),
+    ("vllm-mlx", "vLLM-MLX (local MLX continuous batching, free)"),
+    ("mlx-lm", "mlx-lm server (official Apple MLX-LM, free)"),
 ];
 
 /// Available setup sections and their labels.

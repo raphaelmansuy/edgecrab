@@ -868,9 +868,9 @@ Transcription: Whisper (local), Groq Whisper, OpenAI Whisper.
 
 ---
 
-## 16 LLM Providers
+## LLM Providers
 
-EdgeCrab ships with 16 LLM providers out of the box (14 cloud, 2 local). Over 200 models are compiled in, with user override via `~/.edgecrab/models.yaml`.
+EdgeCrab ships a multi-provider catalog (cloud + **first-class local** servers). Over 200 models are compiled in; override via `~/.edgecrab/models.yaml`. Local providers share an agent harness (non-stream tools when needed, no dual-request on timeout, prefix tool freeze, zero cost).
 
 | Provider      | Env Var                          | Notable Models                                    |
 | ------------- | -------------------------------- | ------------------------------------------------- |
@@ -887,13 +887,22 @@ EdgeCrab ships with 16 LLM providers out of the box (14 cloud, 2 local). Over 20
 | `huggingface` | `HUGGING_FACE_HUB_TOKEN`         | Any HF Inference API model                        |
 | `zai`         | `ZAI_API_KEY`                    | Z.AI / GLM series                                 |
 | `openrouter`  | `OPENROUTER_API_KEY`             | 600+ models via one endpoint                      |
-| `ollama`      | *(none)*                         | Any model — `ollama serve` on port 11434          |
-| `lmstudio`    | *(none)*                         | Any model — LM Studio on port 1234                |
+| `ollama`      | *(none)*                         | Local — `ollama serve` **:11434**                 |
+| `lmstudio`    | *(none)*                         | Local — LM Studio **:1234**                       |
+| `omlx`        | *(optional `OMLX_API_KEY`)*      | Local MLX — oMLX **:9050** (`~/.omlx/settings.json`) |
+| `mtplx`       | *(optional `MTPLX_API_KEY`)*     | Local MTP — MTPLX app (`settings.port`, often 8002) |
+| `llamacpp`    | *(optional `LLAMACPP_API_KEY`)*  | llama-server (Metal GGUF) **:8080**               |
+| `vllm-mlx`    | *(optional `VLLM_MLX_API_KEY`)*  | vLLM-MLX continuous batching **:8000**            |
+| `mlx-lm`      | *(optional `MLX_LM_API_KEY`)*    | `mlx_lm.server` **:8080**                         |
+
+Use TUI **`/endpoint`** to override any provider base URL (port collisions: 8080 llama-server vs mlx-lm; 8000 MTPLX vs vLLM-MLX). Docs: [site Local Models](site/src/content/docs/providers/local.md), `specs/023-omlx/`.
 
 **Switch provider at any time:**
 ```bash
 edgecrab --model openai/gpt-5 "deep code review"
 edgecrab --model ollama/llama3.3 "work offline"
+edgecrab --model omlx/<id> "Apple Silicon MLX"
+edgecrab --model llamacpp/<id> "llama-server GGUF"
 edgecrab --model groq/llama-3.3-70b-versatile "quick task"
 ```
 

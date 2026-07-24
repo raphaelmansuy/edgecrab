@@ -798,6 +798,11 @@ pub fn format_tool_draft_aborted(
     let server_hint = match provider {
         "lmstudio" => " LM Studio may show a new GEN counter.",
         "ollama" => " Ollama may still be processing the prior request.",
+        "omlx" => " oMLX may still be processing the prior request.",
+        "mtplx" => " MTPLX may still be processing the prior request.",
+        "llamacpp" => " llama-server may still be processing the prior request.",
+        "vllm-mlx" => " vLLM-MLX may still be processing the prior request.",
+        "mlx-lm" => " mlx_lm.server may still be processing the prior request.",
         _ => "",
     };
     format!(
@@ -827,7 +832,7 @@ pub struct LlmWaitContext {
 pub fn nonstreaming_wait_heartbeat_secs(provider: &str) -> u64 {
     match provider {
         "vscode-copilot" | "bedrock" | "openai" | "anthropic" | "google" | "xai" | "mistral" => 3,
-        "lmstudio" | "ollama" => 8,
+        "lmstudio" | "ollama" | "omlx" | "mtplx" | "llamacpp" | "vllm-mlx" | "mlx-lm" | "vllm" => 8,
         _ => 5,
     }
 }
@@ -877,6 +882,24 @@ fn nonstreaming_wait_liveness(provider: &str, phase: NonStreamingWaitPhase) -> &
             }
             NonStreamingWaitPhase::Heartbeat => "non-streaming — Ollama may still be generating",
         },
+        "omlx" => match phase {
+            NonStreamingWaitPhase::Start => {
+                "non-streaming — oMLX generates server-side until complete"
+            }
+            NonStreamingWaitPhase::Heartbeat => "non-streaming — oMLX may still be generating",
+        },
+        "mtplx" => match phase {
+            NonStreamingWaitPhase::Start => {
+                "non-streaming — MTPLX generates server-side until complete"
+            }
+            NonStreamingWaitPhase::Heartbeat => "non-streaming — MTPLX may still be generating",
+        },
+        "llamacpp" | "vllm-mlx" | "mlx-lm" | "vllm" => match phase {
+            NonStreamingWaitPhase::Start => "non-streaming — local server generates until complete",
+            NonStreamingWaitPhase::Heartbeat => {
+                "non-streaming — local server may still be generating"
+            }
+        },
         "vscode-copilot" => match phase {
             NonStreamingWaitPhase::Start => "non-streaming — waiting on Copilot API until complete",
             NonStreamingWaitPhase::Heartbeat => "non-streaming — still waiting on Copilot API",
@@ -898,6 +921,11 @@ fn timeout_env_hint(provider: &str) -> &'static str {
     match provider {
         "lmstudio" => "LMSTUDIO_TIMEOUT_SECONDS",
         "ollama" => "OLLAMA_TIMEOUT_SECONDS",
+        "omlx" => "OMLX_TIMEOUT_SECONDS",
+        "mtplx" => "MTPLX_TIMEOUT_SECONDS",
+        "llamacpp" => "LLAMACPP_TIMEOUT_SECONDS",
+        "vllm-mlx" => "VLLM_MLX_TIMEOUT_SECONDS",
+        "mlx-lm" => "MLX_LM_TIMEOUT_SECONDS",
         _ => "HTTP timeout settings",
     }
 }
@@ -1119,6 +1147,21 @@ pub fn format_local_transport_stall_notice(provider: &str) -> String {
             "⚠ {provider}: request timed out or lost connection — Ollama may still be generating. \
              EdgeCrab did not retry to avoid a duplicate request. Wait for the server or restart \
              Ollama, then retry with a smaller step."
+        ),
+        "omlx" => format!(
+            "⚠ {provider}: request timed out or lost connection — oMLX may still be generating. \
+             EdgeCrab did not retry to avoid a duplicate request. Wait for the server or restart \
+             oMLX, then retry with a smaller step."
+        ),
+        "mtplx" => format!(
+            "⚠ {provider}: request timed out or lost connection — MTPLX may still be generating. \
+             EdgeCrab did not retry to avoid a duplicate request. Wait for the server or restart \
+             MTPLX, then retry with a smaller step."
+        ),
+        "llamacpp" | "vllm-mlx" | "mlx-lm" | "vllm" => format!(
+            "⚠ {provider}: request timed out or lost connection — the local server may still be \
+             generating. EdgeCrab did not retry to avoid a duplicate request. Wait for the server \
+             to finish, then retry with a smaller step."
         ),
         _ => format!(
             "⚠ {provider}: request timed out or lost connection. EdgeCrab did not retry. \

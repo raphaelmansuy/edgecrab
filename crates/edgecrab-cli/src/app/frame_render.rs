@@ -267,6 +267,11 @@ impl App {
             self.render_skin_browser(frame, frame.area());
         }
 
+        // Provider base URL override dialog
+        if self.provider_endpoint_overlay.is_some() {
+            self.render_provider_endpoint_overlay(frame, frame.area());
+        }
+
         // Verbose / tool-progress picker overlay (compact centered popup)
         if self.verbose_selector_active {
             self.render_verbose_selector(frame, frame.area());

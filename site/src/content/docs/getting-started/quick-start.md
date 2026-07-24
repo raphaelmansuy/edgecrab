@@ -101,7 +101,7 @@ Provider [1]: 1
 ✓ Created ~/.edgecrab/skills/
 ```
 
-Supported providers: `copilot` · `openai` · `anthropic` · `google` (Gemini) · `vertexai` · `xai` (Grok) · `deepseek` · `mistral` · `groq` · `huggingface` · `zai` · `openrouter` · `ollama` · `lmstudio`. See [Provider Overview](/providers/overview/).
+Supported providers include cloud APIs plus local **`ollama` · `lmstudio` · `omlx` · `mtplx` · `llamacpp` · `vllm-mlx` · `mlx-lm`**. See [Provider Overview](/providers/overview/) and [Local Models](/providers/local/).
 
 :::note[Already have hermes-agent config?]
 Run `edgecrab migrate` to import Hermes state, or `edgecrab claw migrate` to

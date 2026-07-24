@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(plan.total(), 2);
         // Second same-path write must serialize after first claims path.
         assert!(
-            plan.sequential.len() >= 1,
+            !plan.sequential.is_empty(),
             "same-path writes must serialize: {plan:?}"
         );
     }

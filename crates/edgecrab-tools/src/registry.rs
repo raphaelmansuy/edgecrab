@@ -1693,7 +1693,10 @@ pub fn annotate_llm_definitions_for_local_turn(
     let Some((max_arg_bytes, max_output_tokens)) = local_turn_budget else {
         return defs;
     };
-    if !matches!(provider_name, "lmstudio" | "ollama") {
+    if !matches!(
+        provider_name,
+        "lmstudio" | "ollama" | "omlx" | "mtplx" | "llamacpp" | "vllm-mlx" | "mlx-lm" | "vllm"
+    ) {
         return defs;
     }
     let suffix = crate::mutation_turn_policy::local_tool_budget_schema_suffix(

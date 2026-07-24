@@ -68,6 +68,7 @@ mod plugins_cmd;
 mod presentation;
 mod process_tail_panel;
 mod profile;
+mod provider_endpoint_overlay;
 mod proxy_cmd;
 mod proxy_hub;
 mod proxy_setup_tui;
@@ -3023,6 +3024,11 @@ fn provider_environment_hint(provider: &str) -> &'static str {
         "lmstudio" => "local, no key",
         "mistral" => "MISTRAL_API_KEY",
         "ollama" => "local, no key",
+        "omlx" => "local, optional OMLX_API_KEY",
+        "mtplx" => "local, optional MTPLX_API_KEY",
+        "llamacpp" => "local, optional LLAMACPP_API_KEY",
+        "vllm-mlx" => "local, optional VLLM_MLX_API_KEY",
+        "mlx-lm" => "local, optional MLX_LM_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         "vertexai" => "GOOGLE_CLOUD_PROJECT + ADC",

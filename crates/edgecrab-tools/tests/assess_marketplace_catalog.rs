@@ -23,8 +23,8 @@ fn assess_each_marketplace_filter_against_disk_sot() {
     }
     println!("EDGECRAB_HOME={home}");
     println!(
-        "{:<16} {:>8} {:>8} {:>8} {:>8} {:>8}  {}",
-        "filter", "total", "complete", "p0", "p80", "uniq+", "verdict"
+        "{:<16} {:>8} {:>8} {:>8} {:>8} {:>8}  verdict",
+        "filter", "total", "complete", "p0", "p80", "uniq+"
     );
 
     let mut pass = 0usize;

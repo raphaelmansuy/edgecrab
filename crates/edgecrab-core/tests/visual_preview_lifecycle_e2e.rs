@@ -115,7 +115,7 @@ fn game002_session_port_grounds_navigate_url() {
             s.parameters
                 .get("detected_http_server_ports")
                 .and_then(|v| v.as_array())
-                .map(|ports| ports.clone())
+                .cloned()
         })
         .expect("detected_http_server_ports suggestion");
     assert_eq!(

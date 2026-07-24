@@ -971,9 +971,7 @@ mod tests {
             "os.environ itself must still flag"
         );
         assert!(
-            r.findings
-                .iter()
-                .all(|f| f.pattern_id != "env_file_access"),
+            r.findings.iter().all(|f| f.pattern_id != "env_file_access"),
             ".env must not match as a substring of environ: {:?}",
             r.findings
         );
@@ -990,9 +988,7 @@ mod tests {
             r.findings
         );
         assert!(
-            r.findings
-                .iter()
-                .all(|f| f.pattern_id != "env_file_access"),
+            r.findings.iter().all(|f| f.pattern_id != "env_file_access"),
             ".env must not match inside process.env: {:?}",
             r.findings
         );
@@ -1002,9 +998,7 @@ mod tests {
     fn env_file_needle_still_matches_dotenv_path() {
         let r = scan("open('.env')", ScanContext::Install);
         assert!(
-            r.findings
-                .iter()
-                .any(|f| f.pattern_id == "env_file_access"),
+            r.findings.iter().any(|f| f.pattern_id == "env_file_access"),
             "literal .env path must still flag: {:?}",
             r.findings
         );

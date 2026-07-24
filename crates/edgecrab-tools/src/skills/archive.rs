@@ -434,12 +434,9 @@ mod tests {
 
     #[test]
     fn protected_plan_not_archivable() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
         assert_eq!(
-            check_archive_eligibility(
-                &tempfile::TempDir::new().expect("tmpdir").path(),
-                "plan",
-                true
-            ),
+            check_archive_eligibility(tmp.path(), "plan", true),
             ArchiveEligibility::Protected
         );
     }

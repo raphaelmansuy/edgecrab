@@ -112,7 +112,9 @@ static ZERO_COST: LazyLock<PricingEntry> = LazyLock::new(|| PricingEntry {
 });
 
 /// Providers that are subscription-included or local (zero cost).
-const ZERO_COST_PROVIDERS: &[&str] = &["copilot", "ollama", "lmstudio"];
+const ZERO_COST_PROVIDERS: &[&str] = &[
+    "copilot", "ollama", "lmstudio", "omlx", "mtplx", "llamacpp", "vllm-mlx", "mlx-lm", "vllm",
+];
 
 /// Look up pricing for a model. Tries exact match first, then prefix/fuzzy,
 /// then falls back to zero-cost for subscription/local providers.

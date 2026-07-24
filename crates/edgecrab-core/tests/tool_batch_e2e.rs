@@ -53,7 +53,7 @@ fn e2e_t2_overlapping_paths_serialize() {
     assert_eq!(plan.total(), 2);
     if !reg.is_parallel_safe(tool) {
         assert!(
-            plan.sequential.len() >= 1,
+            !plan.sequential.is_empty(),
             "overlapping write paths must serialize: {plan:?}"
         );
     }
@@ -93,7 +93,7 @@ fn e2e_t4_mutating_tools_not_blindly_parallel() {
     if !reg.is_parallel_safe("write_file") {
         // Expected: sequential path (or first parallel if path_arguments allow non-overlap only)
         assert!(
-            plan.sequential.len() >= 1 || plan.parallel.len() <= 1,
+            !plan.sequential.is_empty() || plan.parallel.len() <= 1,
             "mutating same file should serialize: {plan:?}"
         );
     }

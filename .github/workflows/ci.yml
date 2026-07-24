@@ -13,20 +13,23 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust-quality:
     name: Rust — lint & fmt
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - run: ./scripts/release-version.sh check
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-quality
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -42,19 +45,16 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            workspace_test_cmd: cargo test --workspace --exclude edgecrab-lsp
+            workspace_test_cmd: cargo test --workspace --exclude edgecrab-lsp -- --test-threads=1
           - os: macos-14
             workspace_test_cmd: cargo test --workspace --exclude edgecrab-lsp --no-run
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - run: ./scripts/release-version.sh check
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-tests-${{ matrix.os }}
       - run: cargo test -p edgecrab-lsp --all-targets
       - run: ${{ matrix.workspace_test_cmd }}
       - name: Offline harness + MCP mock gates (027 Wave 0)
@@ -76,16 +76,15 @@ jobs:
     name: Python SDK — build & test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: python-sdk
+          workspaces: sdks/python -> target
       - run: |
           cd sdks/python
           python -m pip install --upgrade pip build twine maturin pytest pytest-asyncio
@@ -99,13 +98,8 @@ jobs:
     name: Node.js SDK — build & test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -114,6 +108,9 @@ jobs:
             sdks/node/package-lock.json
             sdks/nodejs-native/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: node-sdk
       - name: Verify public Node SDK package
         run: |
           cd sdks/node
@@ -130,15 +127,14 @@ jobs:
 
   docker-smoke:
     name: Docker — build smoke test
+    # Full image build is expensive; run on main pushes and when Docker inputs change.
+    if: >
+      github.event_name == 'push' ||
+      contains(toJSON(github.event.pull_request.labels.*.name), 'docker')
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v7
         with:
@@ -151,17 +147,17 @@ jobs:
   wasm-sdk:
     name: WASM SDK — build
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - run: cargo install wasm-pack --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm-sdk
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
       - run: |
           cd sdks/wasm
           wasm-pack build --target web --dev
@@ -169,27 +165,24 @@ jobs:
   security:
     name: Security audit
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-audit --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - run: cargo audit
 
   otel-collector:
     name: OTEL — collector e2e
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: otel-collector
       - name: Start OTLP collector
         run: docker compose -f infra/otel/docker-compose.yaml up -d
       - name: Wait for collector
@@ -214,21 +207,17 @@ jobs:
   site:
     name: Site — build check
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - uses: pnpm/action-setup@v6
         with:
           package_json_file: site/package.json
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-          package-manager-cache: false
-      - run: pnpm install --force --no-frozen-lockfile
+          cache: 'pnpm'
+          cache-dependency-path: site/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
         working-directory: site
       - run: pnpm run build
         working-directory: site
