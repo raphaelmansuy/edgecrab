@@ -32,6 +32,7 @@ npm install -g edgecrab-cli
 
 The postinstall script automatically downloads the correct pre-built native binary for your platform.
 If an older cached binary is already present, the wrapper now replaces it automatically instead of silently keeping the stale binary.
+Launch and postinstall also rename strictly older native `edgecrab` binaries earlier on your `PATH` (often `~/.cargo/bin/edgecrab`) to `edgecrab.<ver>.bak` so they do not shadow the npm install. Opt out with `EDGECRAB_NO_PATH_REPAIR=1`.
 Requires **Node.js 18+**. No Rust, GCC, or build tools needed.
 
 Verify:

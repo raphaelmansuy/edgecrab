@@ -20,6 +20,10 @@ edgecrab --version
 ```
 
 The npm wrapper in this repository now verifies the native binary version and replaces stale cached binaries automatically.
+On launch and postinstall it also renames strictly older native `edgecrab` entries on your `PATH` (for example a leftover `~/.cargo/bin/edgecrab`) to `edgecrab.<ver>.bak` so they cannot shadow the upgraded install.
+Set `EDGECRAB_NO_PATH_REPAIR=1` to disable that rename.
+
+If you still see an older version, run `which -a edgecrab` and remove or reorder the unexpected install.
 
 ---
 

@@ -14,6 +14,16 @@ Last updated: 2026-07-24
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-07-24
+
+### Fixed
+
+- **Stale PATH shadows** — native launch + npm launcher/postinstall rename older `edgecrab` binaries on `PATH` to `edgecrab.<ver>.bak` (opt out: `EDGECRAB_NO_PATH_REPAIR=1`). Prevents cargo 0.9.x from winning over npm/Homebrew and breaking providers like omlx.
+
+### Added
+
+- **Doctor PATH check** — warns when another `edgecrab` on `PATH` reports a different version.
+
 ## [0.12.0] — 2026-07-24
 
 ### Added

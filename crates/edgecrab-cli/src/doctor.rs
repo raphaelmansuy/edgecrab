@@ -98,6 +98,7 @@ pub async fn run(config_override: Option<&str>) -> anyhow::Result<bool> {
     load_dot_env(&context.home.join(".env"));
 
     checks.push(check_config_file(&context.config_path));
+    checks.push(check_path_binaries());
     if let Ok(config) = edgecrab_core::AppConfig::load()
         && config.computer_use.enabled
     {
@@ -541,6 +542,76 @@ pub fn check_cache_hit_rate_slo(
             ),
         )),
     }
+}
+
+/// Warn when PATH contains another `edgecrab` with a different `--version`.
+///
+/// Stale `~/.cargo/bin/edgecrab` installs are a common cause of
+/// "Unknown LLM provider: omlx" after upgrading via npm/Homebrew.
+/// Launch-time auto-repair lives in [`crate::path_binary_repair`].
+pub fn check_path_binaries() -> Check {
+    use crate::path_binary_repair::{
+        probe_edgecrab_version, running_package_version, same_executable,
+    };
+
+    let running_ver = running_package_version();
+    let self_exe = std::env::current_exe().ok();
+    let self_exe_display = self_exe
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unknown>".into());
+
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let bin_name = if cfg!(windows) {
+        "edgecrab.exe"
+    } else {
+        "edgecrab"
+    };
+
+    let mut conflicts: Vec<String> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join(bin_name);
+        if !candidate.is_file() {
+            continue;
+        }
+        if seen.iter().any(|p| same_executable(p, &candidate)) {
+            continue;
+        }
+        if let Some(ref self_path) = self_exe
+            && same_executable(self_path, &candidate)
+        {
+            seen.push(candidate);
+            continue;
+        }
+        seen.push(candidate.clone());
+
+        let other_ver =
+            probe_edgecrab_version(&candidate).unwrap_or_else(|| "unknown".to_string());
+        // pipx / SDK wrappers often print a different product name — still a shadow risk.
+        if other_ver != running_ver {
+            conflicts.push(format!(
+                "{} reports {other_ver} (running {running_ver} from {self_exe_display})",
+                candidate.display()
+            ));
+        }
+    }
+
+    if conflicts.is_empty() {
+        return Check::pass(
+            "PATH binary",
+            format!("edgecrab {running_ver} — no conflicting older installs on PATH"),
+        );
+    }
+
+    Check::warn(
+        "PATH binary",
+        format!(
+            "stale/conflicting edgecrab on PATH — {}\n    Fix: remove older installs (common: ~/.cargo/bin/edgecrab) or put the intended install first in PATH. Check with: which -a edgecrab. Newer EdgeCrab also auto-renames older PATH binaries at launch (EDGECRAB_NO_PATH_REPAIR=1 to opt out).",
+            conflicts.join("; ")
+        ),
+    )
 }
 
 fn check_config_file(home: &Path) -> Check {
@@ -1260,6 +1331,63 @@ mod tests {
             }
             MacosConsentState::Unknown => {
                 Check::warn(label, format!("consent state unknown — {remedy}"))
+            }
+        }
+    }
+
+    #[test]
+    fn check_path_binaries_warns_on_stale_shadow() {
+        let tmp = TempDir::new().expect("tmp");
+        let fake = tmp.path().join("edgecrab");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&fake, "#!/bin/sh\necho 'edgecrab 0.9.0'\n").expect("write fake");
+            let mut perms = std::fs::metadata(&fake).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms).expect("chmod");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fake;
+            return;
+        }
+
+        let old_path = std::env::var_os("PATH");
+        let old_opt_out = std::env::var_os("EDGECRAB_NO_PATH_REPAIR");
+        let mut dirs = vec![tmp.path().to_path_buf()];
+        if let Some(ref p) = old_path {
+            dirs.extend(std::env::split_paths(p));
+        }
+        // SAFETY: test-only PATH mutation; restored below. Disable repair so
+        // doctor still sees the stale binary for this warn-only assertion.
+        unsafe {
+            std::env::set_var("PATH", std::env::join_paths(&dirs).expect("join PATH"));
+            std::env::set_var("EDGECRAB_NO_PATH_REPAIR", "1");
+        }
+
+        let check = check_path_binaries();
+        assert_eq!(check.status, CheckStatus::Warn, "detail={}", check.detail);
+        assert!(
+            check.detail.contains("0.9.0"),
+            "expected stale version in detail: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("which -a edgecrab"),
+            "expected fix hint: {}",
+            check.detail
+        );
+
+        // SAFETY: restore env after test.
+        unsafe {
+            match old_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            match old_opt_out {
+                Some(v) => std::env::set_var("EDGECRAB_NO_PATH_REPAIR", v),
+                None => std::env::remove_var("EDGECRAB_NO_PATH_REPAIR"),
             }
         }
     }

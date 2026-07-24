@@ -23,6 +23,7 @@ All `EDGECRAB_*` variables are applied via `apply_env_overrides()` in `config.rs
 | `EDGECRAB_SKIP_CONTEXT_FILES` | bool | `false` | Skip SOUL.md and AGENTS.md loading |
 | `EDGECRAB_SKIP_MEMORY` | bool | `false` | Disable memory for this session |
 | `EDGECRAB_MANAGED` | bool | `false` | Block all config writes (`1` to enable) |
+| `EDGECRAB_NO_PATH_REPAIR` | bool | `false` | Disable launch/npm auto-rename of older `edgecrab` binaries on `PATH` (`1` / `true`) |
 
 ---
 

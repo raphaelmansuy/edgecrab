@@ -59,6 +59,7 @@ mod model_picker;
 mod overlay_layout;
 mod overlay_text_input;
 mod pairing_cmd;
+mod path_binary_repair;
 #[cfg(target_os = "macos")]
 mod permissions;
 mod picker_chrome;
@@ -514,6 +515,11 @@ impl LLMProvider for OAuthRefreshingProvider {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Rename strictly older native `edgecrab` PATH shadows before clap so
+    // `edgecrab --version` still repairs. Opt out: EDGECRAB_NO_PATH_REPAIR=1.
+    // Must run before CliArgs::parse() — clap exits early on --version/--help.
+    let _ = path_binary_repair::repair_stale_path_binaries();
+
     if try_run_plugin_cli_command_from_argv().await? {
         return Ok(());
     }

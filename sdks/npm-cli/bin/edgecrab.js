@@ -12,7 +12,7 @@
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const { ensureInstalledBinary, readBinaryVersion } = require('../scripts/install');
+const { ensureInstalledBinary, readBinaryVersion, repairStalePathBinaries } = require('../scripts/install');
 
 const BINARY  = process.platform === 'win32' ? 'edgecrab.exe' : 'edgecrab';
 const BIN_DIR = path.join(__dirname, BINARY);
@@ -32,6 +32,9 @@ async function main() {
     );
     process.exit(1);
   }
+
+  // Rename older PATH shadows before spawn so `which edgecrab` matches this install.
+  repairStalePathBinaries(PACKAGE_VERSION, BIN_DIR);
 
   const result = spawnSync(BIN_DIR, process.argv.slice(2), {
     stdio: 'inherit',

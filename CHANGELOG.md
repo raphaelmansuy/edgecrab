@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-07-24
+
+### Fixed
+
+- **Stale PATH `edgecrab` shadows** — launch and npm postinstall/launcher auto-rename strictly older native installs on `PATH` (common: `~/.cargo/bin/edgecrab`) to `edgecrab.<ver>.bak`, so upgrades are not shadowed (e.g. `Unknown LLM provider: omlx` from 0.9.x). Opt out: `EDGECRAB_NO_PATH_REPAIR=1`. `edgecrab doctor` still warns on remaining conflicts.
+
+### Added
+
+- **Doctor PATH/version check** — warns when multiple `edgecrab` binaries on `PATH` report mismatched versions.
+
 ## [0.12.0] — 2026-07-24
 
 ### Added
