@@ -1,6 +1,9 @@
 //! WASM Agent — the primary entry point for browser/edge environments.
 
 use js_sys::{Array, Function, Object, Promise, Reflect};
+use llm_wasm::LlmWasmError;
+use llm_wasm::cost::CostLedger;
+use llm_wasm::retry::RetryPolicy;
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
@@ -26,6 +29,12 @@ pub struct AgentOptions {
     pub instructions: Option<String>,
     /// Enable streaming mode.
     pub streaming: Option<bool>,
+    /// Retries for a request that fails with 429 or 5xx, waiting for
+    /// `Retry-After` when the server sends it (default 0: no retry).
+    pub max_retries: Option<u32>,
+    /// Refuse further LLM calls once priced spend reaches this many USD.
+    /// Models missing from the llm-wasm price table are not counted.
+    pub budget_usd: Option<f64>,
 }
 
 /// The EdgeCrab Agent — lite WASM variant for browser/edge environments.
@@ -45,6 +54,9 @@ pub struct Agent {
     messages: Vec<Message>,
     session_id: String,
     memory: MemoryManager,
+    retry: RetryPolicy,
+    budget_usd: Option<f64>,
+    ledger: CostLedger,
 }
 
 #[wasm_bindgen]
@@ -68,6 +80,12 @@ impl Agent {
             js_sys::Date::now() as u64
         );
 
+        let retry = RetryPolicy::new(opts.max_retries.unwrap_or(0).saturating_add(1), 1_000, 30_000)
+            .map_err(|e| JsValue::from_str(&format!("Invalid options: {e}")))?;
+        if opts.budget_usd.is_some_and(|b| !b.is_finite() || b < 0.0) {
+            return Err(JsValue::from_str("Invalid options: budgetUsd must be a non-negative number"));
+        }
+
         Ok(Agent {
             model: model.to_string(),
             api_key: opts.api_key,
@@ -80,6 +98,9 @@ impl Agent {
             messages: Vec::new(),
             session_id,
             memory: MemoryManager::new(),
+            retry,
+            budget_usd: opts.budget_usd,
+            ledger: CostLedger::new(),
         })
     }
 
@@ -125,6 +146,12 @@ impl Agent {
     #[wasm_bindgen(getter)]
     pub fn model(&self) -> String {
         self.model.clone()
+    }
+
+    /// Priced LLM spend in USD so far for this agent (kept across `newSession`).
+    #[wasm_bindgen(getter, js_name = "costUsd")]
+    pub fn cost_usd(&self) -> f64 {
+        self.ledger.total_usd()
     }
 
     /// Get the current session ID.
@@ -186,6 +213,10 @@ impl Agent {
 
     /// Fork the agent into an isolated copy.
     pub fn fork(&self) -> Result<Agent, JsValue> {
+        let mut ledger = CostLedger::new();
+        ledger
+            .record_usd(self.ledger.total_usd())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(Agent {
             model: self.model.clone(),
             api_key: self.api_key.clone(),
@@ -198,6 +229,9 @@ impl Agent {
             messages: self.messages.clone(),
             session_id: format!("wasm_{}", js_sys::Date::now() as u64),
             memory: self.memory.clone(),
+            retry: self.retry.clone(),
+            budget_usd: self.budget_usd,
+            ledger,
         })
     }
 
@@ -214,7 +248,16 @@ impl Agent {
         let max_iters = self.max_iterations.max(1);
 
         for _ in 0..max_iters {
+            if let Some(limit) = self.budget_usd {
+                let used = self.ledger.total_usd();
+                if used >= limit {
+                    return Err(JsValue::from_str(
+                        &LlmWasmError::BudgetExceeded { used, limit }.to_string(),
+                    ));
+                }
+            }
             let json_val = self.call_llm_once(&conversation).await?;
+            self.record_usage(&json_val);
             let choices = Reflect::get(&json_val, &"choices".into())?;
             let first = Reflect::get(&choices, &0u32.into())?;
             let message = Reflect::get(&first, &"message".into())?;
@@ -304,6 +347,42 @@ impl Agent {
         }));
 
         all_messages
+    }
+
+    /// Price the response's `usage` block into the ledger. Responses without
+    /// usage, and models missing from the price table, are left uncounted.
+    fn record_usage(&mut self, response: &JsValue) {
+        let usage = Reflect::get(response, &"usage".into()).unwrap_or(JsValue::UNDEFINED);
+        if usage.is_undefined() || usage.is_null() {
+            return;
+        }
+        let tokens = |key: &str| {
+            Reflect::get(&usage, &key.into())
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as u32
+        };
+        let _ = self
+            .ledger
+            .record(&self.model, tokens("prompt_tokens"), tokens("completion_tokens"));
+    }
+
+    fn retry_after_header(response: &JsValue) -> Option<String> {
+        let headers = Reflect::get(response, &"headers".into()).ok()?;
+        let get: Function = Reflect::get(&headers, &"get".into()).ok()?.dyn_into().ok()?;
+        get.call1(&headers, &"retry-after".into()).ok()?.as_string()
+    }
+
+    async fn sleep_ms(ms: u32) -> Result<(), JsValue> {
+        let set_timeout: Function = Reflect::get(&js_sys::global(), &"setTimeout".into())?
+            .dyn_into()
+            .map_err(|_| JsValue::from_str("setTimeout not available in this environment"))?;
+        let promise = Promise::new(&mut |resolve, reject| {
+            if let Err(e) = set_timeout.call2(&JsValue::NULL, &resolve, &JsValue::from(ms)) {
+                let _ = reject.call1(&JsValue::NULL, &e);
+            }
+        });
+        JsFuture::from(promise).await.map(|_| ())
     }
 
     fn extract_message_content(message: &JsValue) -> Result<String, JsValue> {
@@ -397,18 +476,34 @@ impl Agent {
             .dyn_into()
             .map_err(|_| JsValue::from_str("fetch not available in this environment"))?;
 
-        let promise: Promise = fetch_fn
-            .call2(&JsValue::NULL, &JsValue::from_str(&url), &opts)?
-            .dyn_into()
-            .map_err(|_| JsValue::from_str("fetch did not return a Promise"))?;
+        let mut attempt = 1;
+        let (response, ok, status) = loop {
+            let promise: Promise = fetch_fn
+                .call2(&JsValue::NULL, &JsValue::from_str(&url), &opts)?
+                .dyn_into()
+                .map_err(|_| JsValue::from_str("fetch did not return a Promise"))?;
 
-        let response = JsFuture::from(promise).await?;
-        let ok = Reflect::get(&response, &"ok".into())?
-            .as_bool()
-            .unwrap_or(false);
-        let status = Reflect::get(&response, &"status".into())?
-            .as_f64()
-            .unwrap_or(0.0) as i32;
+            let response = JsFuture::from(promise).await?;
+            let ok = Reflect::get(&response, &"ok".into())?
+                .as_bool()
+                .unwrap_or(false);
+            let status = Reflect::get(&response, &"status".into())?
+                .as_f64()
+                .unwrap_or(0.0) as i32;
+
+            if !ok && self.retry.should_retry(attempt, status as u16) {
+                let retry_after = Self::retry_after_header(&response);
+                let delay = self.retry.delay_for_response(
+                    attempt,
+                    retry_after.as_deref(),
+                    js_sys::Math::random(),
+                );
+                Self::sleep_ms(delay).await?;
+                attempt += 1;
+                continue;
+            }
+            break (response, ok, status);
+        };
 
         // Parse response
         let json_fn: Function = Reflect::get(&response, &"json".into())?
